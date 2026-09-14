@@ -18,9 +18,11 @@ struct WarmProgress: Equatable {
     var inFlightFiles: [String]  // names of files currently downloading in parallel, in start order
     var currentDirectory: String
     var filesDone: Int          // files fully read (advances on completion, not start)
-    var filesTotal: Int         // 0 = not yet estimated / unknown
+    var filesTotal: Int         // 0 = not yet estimated / unknown; excludes already-cached files
     var bytesDone: Int64        // bytes actually read through the mount so far
-    var bytesTotal: Int64       // 0 = unknown
+    var bytesTotal: Int64       // 0 = unknown; excludes already-cached bytes
+    var filesAlreadyCached: Int   // files skipped because they were already fully offline
+    var bytesAlreadyCached: Int64 // bytes represented by those skipped files
     var startedAt: Date
     var finishedAt: Date?
 
@@ -32,8 +34,14 @@ struct WarmProgress: Equatable {
         self.filesTotal = 0
         self.bytesDone = 0
         self.bytesTotal = 0
+        self.filesAlreadyCached = 0
+        self.bytesAlreadyCached = 0
         self.startedAt = startedAt
         self.finishedAt = nil
+    }
+
+    var formattedBytesAlreadyCached: String {
+        ByteCountFormatter.string(fromByteCount: bytesAlreadyCached, countStyle: .file)
     }
 
     /// Number of files reading through the mount right now (drives the "N downloading in
