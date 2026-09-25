@@ -10,6 +10,7 @@ struct ParsedLogEvent {
         case fileChange(FileChange)
         case stats(RcloneStats)
         case errorMessage(String)
+        case sourceMissing(String)
         case unknown
     }
 
@@ -168,6 +169,10 @@ final class LogParser {
 
         if SyncLogPatterns.isSyncAlreadyRunning(message) {
             return .syncAlreadyRunning
+        }
+
+        if SyncLogPatterns.isSourceMissing(message) {
+            return .sourceMissing(SyncLogPatterns.extractSourceMissingPath(from: message) ?? "")
         }
 
         return .unknown

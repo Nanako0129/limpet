@@ -969,6 +969,26 @@ final class SyncManager: ObservableObject {
         updateAggregateState()
     }
 
+    /// Pure state transition for the three events the source-missing clear
+    /// path depends on (AC-L5-2 drives this directly, since standing up a
+    /// full SyncManager needs a real profile store, workspace observers and
+    /// config watchers). Not a general reducer — `processLogEvent` above
+    /// still owns every other side effect (progress, errors, notifications)
+    /// for these same cases; this only extracts the `profileStates` write so
+    /// it can be exercised headlessly.
+    static func reduceProfileState(_ current: SyncState, for eventType: ParsedLogEvent.EventType) -> SyncState {
+        switch eventType {
+        case .syncStarted:
+            return .syncing
+        case .syncCompleted:
+            return .idle
+        case .sourceMissing(let path):
+            return .error("Source missing: \(path)")
+        default:
+            return current
+        }
+    }
+
     private func processLogEvent(_ event: ParsedLogEvent, profileId: UUID) {
         let profile = profileStore.profile(for: profileId)
         let profileName = profile?.name ?? "Unknown"
@@ -976,7 +996,7 @@ final class SyncManager: ObservableObject {
 
         switch event.type {
         case .syncStarted:
-            profileStates[profileId] = .syncing
+            profileStates[profileId] = Self.reduceProfileState(profileStates[profileId] ?? .idle, for: event.type)
             profileErrors[profileId] = nil  // Clear previous error on new sync
             lastSeenErrorMessage[profileId] = nil  // Clear last seen error
             profileProgress[profileId] = nil  // Reset progress for new sync
@@ -986,7 +1006,7 @@ final class SyncManager: ObservableObject {
             notificationService.clearPendingChanges(for: profileId)
 
         case .syncCompleted:
-            profileStates[profileId] = .idle
+            profileStates[profileId] = Self.reduceProfileState(profileStates[profileId] ?? .idle, for: event.type)
             profileErrors[profileId] = nil  // Clear error on success
             lastSeenErrorMessage[profileId] = nil
             profileProgress[profileId] = nil  // Clear progress when sync completes
@@ -1072,6 +1092,12 @@ final class SyncManager: ObservableObject {
 
         case .syncAlreadyRunning:
             break
+
+        case .sourceMissing(let path):
+            // Menu only (L5.0) — no notification. Clears through the existing
+            // path: the watcher's 30s recheck runs a sync once the source
+            // returns, and .syncStarted below overwrites this unconditionally.
+            profileStates[profileId] = Self.reduceProfileState(profileStates[profileId] ?? .idle, for: event.type)
 
         case .fileChange(var change):
             change.profileName = profileName
