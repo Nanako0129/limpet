@@ -78,8 +78,8 @@ final class ConfigSelfWriteRegistry {
 ///
 /// Reuses `DirectoryWatcher`'s FSEvents+debounce PATTERN but is intentionally
 /// a separate, lighter type rather than a subclass/reuse of `DirectoryWatcher`
-/// itself — that class is tuned for sync-triggering (15s debounce, phantom-path
-/// detection, metadata filtering), the wrong shape for config, which needs a
+/// itself — that class is tuned for sync-triggering (debounce plus metadata
+/// filtering), the wrong shape for config, which needs a
 /// short debounce and self-write suppression instead.
 final class ConfigFileWatcher {
     private var stream: FSEventStreamRef?

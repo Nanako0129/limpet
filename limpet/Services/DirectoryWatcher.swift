@@ -97,53 +97,21 @@ final class DirectoryWatcher {
             LimpetSettings.debugLog("[\(label)]   RAW: \(path)")
         }
 
-        // First filter to only paths within our watched directories
-        // FSEvents can deliver events for other directories on the same volume
-        // Also filter out phantom paths - FSEvents on external drives can report paths
-        // with rewritten directory names that don't actually exist
+        // Keep only paths inside the watched directories; FSEvents can deliver
+        // events for other directories on the same volume. A path that no longer
+        // exists is a delete and must trigger a sync. There is deliberately no
+        // "phantom path" filter here: the old one dropped any event whose file
+        // name also existed in a sibling directory, which swallowed real deletes
+        // of README.md, index.js and the like, while a spurious trigger only costs
+        // one rclone run that finds nothing to transfer.
         let pathsInScope = eventPaths.filter { eventPath in
-            // Check path prefix first
             let matchesWatchedPath = self.paths.contains { watchedPath in
                 eventPath == watchedPath || eventPath.hasPrefix(watchedPath + "/")
             }
-
-            guard matchesWatchedPath else {
+            if !matchesWatchedPath {
                 LimpetSettings.debugLog("[\(label)]   FILTERED OUT: \(eventPath) (not in watched paths)")
-                return false
             }
-
-            // File exists - definitely a valid event (create/modify)
-            if FileManager.default.fileExists(atPath: eventPath) {
-                return true
-            }
-
-            // File doesn't exist - could be legitimate delete OR FSEvents phantom
-            // FSEvents phantom: same filename exists in a sibling directory
-            // Legitimate delete: file doesn't exist anywhere
-            let filename = (eventPath as NSString).lastPathComponent
-            let parentDir = (eventPath as NSString).deletingLastPathComponent
-            let grandparentDir = (parentDir as NSString).deletingLastPathComponent
-
-            // Check if file with same name exists in sibling directory (phantom detection)
-            if let siblings = try? FileManager.default.contentsOfDirectory(atPath: grandparentDir) {
-                for sibling in siblings {
-                    let siblingPath = (grandparentDir as NSString).appendingPathComponent(sibling)
-                    var isDir: ObjCBool = false
-                    if FileManager.default.fileExists(atPath: siblingPath, isDirectory: &isDir),
-                       isDir.boolValue,
-                       siblingPath != parentDir {
-                        let potentialOriginal = (siblingPath as NSString).appendingPathComponent(filename)
-                        if FileManager.default.fileExists(atPath: potentialOriginal) {
-                            LimpetSettings.debugLog("[\(label)]   PHANTOM: \(eventPath) (exists at \(potentialOriginal))")
-                            return false
-                        }
-                    }
-                }
-            }
-
-            // File doesn't exist in siblings either - legitimate delete
-            LimpetSettings.debugLog("[\(label)]   DELETE EVENT: \(eventPath)")
-            return true
+            return matchesWatchedPath
         }
 
         if pathsInScope.isEmpty {
