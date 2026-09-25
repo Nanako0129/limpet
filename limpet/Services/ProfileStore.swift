@@ -187,12 +187,24 @@ final class ProfileStore: ObservableObject {
     /// Remove any `*.profile.json` in `profilesDirectory` not in `keep`
     /// (self-healing against orphans left by an interrupted delete or an
     /// externally-dropped file). Only files matching the `.profile.json`
-    /// suffix are ever removed.
+    /// suffix are ever touched. Only a file that decodes to a `SyncProfile` is
+    /// a genuine orphan and removed. One that does not decode (an F4-refused
+    /// value, a `transfers` out of range, garbage) never reached `profiles`
+    /// because `profilesOnDisk` skipped it, so it is not an orphan: it may be
+    /// the only copy of a profile whose agent is still installed. It is moved
+    /// to `profiles/refused/` (`SyncManager.quarantineRefusedDrop`), never
+    /// deleted; if that move fails it stays where it is.
     private func pruneOrphanProfileFiles(keeping keep: Set<String>) {
         let fm = FileManager.default
         guard let files = try? fm.contentsOfDirectory(atPath: profilesDirectory) else { return }
         for file in files where file.hasSuffix(".profile.json") && !keep.contains(file) {
-            try? fm.removeItem(atPath: "\(profilesDirectory)/\(file)")
+            let path = "\(profilesDirectory)/\(file)"
+            if let data = fm.contents(atPath: path),
+               (try? JSONDecoder().decode(SyncProfile.self, from: data)) != nil {
+                try? fm.removeItem(atPath: path)
+            } else if SyncManager.quarantineRefusedDrop(at: path) == nil {
+                print("Could not move undecodable profile file \(file) to refused/; left in place")
+            }
         }
     }
 

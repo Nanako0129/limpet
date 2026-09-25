@@ -104,6 +104,7 @@ enum ConfigSelfTest {
             testDoctorWarnsStaleMaxDelete,
             testRefusedExternalEditRestored,
             testWizardRetryKeepsProfileId,
+            testPruneKeepsUndecodableFile,
         ]
 
         for check in checks {
@@ -3481,6 +3482,49 @@ enum ConfigSelfTest {
         let retry = build(first)
         guard first.isEnabled, retry.id == first.id, retry.isEnabled else {
             return report(id, slug, false, "(retry got id \(retry.id), first \(first.id))")
+        }
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L4-25 — a full save moves an undecodable profile file aside, never deletes it
+
+    /// Internal review F1: `profilesOnDisk` skips a file that does not decode,
+    /// so the orphan prune of a full `save()` used to delete it while its
+    /// launchd agent stayed installed. A genuine (decodable) orphan is still removed.
+    private static func testPruneKeepsUndecodableFile() -> Bool {
+        let id = "AC-L4-25", slug = "prune-moves-undecodable-aside"
+        let fm = FileManager.default
+        let dir = "\(selfTestRoot)/ac-l4-25/profiles"
+        try? fm.removeItem(atPath: "\(selfTestRoot)/ac-l4-25")
+        let valid = sampleProfile(name: "Valid")
+        let doomed = sampleProfile(name: "Doomed")
+        let invalidDict: [String: Any] = [
+            "id": UUID().uuidString, "name": "Invalid", "rcloneRemote": "selftest-fixture-remote:",
+            "remotePath": "Invalid", "localSyncPath": "/tmp/limpet-selftest-local", "transfers": 128,
+        ]
+        let invalidPath = "\(dir)/invalid.profile.json"
+        guard ProfileStore.writeProfileFile(valid, in: dir) != nil, ProfileStore.writeProfileFile(doomed, in: dir) != nil,
+              let invalid = try? JSONSerialization.data(withJSONObject: invalidDict),
+              (try? invalid.write(to: URL(fileURLWithPath: invalidPath))) != nil,
+              (try? JSONDecoder().decode(SyncProfile.self, from: invalid)) == nil else {
+            return report(id, slug, false, "(fixture setup failed)")
+        }
+        let store = ProfileStore(
+            profilesDirectory: dir,
+            defaults: UserDefaults(suiteName: "com.nanako.limpet.selftest.l4-25.\(UUID().uuidString)")!)
+        guard Set(store.profiles.map(\.id)) == [valid.id, doomed.id] else {
+            return report(id, slug, false, "(fixture load: \(store.profiles.map(\.name)))")
+        }
+        store.delete(id: doomed.id)  // a full save(): writes Valid, prunes the rest
+        store.save()                 // and once more with nothing to delete
+        let refused = (try? fm.contentsOfDirectory(atPath: "\(dir)/refused")) ?? []
+        guard !fm.fileExists(atPath: invalidPath), refused.count == 1, refused[0].hasPrefix("invalid."),
+              fm.contents(atPath: "\(dir)/refused/\(refused[0])") == invalid else {
+            return report(id, slug, false, "(undecodable file not kept under refused/: refused=\(refused))")
+        }
+        guard fm.fileExists(atPath: "\(dir)/\(valid.shortId).profile.json"),
+              !fm.fileExists(atPath: "\(dir)/\(doomed.shortId).profile.json") else {
+            return report(id, slug, false, "(valid file lost or genuine orphan not removed)")
         }
         return report(id, slug, true)
     }

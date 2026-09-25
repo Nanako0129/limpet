@@ -119,7 +119,10 @@ the launchd agent is installed only when it's `isEnabled && isValid`, so an
 agent can stage a profile and flip it on in a second edit. A drop refused for
 overlap is moved to `profiles/refused/<stem>.<UTC timestamp>.json`, where no
 `*.profile.json` scanner and no file watcher sees it; a drop that fails to
-decode (including an F4-refused value) stays where it is and is ignored. A dropped file whose basename isn't the canonical
+decode (including an F4-refused value) stays where it is and is ignored until
+the next full `ProfileStore.save()` (a profile delete), whose orphan prune
+moves it to `profiles/refused/` instead of deleting it — the prune removes
+only files that decode. A dropped file whose basename isn't the canonical
 `{shortId}.profile.json` is rewritten to the canonical name and the original
 pruned (the canonical write notes its own hash in `ConfigSelfWriteRegistry`, so
 this can never loop). See `ConfigSelfTest`'s AC-C1–AC-C4 for the exact
