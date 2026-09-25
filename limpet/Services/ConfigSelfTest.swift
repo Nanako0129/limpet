@@ -67,6 +67,8 @@ enum ConfigSelfTest {
             testGeneratedPlistShape,
             testMissingSourceIsNotCreated,
             testTransfersChangeReinstalls,
+            testTranslocatedAppRefused,
+            testInstallRefusesNonOwnedShim,
         ]
 
         for check in checks {
@@ -1457,7 +1459,11 @@ enum ConfigSelfTest {
 
     private static func testGeneratedPlistShape() -> Bool {
         let profile = sampleProfile()
-        let plist = SyncSetupService.shared.generateLaunchdPlist(for: profile)
+        // A fake shim path distinct from the real ~/.local/bin/limpet, so this
+        // assertion is meaningless unless ProgramArguments actually carries the
+        // value passed in (and not, say, the app's own executable path).
+        let fakeShimPath = "/tmp/limpet-selftest-shim/limpet"
+        let plist = SyncSetupService.shared.generateLaunchdPlist(for: profile, shimPath: fakeShimPath)
 
         // Match the key together with its value: a bare `contains("<true/>")` is also
         // satisfied by RunAtLoad's value and would pass with KeepAlive set to false.
@@ -1467,35 +1473,92 @@ enum ConfigSelfTest {
         guard plist.range(of: #"<key>RunAtLoad</key>\s*<true/>"#, options: .regularExpression) != nil else {
             return report("AC-W3", "watch-plist-shape", false, "(missing RunAtLoad)")
         }
-        // An app path with XML-special characters must still yield a valid plist that
-        // round-trips to the exact path (the plist is serialized, not templated).
-        let oddPath = "/tmp/a&b<c>/limpet.app/Contents/MacOS/limpet"
-        let oddXML = SyncSetupService.shared.generateLaunchdPlist(for: profile, appExecutablePath: oddPath)
+        // A shim path with XML-special characters must still yield a valid plist that
+        // round-trips to the exact path (the plist is serialized, not templated), AND
+        // ProgramArguments[0] must be exactly the shim path — never the app binary.
+        let oddPath = "/tmp/a&b<c>/limpet-shim/limpet"
+        let oddXML = SyncSetupService.shared.generateLaunchdPlist(for: profile, shimPath: oddPath)
         guard let parsed = try? PropertyListSerialization.propertyList(
                   from: Data(oddXML.utf8), options: [], format: nil) as? [String: Any],
               let args = parsed["ProgramArguments"] as? [String],
               args == [oddPath, "watch", profile.shortId] else {
-            return report("AC-W3", "watch-plist-shape", false, "(plist with an XML-special app path did not round-trip)")
+            return report("AC-W3", "watch-plist-shape", false, "(plist with an XML-special shim path did not round-trip)")
+        }
+        guard let fakeParsed = try? PropertyListSerialization.propertyList(
+                  from: Data(plist.utf8), options: [], format: nil) as? [String: Any],
+              let fakeArgs = fakeParsed["ProgramArguments"] as? [String],
+              fakeArgs == [fakeShimPath, "watch", profile.shortId] else {
+            return report(
+                "AC-W3", "watch-plist-shape", false,
+                "(ProgramArguments is not exactly [shimPath, \"watch\", shortId])")
         }
         guard !plist.contains("StartInterval") else {
             return report("AC-W3", "watch-plist-shape", false, "(still has StartInterval)")
         }
-        guard let programArgsRange = plist.range(of: "<key>ProgramArguments</key>") else {
-            return report("AC-W3", "watch-plist-shape", false, "(missing ProgramArguments)")
-        }
-        let afterProgramArgs = plist[programArgsRange.upperBound...]
-        guard let arrayClose = afterProgramArgs.range(of: "</array>") else {
-            return report("AC-W3", "watch-plist-shape", false, "(ProgramArguments array not closed)")
-        }
-        let argsBlock = afterProgramArgs[..<arrayClose.lowerBound]
-        guard argsBlock.contains("<string>watch</string>"),
-              argsBlock.contains("<string>\(profile.shortId)</string>") else {
-            return report(
-                "AC-W3", "watch-plist-shape", false,
-                "(ProgramArguments does not end with watch, <shortId>)")
-        }
 
         return report("AC-W3", "watch-plist-shape", true)
+    }
+
+    // MARK: - AC-W6 — App Translocation refuses install / shim write
+
+    /// A translocated executable path must be refused both by the shim
+    /// installer (called on every GUI launch) and by the guard
+    /// `SyncSetupService.install(profile:)` checks before doing anything else.
+    /// Exercises the pure, no-side-effect `isTranslocated` predicate plus
+    /// `CLIShimInstaller.install` against a temp path — never the real
+    /// ~/.local/bin/limpet, and `install(profile:)` itself is never called
+    /// here since it also touches real ~/Library/LaunchAgents paths.
+    private static func testTranslocatedAppRefused() -> Bool {
+        let translocatedPath = "/private/tmp/AppTranslocation/ABCDEF12-3456/d/limpet.app/Contents/MacOS/limpet"
+        guard CLIShimInstaller.isTranslocated(translocatedPath) else {
+            return report("AC-W6", "translocated-app-refused", false, "(isTranslocated didn't flag a translocated path)")
+        }
+        guard !CLIShimInstaller.isTranslocated("/Applications/limpet.app/Contents/MacOS/limpet") else {
+            return report("AC-W6", "translocated-app-refused", false, "(isTranslocated false-positived on a normal path)")
+        }
+
+        let shimDir = "\(selfTestRoot)/ac-w6-shim"
+        try? FileManager.default.removeItem(atPath: shimDir)
+        let shimPath = "\(shimDir)/limpet"
+        guard CLIShimInstaller.install(executablePath: translocatedPath, shimPath: shimPath) == false else {
+            return report("AC-W6", "translocated-app-refused", false, "(shim install did not refuse a translocated executable path)")
+        }
+        guard !FileManager.default.fileExists(atPath: shimPath) else {
+            return report("AC-W6", "translocated-app-refused", false, "(shim was written despite a translocated executable path)")
+        }
+
+        return report("AC-W6", "translocated-app-refused", true)
+    }
+
+    // MARK: - AC-W7 — install() refuses to write over a non-owned shim
+
+    /// `SyncSetupService.install(profile:)` must never point a LaunchAgent at
+    /// a file it doesn't own. `canWriteShim` is the exact guard `install`
+    /// checks before calling `CLIShimInstaller.install` — verified here
+    /// against a temp path with a foreign (unmarked) file, never the real
+    /// ~/.local/bin/limpet.
+    private static func testInstallRefusesNonOwnedShim() -> Bool {
+        let shimDir = "\(selfTestRoot)/ac-w7-shim"
+        try? FileManager.default.removeItem(atPath: shimDir)
+        try? FileManager.default.createDirectory(atPath: shimDir, withIntermediateDirectories: true)
+        let shimPath = "\(shimDir)/limpet"
+
+        guard SyncSetupService.canWriteShim(at: shimPath) else {
+            return report("AC-W7", "install-refuses-nonowned-shim", false, "(refused an absent shim path)")
+        }
+
+        let foreignContent = "#!/bin/sh\necho not ours\n"
+        try? foreignContent.write(toFile: shimPath, atomically: true, encoding: .utf8)
+        guard SyncSetupService.canWriteShim(at: shimPath) == false else {
+            return report("AC-W7", "install-refuses-nonowned-shim", false, "(allowed writing over a foreign, unmarked file)")
+        }
+
+        try? "\(CLIShimInstaller.ownershipMarker)\necho ours\n".write(toFile: shimPath, atomically: true, encoding: .utf8)
+        guard SyncSetupService.canWriteShim(at: shimPath) else {
+            return report("AC-W7", "install-refuses-nonowned-shim", false, "(refused a file limpet owns)")
+        }
+
+        return report("AC-W7", "install-refuses-nonowned-shim", true)
     }
 
 }

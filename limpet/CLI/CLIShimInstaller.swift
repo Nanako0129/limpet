@@ -20,9 +20,21 @@ enum CLIShimInstaller {
         "\(NSHomeDirectory())/.local/bin/limpet"
     }
 
+    /// Whether `path` runs through macOS's App Translocation
+    /// (`.../AppTranslocation/<random>/...`) — a randomized, non-persistent
+    /// mount Gatekeeper uses for an unmoved, quarantined app. A shim `exec`ing
+    /// a path under here will start working and then, the moment the mount
+    /// disappears (reboot, app relaunch from its real location), point at
+    /// nothing. Exposed so `ConfigSelfTest` can assert the guard without a
+    /// real translocated launch.
+    static func isTranslocated(_ path: String) -> Bool {
+        path.contains("/AppTranslocation/")
+    }
+
     /// Write (or refresh) the shim. No-op, logged, when a file already exists
     /// at `shimPath` that lacks the ownership marker — that's a user's own
-    /// file and must never be overwritten.
+    /// file and must never be overwritten. Also a no-op, logged, when
+    /// `executablePath` is an App Translocation path — see `isTranslocated`.
     ///
     /// - Parameter shimPath: overridable so `ConfigSelfTest` can target an
     ///   isolated temp path instead of the real `~/.local/bin/limpet`.
@@ -32,6 +44,10 @@ enum CLIShimInstaller {
         shimPath: String = CLIShimInstaller.shimPath
     ) -> Bool {
         guard !executablePath.isEmpty else { return false }
+        guard !isTranslocated(executablePath) else {
+            LimpetSettings.debugLog("[CLIShimInstaller] \(executablePath) is an App Translocation path; skipping shim write")
+            return false
+        }
 
         let fm = FileManager.default
         let binDir = (shimPath as NSString).deletingLastPathComponent

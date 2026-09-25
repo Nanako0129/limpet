@@ -104,7 +104,21 @@ final class SyncSetupService {
     ///   - profile: The sync profile to install
     ///   - loadAgent: Whether to load the launchd agent immediately (default: true).
     ///                Set to false if you need to run resync first to avoid race conditions.
-    func install(profile: SyncProfile, loadAgent: Bool = true) throws {
+    ///   - executablePath: The running app's own executable path. Overridable so
+    ///     `ConfigSelfTest` can exercise the translocation guard without a real
+    ///     translocated launch; the app never needs to pass this itself.
+    func install(
+        profile: SyncProfile,
+        loadAgent: Bool = true,
+        executablePath: String = Bundle.main.executablePath ?? ""
+    ) throws {
+        // Refuse a translocated launch outright — see `CLIShimInstaller.isTranslocated`.
+        // AppTranslocation is a randomized, non-persistent Gatekeeper mount; an agent
+        // whose shim was refreshed from it would work until the mount disappears.
+        guard !CLIShimInstaller.isTranslocated(executablePath) else {
+            throw SetupError.translocatedApp
+        }
+
         // Validate required settings
         guard !profile.rcloneRemote.isEmpty else {
             throw SetupError.missingRcloneRemote
@@ -114,6 +128,16 @@ final class SyncSetupService {
         }
         guard !profile.remotePath.isEmpty else {
             throw SetupError.missingRemotePath
+        }
+
+        // Refresh the CLI shim before writing the plist below, so the plist's
+        // ProgramArguments always points at a shim that execs the CURRENT
+        // executable path. Never point an agent at a file limpet doesn't own.
+        guard SyncSetupService.canWriteShim(at: CLIShimInstaller.shimPath) else {
+            throw SetupError.shimNotOwned
+        }
+        guard CLIShimInstaller.install(executablePath: executablePath) else {
+            throw SetupError.shimInstallFailed
         }
 
         // Create directories if needed
@@ -539,28 +563,39 @@ final class SyncSetupService {
     /// (AC for limpet-plan.md L3(c)).
     ///
     /// `KeepAlive=true` + `RunAtLoad=true` and NO `StartInterval`: the agent
-    /// runs `limpet watch <shortId>` (this app's own binary, not the shared
-    /// script) as a long-lived process that is the SOLE owner of this
-    /// profile's scheduling — see `SyncWatchDaemon`. launchd restarts it if it
-    /// ever exits, which doubles as the "watcher crashed" recovery path.
-    /// stdout/stderr go to a separate `limpet-launchd-*.log`, never the
-    /// profile log the GUI reads — the watcher's child processes already tee
-    /// their own output into the profile log themselves.
+    /// runs `limpet watch <shortId>` as a long-lived process that is the SOLE
+    /// owner of this profile's scheduling — see `SyncWatchDaemon`. launchd
+    /// restarts it if it ever exits, which doubles as the "watcher crashed"
+    /// recovery path. stdout/stderr go to a separate `limpet-launchd-*.log`,
+    /// never the profile log the GUI reads — the watcher's child processes
+    /// already tee their own output into the profile log themselves.
+    ///
+    /// `ProgramArguments[0]` points at the `~/.local/bin/limpet` CLI shim
+    /// (`CLIShimInstaller`), never the app's own executable path directly.
+    /// The app bundle can move after install, or macOS can run it once from a
+    /// randomized, non-persistent App Translocation path — either way a path
+    /// baked into the plist would eventually stop resolving and silently kill
+    /// realtime sync. The shim is a stable, `exec`-refreshed indirection:
+    /// `install(profile:)` refreshes it right before writing this plist, so
+    /// launchd always resolves through a file that gets rewritten to point at
+    /// wherever the app currently lives. The shim's `exec` (not fork) is what
+    /// lets `launchctl kill SIGUSR1 gui/<uid>/<label>` keep reaching the
+    /// watcher process — it inherits the agent's PID.
     func generateLaunchdPlist(
         for profile: SyncProfile,
-        appExecutablePath: String = Bundle.main.executablePath ?? "/Applications/limpet.app/Contents/MacOS/limpet"
+        shimPath: String = CLIShimInstaller.shimPath
     ) -> String {
         let logDir = (profile.logPath as NSString).deletingLastPathComponent
         let launchdLogPath = logDir + "/limpet-launchd-\(profile.shortId).log"
         let path = "/opt/homebrew/bin:/usr/local/bin:/run/current-system/sw/bin:"
             + "/etc/profiles/per-user/\(NSUserName())/bin:\(NSHomeDirectory())/.nix-profile/bin:/usr/bin:/bin"
 
-        // Serialized rather than templated, so every string value (the app path in
+        // Serialized rather than templated, so every string value (the shim path in
         // particular, which may contain `&` or `<`) is XML-escaped and the plist stays
         // loadable wherever the app lives.
         let plist: [String: Any] = [
             "Label": profile.launchdLabel,
-            "ProgramArguments": [appExecutablePath, "watch", profile.shortId],
+            "ProgramArguments": [shimPath, "watch", profile.shortId],
             "KeepAlive": true,
             "RunAtLoad": true,
             "StandardOutPath": launchdLogPath,
@@ -576,6 +611,15 @@ final class SyncSetupService {
     }
 
     // MARK: - Helpers
+
+    /// Whether `install(profile:)` may (re)write the CLI shim at `shimPath`:
+    /// true when nothing is there yet, or when what's there already carries
+    /// limpet's ownership marker. Exposed (static, no side effects) so
+    /// `ConfigSelfTest` can verify the guard against a temp path instead of
+    /// the real `~/.local/bin/limpet`.
+    static func canWriteShim(at shimPath: String) -> Bool {
+        !FileManager.default.fileExists(atPath: shimPath) || CLIShimInstaller.ownsExistingShim(at: shimPath)
+    }
 
     private func createDirectories(for profile: SyncProfile) throws {
         let fm = FileManager.default
@@ -647,6 +691,9 @@ final class SyncSetupService {
         case missingRemotePath
         case scriptGenerationFailed
         case plistGenerationFailed
+        case translocatedApp
+        case shimNotOwned
+        case shimInstallFailed
 
         var errorDescription: String? {
             switch self {
@@ -660,6 +707,15 @@ final class SyncSetupService {
                 return "Failed to generate sync script"
             case .plistGenerationFailed:
                 return "Failed to generate launchd plist"
+            case .translocatedApp:
+                return "limpet is running from a temporary, randomized location (macOS App "
+                    + "Translocation) and can't install a reliable background sync agent from "
+                    + "here. Move limpet.app to /Applications and relaunch it, then try again."
+            case .shimNotOwned:
+                return "~/.local/bin/limpet already exists and wasn't created by limpet, so it "
+                    + "won't be overwritten. Move or remove that file, then try again."
+            case .shimInstallFailed:
+                return "Failed to write the limpet CLI shim at ~/.local/bin/limpet"
             }
         }
     }
