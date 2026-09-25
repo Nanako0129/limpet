@@ -1,18 +1,17 @@
 {
-  "name": "synctray",
+  "name": "limpet",
   "version": "0.0.0",
   "private": true,
   "scripts": {
-    "build": "pnpm dlx nx run synctray:build",
-    "build:release": "pnpm dlx nx run synctray:build:release",
-    "test": "pnpm dlx nx run synctray:test",
-    "clean": "pnpm dlx nx run synctray:clean",
-    "install": "pnpm dlx nx run synctray:install",
-    "install:launch": "pnpm dlx nx run synctray:install:launch",
-    "install:full": "pnpm dlx nx run synctray:install:full",
-    "install:full:launch": "pnpm dlx nx run synctray:install:full:launch",
-    "dev": "pnpm dlx nx run synctray:dev",
-    "release": "pnpm dlx nx run synctray:release",
+    "build": "pnpm dlx nx run limpet:build",
+    "build:release": "pnpm dlx nx run limpet:build:release",
+    "test": "pnpm dlx nx run limpet:test",
+    "clean": "pnpm dlx nx run limpet:clean",
+    "install": "pnpm dlx nx run limpet:install",
+    "install:launch": "pnpm dlx nx run limpet:install:launch",
+    "install:full": "pnpm dlx nx run limpet:install:full",
+    "install:full:launch": "pnpm dlx nx run limpet:install:full:launch",
+    "dev": "pnpm dlx nx run limpet:dev",
     "reset": "nx reset"
   },
   "devDependencies": {

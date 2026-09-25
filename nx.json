@@ -1,37 +1,57 @@
 {
   "$schema": "https://raw.githubusercontent.com/nrwl/nx/master/packages/nx/schemas/nx-schema.json",
   "namedInputs": {
-    "default": ["{projectRoot}/**/*"],
+    "default": [
+      "{projectRoot}/**/*"
+    ],
     "swift-sources": [
-      "{projectRoot}/SyncTray/**/*.swift",
-      "{projectRoot}/SyncTray/**/*.plist",
-      "{projectRoot}/SyncTray/**/*.xcassets",
-      "{projectRoot}/SyncTray/**/*.xib",
-      "{projectRoot}/SyncTray/**/*.storyboard"
+      "{projectRoot}/limpet/**/*.swift",
+      "{projectRoot}/limpet/**/*.plist",
+      "{projectRoot}/limpet/**/*.xcassets",
+      "{projectRoot}/limpet/**/*.xib",
+      "{projectRoot}/limpet/**/*.storyboard"
     ],
     "project-config": [
-      "{projectRoot}/SyncTray.xcodeproj/**/*",
+      "{projectRoot}/limpet.xcodeproj/**/*",
       "{projectRoot}/*.xcworkspace/**/*"
     ],
-    "scripts": ["{projectRoot}/scripts/**/*.sh"],
-    "cask": ["{projectRoot}/Casks/**/*.rb"]
+    "scripts": [
+      "{projectRoot}/scripts/**/*.sh"
+    ]
   },
   "targetDefaults": {
     "build": {
       "cache": true,
-      "inputs": ["swift-sources", "project-config"],
-      "outputs": ["{projectRoot}/build"]
+      "inputs": [
+        "swift-sources",
+        "project-config"
+      ],
+      "outputs": [
+        "{projectRoot}/build"
+      ]
     },
     "test": {
       "cache": true,
-      "inputs": ["swift-sources", "project-config"],
-      "dependsOn": ["^build"]
+      "inputs": [
+        "swift-sources",
+        "project-config"
+      ],
+      "dependsOn": [
+        "^build"
+      ]
     },
     "install": {
       "cache": true,
-      "inputs": ["swift-sources", "project-config"],
-      "outputs": ["{projectRoot}/build"],
-      "dependsOn": ["clean"]
+      "inputs": [
+        "swift-sources",
+        "project-config"
+      ],
+      "outputs": [
+        "{projectRoot}/build"
+      ],
+      "dependsOn": [
+        "clean"
+      ]
     },
     "clean": {
       "cache": false

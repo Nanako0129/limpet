@@ -1,5 +1,5 @@
 #!/bin/bash
-# SyncTray Development Script
+# limpet Development Script
 # Watches for file changes and rebuilds/relaunches the app
 #
 # Usage: ./scripts/dev.sh
@@ -19,9 +19,9 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-SCHEME="SyncTray"
+SCHEME="limpet"
 BUILD_DIR="$PROJECT_DIR/build/Build/Products/Debug"
-APP_NAME="SyncTray.app"
+APP_NAME="limpet.app"
 APP_PATH="$BUILD_DIR/$APP_NAME"
 
 # Colors for output
@@ -54,9 +54,9 @@ if ! command -v fswatch &> /dev/null; then
     exit 1
 fi
 
-# Kill any existing SyncTray processes
+# Kill any existing limpet processes
 kill_app() {
-    pkill -x "SyncTray" 2>/dev/null || true
+    pkill -x "limpet" 2>/dev/null || true
 }
 
 # Build the app (incremental — only recompiles changed files)
@@ -160,7 +160,7 @@ trap cleanup SIGINT SIGTERM
 # Main
 echo ""
 echo "╔════════════════════════════════════════╗"
-echo "║       SyncTray Development Mode        ║"
+echo "║       limpet Development Mode        ║"
 echo "╠════════════════════════════════════════╣"
 echo "║  Watching for changes...               ║"
 echo "║  Press Ctrl+C to stop                  ║"
@@ -177,7 +177,7 @@ else
 fi
 
 echo ""
-log_info "Watching for file changes in SyncTray/..."
+log_info "Watching for file changes in limpet/..."
 
 # Watch for changes (--latency debounces at the fswatch level too)
 fswatch -0 -r \
@@ -188,6 +188,6 @@ fswatch -0 -r \
     --include='\.xcassets$' \
     --include='\.plist$' \
     --exclude='.*' \
-    "$PROJECT_DIR/SyncTray" | while read -d "" file; do
+    "$PROJECT_DIR/limpet" | while read -d "" file; do
     on_change "$file"
 done

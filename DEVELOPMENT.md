@@ -1,4 +1,4 @@
-# SyncTray Development Guide
+# limpet Development Guide
 
 ## Prerequisites
 
@@ -10,24 +10,24 @@
 
 ```bash
 # Build
-xcodebuild -scheme SyncTray -destination 'platform=macOS' build
+xcodebuild -scheme limpet -destination 'platform=macOS' build
 
 # Build with pretty output
-xcodebuild -scheme SyncTray -destination 'platform=macOS' build 2>&1 | xcbeautify
+xcodebuild -scheme limpet -destination 'platform=macOS' build 2>&1 | xcbeautify
 
 # Run
-open ~/Library/Developer/Xcode/DerivedData/SyncTray-*/Build/Products/Debug/SyncTray.app
+open ~/Library/Developer/Xcode/DerivedData/limpet-*/Build/Products/Debug/limpet.app
 ```
 
 ## Project Structure
 
 ```
-SyncTray/
+limpet/
 ├── Models/           # Data models and state types
 ├── Services/         # Business logic and background services
 ├── Views/            # SwiftUI views
 ├── Assets.xcassets/  # App icons and images
-└── SyncTrayApp.swift # App entry point and AppDelegate
+└── LimpetApp.swift # App entry point and AppDelegate
 ```
 
 See [CLAUDE.md](CLAUDE.md) for full architecture documentation.
@@ -41,21 +41,21 @@ Toggle **Debug Logging** in Settings to enable verbose output in sync log files.
 ### Inspect launchd Agents
 
 ```bash
-launchctl list | grep synctray
-launchctl print gui/$(id -u)/com.synctray.sync.{shortId}
-cat ~/Library/LaunchAgents/com.synctray.sync.*.plist
+launchctl list | grep limpet
+launchctl print gui/$(id -u)/com.nanako.limpet.watch.{shortId}
+cat ~/Library/LaunchAgents/com.nanako.limpet.watch.*.plist
 ```
 
 ### View Sync Logs
 
 ```bash
-tail -f ~/.local/log/synctray-sync-{shortId}.log
+tail -f ~/.local/log/limpet-sync-{shortId}.log
 ```
 
 ### Lock Files
 
 ```bash
-ls -la /tmp/synctray-sync-*.lock
+ls -la /tmp/limpet-sync-*.lock
 ```
 
 Stale locks are cleaned on app startup.

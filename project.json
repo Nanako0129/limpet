@@ -1,26 +1,32 @@
 {
-  "name": "synctray",
+  "name": "limpet",
   "$schema": "https://raw.githubusercontent.com/nrwl/nx/master/packages/nx/schemas/project-schema.json",
   "projectType": "application",
-  "sourceRoot": "SyncTray",
+  "sourceRoot": "limpet",
   "targets": {
     "build": {
       "executor": "nx:run-commands",
       "options": {
-        "command": "xcodebuild -scheme SyncTray -configuration Debug -derivedDataPath build DASH0_AUTH_TOKEN=\"${DASH0_AUTH_TOKEN:-}\" build 2>&1 | grep -E '(error:|warning:.*error|BUILD)' || true",
+        "command": "xcodebuild -scheme limpet -configuration Debug -derivedDataPath build DASH0_AUTH_TOKEN=\"${DASH0_AUTH_TOKEN:-}\" build 2>&1 | grep -E '(error:|warning:.*error|BUILD)' || true",
         "cwd": "{projectRoot}"
       },
-      "inputs": ["swift-sources", "project-config"],
+      "inputs": [
+        "swift-sources",
+        "project-config"
+      ],
       "outputs": [],
       "cache": true
     },
     "build:release": {
       "executor": "nx:run-commands",
       "options": {
-        "command": "xcodebuild -scheme SyncTray -configuration Release -derivedDataPath build clean build ONLY_ACTIVE_ARCH=NO DASH0_AUTH_TOKEN=\"${DASH0_AUTH_TOKEN:-}\" 2>&1 | tail -5",
+        "command": "xcodebuild -scheme limpet -configuration Release -derivedDataPath build clean build ONLY_ACTIVE_ARCH=NO DASH0_AUTH_TOKEN=\"${DASH0_AUTH_TOKEN:-}\" 2>&1 | tail -5",
         "cwd": "{projectRoot}"
       },
-      "inputs": ["swift-sources", "project-config"],
+      "inputs": [
+        "swift-sources",
+        "project-config"
+      ],
       "outputs": [],
       "cache": true
     },
@@ -37,8 +43,8 @@
       "options": {
         "commands": [
           "rm -rf build",
-          "rm -rf $HOME/Library/Developer/Xcode/DerivedData/SyncTray-* 2>/dev/null || true",
-          "xcodebuild -scheme SyncTray clean -quiet 2>/dev/null || true"
+          "rm -rf $HOME/Library/Developer/Xcode/DerivedData/limpet-* 2>/dev/null || true",
+          "xcodebuild -scheme limpet clean -quiet 2>/dev/null || true"
         ],
         "cwd": "{projectRoot}",
         "parallel": false
@@ -50,31 +56,35 @@
       "options": {
         "commands": [
           {
-            "command": "pkill -x SyncTray 2>/dev/null && sleep 1 || true",
+            "command": "pkill -x limpet 2>/dev/null && sleep 1 || true",
             "description": "Kill running app"
           },
           {
-            "command": "rm -rf /Applications/SyncTray.app 2>/dev/null || true",
+            "command": "rm -rf /Applications/limpet.app 2>/dev/null || true",
             "description": "Remove old installation"
           },
           {
-            "command": "cp -R build/Build/Products/Debug/SyncTray.app /Applications/SyncTray.app",
+            "command": "cp -R build/Build/Products/Debug/limpet.app /Applications/limpet.app",
             "description": "Install to Applications"
           }
         ],
         "cwd": "{projectRoot}",
         "parallel": false
       },
-      "dependsOn": ["build"],
+      "dependsOn": [
+        "build"
+      ],
       "cache": false
     },
     "install:launch": {
       "executor": "nx:run-commands",
       "options": {
-        "command": "open /Applications/SyncTray.app",
+        "command": "open /Applications/limpet.app",
         "cwd": "{projectRoot}"
       },
-      "dependsOn": ["install"],
+      "dependsOn": [
+        "install"
+      ],
       "cache": false
     },
     "install:full": {
@@ -83,7 +93,11 @@
         "command": "sh ./scripts/install.sh",
         "cwd": "{projectRoot}"
       },
-      "inputs": ["swift-sources", "project-config", "scripts"],
+      "inputs": [
+        "swift-sources",
+        "project-config",
+        "scripts"
+      ],
       "outputs": [],
       "cache": true
     },
@@ -93,7 +107,9 @@
         "command": "sh ./scripts/install.sh --launch",
         "cwd": "{projectRoot}"
       },
-      "dependsOn": ["install:full"],
+      "dependsOn": [
+        "install:full"
+      ],
       "cache": false
     },
     "dev": {
@@ -102,23 +118,6 @@
         "command": "sh ./scripts/dev.sh",
         "cwd": "{projectRoot}"
       },
-      "cache": false
-    },
-    "release": {
-      "executor": "nx:run-commands",
-      "options": {
-        "command": "sh ./scripts/release.sh",
-        "cwd": "{projectRoot}"
-      },
-      "cache": false
-    },
-    "setup-tap": {
-      "executor": "nx:run-commands",
-      "options": {
-        "command": "sh ./scripts/setup-tap.sh",
-        "cwd": "{projectRoot}"
-      },
-      "inputs": ["cask"],
       "cache": false
     },
     "reset": {

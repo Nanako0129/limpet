@@ -1,9 +1,9 @@
 #!/bin/bash
 # scripts/check-schema-in-sync.sh
 #
-# Fail-closed check that SyncTray/Resources/Schemas/profile.schema.json's
+# Fail-closed check that limpet/Resources/Schemas/profile.schema.json's
 # `properties` keys are a superset of SyncProfile.CodingKeys
-# (SyncTray/Models/SyncProfile.swift). A CodingKey missing from the schema
+# (limpet/Models/SyncProfile.swift). A CodingKey missing from the schema
 # means an external agent/human hand-editing a `.profile.json` file has no
 # validation for that field — this check makes that drift a hard failure,
 # both locally and in CI (.github/workflows/ci.yml).
@@ -23,8 +23,8 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PROFILE_SWIFT="$REPO_ROOT/SyncTray/Models/SyncProfile.swift"
-PROFILE_SCHEMA="$REPO_ROOT/SyncTray/Resources/Schemas/profile.schema.json"
+PROFILE_SWIFT="$REPO_ROOT/limpet/Models/SyncProfile.swift"
+PROFILE_SCHEMA="$REPO_ROOT/limpet/Resources/Schemas/profile.schema.json"
 
 # Extract the key names from `enum CodingKeys: String, CodingKey { ... }`.
 extract_coding_keys() {
@@ -78,7 +78,7 @@ check_in_sync() {
 }
 
 if [[ "${1:-}" == "--self-verify-faildetect" ]]; then
-    TMP_DIR="$(mktemp -d -t synctray-schema-desync)"
+    TMP_DIR="$(mktemp -d -t limpet-schema-desync)"
     trap 'rm -rf "$TMP_DIR"' EXIT
     TMP_SCHEMA="$TMP_DIR/profile.schema.json"
 
