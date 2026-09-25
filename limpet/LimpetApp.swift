@@ -1,0 +1,346 @@
+import SwiftUI
+import UserNotifications
+
+@main
+struct LimpetApp: App {
+    @StateObject private var syncManager: SyncManager
+
+    @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
+
+    init() {
+        // Headless `limpet` CLI subcommands (doctor, test-remote, logs,
+        // listremotes, profiles) are dispatched and exited BEFORE anything
+        // else — never launches the SwiftUI app, never starts watchers/
+        // timers. `dispatch` returns nil for `--self-test` and a
+        // normal (no-argument) launch, so both fall through unaffected.
+        if let exitCode = LimpetCLI.dispatch(arguments: CommandLine.arguments) {
+            exit(exitCode)
+        }
+
+        // `--self-test` runs the host self-test suite (schema/round-trip/
+        // migration/reconcile/self-write/isolated-login/CLI assertions) and
+        // exits immediately — never launches the SwiftUI app. Checked before
+        // any other init work so the self-test never touches real user data.
+        // ConfigSelfTest is #if DEBUG only (no XCTest target; see CLAUDE.md).
+        #if DEBUG
+        if CommandLine.arguments.contains("--self-test") {
+            let exitCode = ConfigSelfTest.run()
+            exit(exitCode)
+        }
+        #endif
+
+        // Run any pending data migrations before loading profiles
+        MigrationRunner.runPendingMigrations()
+
+        // Ship the committed JSON Schemas into ~/.config/limpet/schema/ so
+        // ~/.config/limpet is a valid, agent-editable surface from the very
+        // first launch. Also ensures the config directory itself exists
+        // before SyncManager starts its config watcher.
+        ConfigSchemaInstaller.writeSchemas()
+
+        // Create the sync manager
+        let manager = SyncManager()
+        _syncManager = StateObject(wrappedValue: manager)
+
+        // Share with AppDelegate for window creation
+        AppDelegate.sharedSyncManager = manager
+    }
+
+    var body: some Scene {
+        MenuBarExtra {
+            MenuBarView()
+                .environmentObject(syncManager)
+        } label: {
+            MenuBarIcon(
+                state: syncManager.currentState,
+                progress: syncManager.syncProgress?.percentage
+            )
+        }
+        .menuBarExtraStyle(.window)
+    }
+
+}
+
+struct MenuBarIcon: View {
+    let state: SyncState
+    let progress: Double?  // 0-100, nil when not syncing
+
+    var body: some View {
+        switch state {
+        case .syncing:
+            CircularProgressIcon(percentage: progress ?? 0, color: .systemBlue)
+        case .idle:
+            CircularProgressIcon(percentage: 100, color: .gray)
+        default:
+            Image(systemName: state.iconName)
+                .symbolRenderingMode(.palette)
+                .foregroundStyle(state.iconColor)
+        }
+    }
+}
+
+struct CircularProgressIcon: View {
+    let percentage: Double  // 0-100
+    let color: NSColor      // Progress arc color
+
+    var body: some View {
+        Image(nsImage: createProgressImage(percentage: percentage, color: color))
+    }
+
+    private func createProgressImage(percentage: Double, color: NSColor) -> NSImage {
+        let size: CGFloat = 14
+        let lineWidth: CGFloat = 2
+        let imageSize = NSSize(width: size, height: size)
+
+        let image = NSImage(size: imageSize, flipped: false) { rect in
+            let inset = lineWidth / 2
+            let circleRect = rect.insetBy(dx: inset, dy: inset)
+
+            // Background circle (gray)
+            let backgroundPath = NSBezierPath(ovalIn: circleRect)
+            NSColor.gray.withAlphaComponent(0.4).setStroke()
+            backgroundPath.lineWidth = lineWidth
+            backgroundPath.stroke()
+
+            // Progress arc (clockwise from top)
+            if percentage > 0 {
+                let center = NSPoint(x: rect.midX, y: rect.midY)
+                let radius = (min(rect.width, rect.height) - lineWidth) / 2
+                let startAngle: CGFloat = 90  // Top (in AppKit coordinates)
+                let endAngle = 90 - (percentage / 100 * 360)
+
+                let progressPath = NSBezierPath()
+                progressPath.appendArc(
+                    withCenter: center,
+                    radius: radius,
+                    startAngle: startAngle,
+                    endAngle: endAngle,
+                    clockwise: true
+                )
+                progressPath.lineWidth = lineWidth
+                progressPath.lineCapStyle = .round
+                color.setStroke()
+                progressPath.stroke()
+            }
+
+            return true
+        }
+        image.isTemplate = false  // Keep colors (don't use template rendering)
+        return image
+    }
+}
+
+class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUserNotificationCenterDelegate {
+    /// Shared instance for easy access
+    static var shared: AppDelegate?
+
+    /// Profile ID to select when Settings window opens (set from notification tap)
+    static var pendingProfileSelection: UUID?
+
+    /// Flag to open settings on first view appearance
+    static var shouldOpenSettingsOnLaunch = true
+
+    /// Shared sync manager (set by LimpetApp)
+    static var sharedSyncManager: SyncManager?
+
+    /// The settings window
+    private var settingsWindow: NSWindow?
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        // Store shared instance
+        AppDelegate.shared = self
+        // Check if another instance is already running
+        let runningApps = NSWorkspace.shared.runningApplications
+        let myBundleId = Bundle.main.bundleIdentifier
+        let myPID = ProcessInfo.processInfo.processIdentifier
+
+        let otherInstances = runningApps.filter { app in
+            app.bundleIdentifier == myBundleId && app.processIdentifier != myPID
+        }
+
+        if !otherInstances.isEmpty {
+            // Another instance is running, activate it and quit this one
+            otherInstances.first?.activate()
+            NSApp.terminate(nil)
+            return
+        }
+
+        UNUserNotificationCenter.current().delegate = self
+        requestNotificationPermissions()
+
+        // Install/refresh the `limpet` CLI shim (~/.local/bin/limpet) so the
+        // headless CLI is reachable by name. Best-effort, off the main thread —
+        // never clobbers a file that isn't ours (see CLIShimInstaller).
+        DispatchQueue.global(qos: .utility).async {
+            CLIShimInstaller.install()
+        }
+
+        // Open Settings window on launch
+        if AppDelegate.shouldOpenSettingsOnLaunch {
+            AppDelegate.shouldOpenSettingsOnLaunch = false
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                self.openSettingsWindow()
+            }
+        }
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+    }
+
+    /// Called when the user clicks the Dock icon. While Settings is open the app is in
+    /// `.regular` activation policy and shows in the Dock; clicking that icon should
+    /// reopen / unminimize the Settings window, not be a no-op.
+    ///
+    /// - `flag` is `false` when there are no visible windows (closed or miniaturized).
+    ///   `makeKeyAndOrderFront` inside `openSettingsWindow` deminiaturizes if needed.
+    /// - When `flag` is `true` we return `true` and let AppKit bring the app forward.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if !flag {
+            openSettingsWindow()
+        }
+        return true
+    }
+
+    func openSettingsWindow() {
+        LimpetSettings.debugLog("[limpet] openSettingsWindow called, shared=\(AppDelegate.shared != nil), manager=\(AppDelegate.sharedSyncManager != nil)")
+
+        // Switch to regular activation policy so the window appears in cmd+tab and the Dock.
+        // This is reverted to .accessory when the settings window closes (see windowWillClose).
+        NSApp.setActivationPolicy(.regular)
+
+        // Activate app first
+        if #available(macOS 14.0, *) {
+            NSApp.activate()
+        } else {
+            NSApp.activate(ignoringOtherApps: true)
+        }
+
+        // If window already exists, just show it
+        if let window = settingsWindow {
+            LimpetSettings.debugLog("[limpet] Showing existing window")
+            window.makeKeyAndOrderFront(nil)
+            return
+        }
+
+        // Create the settings window with SwiftUI content
+        guard let syncManager = AppDelegate.sharedSyncManager else {
+            print("[limpet] ERROR: sharedSyncManager is nil!")
+            return
+        }
+        LimpetSettings.debugLog("[limpet] Creating new settings window")
+
+        let settingsView = SettingsView()
+            .environmentObject(syncManager)
+
+        let hostingController = NSHostingController(rootView: settingsView)
+
+        let window = NSWindow(contentViewController: hostingController)
+        window.title = "limpet Settings"
+        window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
+        window.setContentSize(NSSize(width: 700, height: 650))
+        window.minSize = NSSize(width: 600, height: 500)
+        window.center()
+        // isReleasedWhenClosed = false keeps the NSWindow object alive after the user
+        // closes it so we can re-show it via makeKeyAndOrderFront without recreating it.
+        // The delegate is set once here and remains valid for the lifetime of the window
+        // because the same NSWindow instance is reused on every subsequent open.
+        window.isReleasedWhenClosed = false
+        window.delegate = self
+
+        self.settingsWindow = window
+        window.makeKeyAndOrderFront(nil)
+        LimpetSettings.debugLog("[limpet] Window created and shown")
+    }
+
+    // MARK: - NSWindowDelegate
+
+    func windowWillClose(_ notification: Notification) {
+        // Guard: only react to the settings window closing. If AppDelegate is ever set
+        // as the delegate for a second window (e.g. an About panel), that window closing
+        // must not revert the activation policy while Settings is still open.
+        guard notification.object as? NSWindow === settingsWindow else { return }
+
+        // Revert to accessory (menu-bar-only) policy once the settings window closes,
+        // so the app disappears from cmd+tab and the Dock when there is no window open.
+        //
+        // We dispatch asynchronously to let the window finish closing first — calling
+        // setActivationPolicy synchronously inside windowWillClose can confuse AppKit
+        // and leave a phantom Dock tile behind on some macOS versions.
+        //
+        // Race guard: if openSettingsWindow() is called before this async block runs
+        // (rapid close-then-reopen), the window will already be visible again. In that
+        // case we must NOT revert to .accessory or the app disappears from cmd+tab while
+        // its window is on screen. We check isVisible as a proxy for "was reopened".
+        DispatchQueue.main.async { [weak self] in
+            guard let window = self?.settingsWindow, !window.isVisible else { return }
+            NSApp.setActivationPolicy(.accessory)
+        }
+    }
+
+    private func requestNotificationPermissions() {
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge]) { granted, error in
+            if let error = error {
+                print("Notification permission error: \(error)")
+            }
+        }
+    }
+
+    // Handle notification actions
+    func userNotificationCenter(_ center: UNUserNotificationCenter,
+                                didReceive response: UNNotificationResponse,
+                                withCompletionHandler completionHandler: @escaping () -> Void) {
+        let userInfo = response.notification.request.content.userInfo
+
+        // Handle mute action
+        if response.actionIdentifier == "MUTE_PROFILE" {
+            if let profileIdString = userInfo["profileId"] as? String,
+               let profileId = UUID(uuidString: profileIdString) {
+                DispatchQueue.main.async {
+                    AppDelegate.sharedSyncManager?.muteNotifications(for: profileId)
+                }
+            }
+            completionHandler()
+            return
+        }
+
+        // Check if this notification has a profile ID (error notification)
+        if let profileIdString = userInfo["profileId"] as? String,
+           let profileId = UUID(uuidString: profileIdString) {
+            // Store the profile ID and open Settings
+            AppDelegate.pendingProfileSelection = profileId
+
+            // Open Settings window first, then post notification to select profile
+            DispatchQueue.main.async {
+                self.openSettingsWindow()
+
+                // Post notification after a short delay to ensure Settings window is ready
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                    NotificationCenter.default.post(
+                        name: .selectProfile,
+                        object: nil,
+                        userInfo: ["profileId": profileId]
+                    )
+                }
+            }
+        } else if response.actionIdentifier == "OPEN_DIRECTORY" || response.actionIdentifier == UNNotificationDefaultActionIdentifier {
+            // Open directory action
+            if let urlString = userInfo["directoryPath"] as? String {
+                let url = URL(fileURLWithPath: urlString)
+                NSWorkspace.shared.open(url)
+            }
+        }
+        completionHandler()
+    }
+
+    // Show notifications even when app is in foreground
+    func userNotificationCenter(_ center: UNUserNotificationCenter,
+                                willPresent notification: UNNotification,
+                                withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
+        completionHandler([.banner, .sound])
+    }
+}
+
+extension Notification.Name {
+    static let selectProfile = Notification.Name("selectProfile")
+    static let openSettingsWindow = Notification.Name("openSettingsWindow")
+}
