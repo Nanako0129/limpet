@@ -8,14 +8,14 @@ final class SyncManager: ObservableObject {
     @Published private(set) var currentState: SyncState = .idle
     @Published private(set) var lastSyncTime: Date?
     @Published private(set) var recentChanges: [FileChange] = []
-    /// Profiles with an in-flight app-initiated ("Sync Now" / directory-watch) run.
-    /// Per-profile so one hung profile no longer blocks manual syncs for all others.
-    @Published private(set) var manualSyncingProfiles: Set<UUID> = []
 
-    /// True while any profile has an app-initiated sync in flight.
-    /// Computed from `manualSyncingProfiles` so existing view bindings keep working;
-    /// SwiftUI re-reads it whenever the published set changes.
-    var isManualSyncRunning: Bool { !manualSyncingProfiles.isEmpty }
+    /// True while any profile is actively syncing. The launchd-owned `limpet
+    /// watch` process is the SOLE thing that ever runs a sync (see
+    /// limpet-plan.md L3) — this app only ever observes that fact through the
+    /// profile log via `LogWatcher`/`processLogEvent`, exactly like a
+    /// scheduled or FSEvents-triggered run, so there is no separate
+    /// "app-initiated" tracking set to maintain.
+    var isManualSyncRunning: Bool { profileStates.values.contains(.syncing) }
 
     /// Sync progress per profile (keyed by profile ID)
     @Published private(set) var profileProgress: [UUID: SyncProgress] = [:]
@@ -43,7 +43,6 @@ final class SyncManager: ObservableObject {
     let profileStore: ProfileStore
 
     private var logWatchers: [UUID: LogWatcher] = [:]
-    private var directoryWatchers: [UUID: DirectoryWatcher] = [:]
     /// Watches ~/.config/limpet for external edits to *.profile.json and
     /// settings.json and routes them through the reconcile path below.
     private var configFileWatcher: ConfigFileWatcher?
@@ -70,9 +69,8 @@ final class SyncManager: ObservableObject {
         self.profileStore = profileStore ?? ProfileStore()
         setupWorkspaceObserver()
         setupProfileObserver()
-        cleanupStaleLockFiles()
         setupService.refreshSharedScriptIfChanged()  // Propagate script template updates
-        detectAndResumeRunningSyncs()  // After cleanup, detect external syncs
+        detectAndResumeRunningSyncs()  // Detect a sync the watcher already has in flight
         checkInitialState()
         startWatchingAllProfiles()
         refreshSettingsFile()
@@ -89,12 +87,6 @@ final class SyncManager: ObservableObject {
         }
         syncCompletionPollers.removeAll()
 
-        // Stop all directory watchers
-        for watcher in directoryWatchers.values {
-            watcher.stop()
-        }
-        directoryWatchers.removeAll()
-
         if let observer = workspaceObserver {
             NSWorkspace.shared.notificationCenter.removeObserver(observer)
         }
@@ -107,52 +99,63 @@ final class SyncManager: ObservableObject {
         checkInitialState()
     }
 
-    /// Trigger manual sync for all enabled profiles, or a specific profile
+    /// Trigger a sync now for `profile` (or every enabled, non-paused profile)
+    /// by signalling ITS launchd-owned `limpet watch` process — the SOLE
+    /// thing that ever runs a sync (limpet-plan.md L3). The app never runs
+    /// rclone or the sync script itself, and never touches the lock file;
+    /// `launchctl kill`'s exit status is itself the liveness check.
     func triggerManualSync(for profile: SyncProfile? = nil) {
         let profilesToSync: [SyncProfile]
         if let profile = profile {
-            // Skip if this specific profile is paused
             guard !isPaused(for: profile.id) else {
                 LimpetSettings.debugLog("Skipping manual sync for paused profile: \(profile.name)")
                 return
             }
-            // Per-profile guard: don't double-trigger a profile that's already
-            // running an app-initiated sync (a different profile hanging no
-            // longer blocks this one).
-            guard !manualSyncingProfiles.contains(profile.id) else { return }
             profilesToSync = [profile]
         } else {
-            // Filter out paused profiles and any already mid-sync
-            profilesToSync = profileStore.enabledProfiles.filter {
-                !isPaused(for: $0.id) && !manualSyncingProfiles.contains($0.id)
-            }
+            profilesToSync = profileStore.enabledProfiles.filter { !isPaused(for: $0.id) }
         }
 
         guard !profilesToSync.isEmpty else {
-            // Only surface "not configured" when there genuinely are no enabled
-            // profiles — not when they're simply all mid-sync already.
             if profileStore.enabledProfiles.isEmpty {
                 currentState = .notConfigured
             }
             return
         }
 
-        let syncingIds = profilesToSync.map { $0.id }
-        manualSyncingProfiles.formUnion(syncingIds)
-
-        Task {
-            // Run all profile syncs in parallel for better performance
-            await withTaskGroup(of: Void.self) { group in
-                for profile in profilesToSync {
-                    group.addTask {
-                        await self.runSyncScript(for: profile)
-                    }
-                }
-            }
-            await MainActor.run {
-                manualSyncingProfiles.subtract(syncingIds)
-            }
+        for profile in profilesToSync {
+            sendSyncNowSignal(to: profile)
         }
+    }
+
+    /// `launchctl kill SIGUSR1 gui/<uid>/<label>` — addressed by label, not
+    /// PID, so this never races a launchd respawn. A non-zero exit means no
+    /// watcher is currently loaded for that profile; reported to the user as
+    /// such rather than silently doing nothing.
+    private func sendSyncNowSignal(to profile: SyncProfile) {
+        let exitCode = runLaunchctl(["kill", "SIGUSR1", "gui/\(getuid())/\(profile.launchdLabel)"])
+        if exitCode != 0 {
+            profileErrors[profile.id] = "no watcher running"
+            LimpetSettings.debugLog(
+                "Sync now for '\(profile.name)': no watcher running (launchctl kill exit \(exitCode))")
+        }
+    }
+
+    /// Run `/bin/launchctl` with `args`, discarding output — every caller here
+    /// only needs the exit code. Mirrors `SyncSetupService.runCommand`.
+    private func runLaunchctl(_ args: [String]) -> Int32 {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        process.arguments = args
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+        } catch {
+            return -1
+        }
+        process.waitUntilExit()
+        return process.terminationStatus
     }
 
     func openLogFile(for profile: SyncProfile? = nil) {
@@ -497,15 +500,15 @@ final class SyncManager: ObservableObject {
         return enabledIds.isSubset(of: pausedProfiles)
     }
 
-    /// Pause syncing for a specific profile (stops directory watcher, blocks manual/scheduled syncs)
+    /// Pause syncing for a specific profile (blocks manual syncs, stops the
+    /// launchd-owned watcher so no further scheduled/FSEvents/manual run can
+    /// start). The GUI never signals or touches the watcher's lock file
+    /// directly here — `launchctl unload` stops the whole KeepAlive process,
+    /// which owns that lock for the run it may have had in flight.
     func pauseProfile(_ profileId: UUID) {
         guard let profile = profileStore.profile(for: profileId) else { return }
 
         pausedProfiles.insert(profileId)
-
-        // Stop directory watcher for this profile
-        directoryWatchers[profileId]?.stop()
-        directoryWatchers.removeValue(forKey: profileId)
 
         // Actually stop scheduled syncs. Previously pause only set an in-memory
         // flag, so launchd kept firing the sync script every interval — the
@@ -513,9 +516,10 @@ final class SyncManager: ObservableObject {
         // rested. Unload the agent so no new runs start.
         setupService.unloadAgent(for: profile)
 
-        // Terminate any in-flight run for this profile and clear its lock, so a
-        // hung/slow sync can't keep holding the lock and block a later resume.
-        terminateRunningSync(for: profile)
+        // Stop any external-sync completion poller watching this profile.
+        syncCompletionPollers[profile.id]?.cancel()
+        syncCompletionPollers.removeValue(forKey: profile.id)
+        monitoringExternalSyncs.remove(profile.id)
 
         // Update profile state to paused
         profileStates[profileId] = .paused
@@ -527,40 +531,16 @@ final class SyncManager: ObservableObject {
         LimpetSettings.debugLog("Paused profile: \(profile.name)")
     }
 
-    /// Terminate any running sync process for `profile` (identified via its lock
-    /// file PID) and remove the lock so a killed/stale run can't block the next
-    /// start. Best-effort: signals the process group (launchd runs each job as
-    /// its own group leader) so the bash script and its rclone child both stop.
-    /// Safe to call when nothing is running.
-    private func terminateRunningSync(for profile: SyncProfile) {
-        if let pid = detectRunningSyncPID(for: profile) {
-            // Negative PID targets the whole process group; fall back to the
-            // single process if it isn't a group leader.
-            if kill(-pid, SIGTERM) != 0 {
-                kill(pid, SIGTERM)
-            }
-        }
-        // Stop any external-sync completion poller watching this profile.
-        syncCompletionPollers[profile.id]?.cancel()
-        syncCompletionPollers.removeValue(forKey: profile.id)
-        monitoringExternalSyncs.remove(profile.id)
-        // Remove the lock file so the next run isn't blocked by a stale lock.
-        try? FileManager.default.removeItem(atPath: profile.lockFilePath)
-    }
-
-    /// Resume syncing for a specific profile (restarts directory watcher)
+    /// Resume syncing for a specific profile (reloads its launchd watcher).
     func resumeProfile(_ profileId: UUID) {
         guard let profile = profileStore.profile(for: profileId),
               profile.isEnabled else { return }
 
         pausedProfiles.remove(profileId)
 
-        // Reload the launchd agent that pause unloaded so scheduled syncs run
-        // again. (No-op if it somehow never unloaded.)
+        // Reload the launchd agent that pause unloaded — RunAtLoad means this
+        // starts a fresh watcher, which runs its own catch-up sync.
         setupService.loadAgent(for: profile)
-
-        // Restart directory watcher for this profile
-        startWatchingDirectory(for: profile)
 
         // Reset state to idle (or check drive mount status)
         if !profile.drivePathToMonitor.isEmpty &&
@@ -755,33 +735,6 @@ final class SyncManager: ObservableObject {
         updateAggregateState()
     }
 
-    /// Clean up stale lock files on app startup
-    /// Removes /tmp lock files where the PID is no longer running
-    private func cleanupStaleLockFiles() {
-        let fm = FileManager.default
-
-        // Clean up limpet's /tmp lock files
-        for profile in profileStore.profiles {
-            let lockPath = profile.lockFilePath
-            guard fm.fileExists(atPath: lockPath) else { continue }
-
-            // Read PID and check if process is still running
-            if let pidString = try? String(contentsOfFile: lockPath, encoding: .utf8)
-                .trimmingCharacters(in: .whitespacesAndNewlines),
-               let pid = Int32(pidString) {
-                // kill with signal 0 checks if process exists without sending a signal
-                if kill(pid, 0) != 0 {
-                    // Process not running - remove stale lock
-                    try? fm.removeItem(atPath: lockPath)
-                }
-            } else {
-                // Could not read/parse PID - remove the lock file
-                try? fm.removeItem(atPath: lockPath)
-            }
-        }
-
-    }
-
     private func setupProfileObserver() {
         profileStore.$profiles
             .sink { [weak self] _ in
@@ -800,18 +753,11 @@ final class SyncManager: ObservableObject {
             logWatchers[id]?.stopWatching()
             logWatchers.removeValue(forKey: id)
         }
-        for id in directoryWatchers.keys where !enabledProfileIds.contains(id) {
-            directoryWatchers[id]?.stop()
-            directoryWatchers.removeValue(forKey: id)
-        }
 
         // Add watchers only for profiles that don't already have them
         for profile in profileStore.enabledProfiles {
             if logWatchers[profile.id] == nil {
                 startWatching(profile: profile)
-            }
-            if directoryWatchers[profile.id] == nil {
-                startWatchingDirectory(for: profile)
             }
         }
     }
@@ -830,73 +776,9 @@ final class SyncManager: ObservableObject {
         }
     }
 
-    /// Start watching a profile's local sync directory for file changes
-    private func startWatchingDirectory(for profile: SyncProfile) {
-        guard !profile.localSyncPath.isEmpty else { return }
-        guard FileManager.default.fileExists(atPath: profile.localSyncPath) else { return }
-
-        let profileId = profile.id
-        let profileName = profile.name
-        let watchPath = profile.localSyncPath
-        let shortId = String(profileId.uuidString.prefix(8))
-        LimpetSettings.debugLog("Starting watcher for '\(profileName)' [id:\(shortId)] at: \(watchPath)")
-
-        let watcher = DirectoryWatcher(
-            paths: [watchPath],
-            debounceInterval: 5.0,
-            debugLabel: "\(profileName) [\(shortId)]"
-        ) { [weak self] in
-            Task { @MainActor in
-                LimpetSettings.debugLog("Change callback fired for '\(profileName)' [id:\(shortId)] -> triggering sync")
-                self?.handleDirectoryChange(for: profileId)
-            }
-        }
-        watcher.start()
-        directoryWatchers[profile.id] = watcher
-    }
-
-    /// Handle file system changes detected by DirectoryWatcher
-    private func handleDirectoryChange(for profileId: UUID) {
-        // Skip if profile is paused
-        if isPaused(for: profileId) {
-            LimpetSettings.debugLog("DirectoryWatcher: Skipping sync for \(profileId.uuidString.prefix(8)) - profile paused")
-            return
-        }
-
-        // Skip if profile is already syncing (avoid duplicate work)
-        if profileStates[profileId] == .syncing {
-            LimpetSettings.debugLog("DirectoryWatcher: Skipping sync for \(profileId.uuidString.prefix(8)) - already syncing")
-            return
-        }
-
-        // Skip if drive not mounted
-        if profileStates[profileId] == .driveNotMounted {
-            LimpetSettings.debugLog("DirectoryWatcher: Skipping sync for \(profileId.uuidString.prefix(8)) - drive not mounted")
-            return
-        }
-
-        // Get profile and verify it's still valid
-        guard let profile = profileStore.profile(for: profileId),
-              profile.isEnabled else {
-            LimpetSettings.debugLog("DirectoryWatcher: Skipping sync for \(profileId.uuidString.prefix(8)) - profile not found or disabled")
-            return
-        }
-
-        LimpetSettings.debugLog("DirectoryWatcher: Triggering sync for '\(profile.name)' (path: \(profile.localSyncPath))")
-
-        // Trigger sync for this specific profile
-        // Note: Lock file in sync script handles concurrent sync prevention
-        Task {
-            await runSyncScript(for: profile)
-        }
-    }
-
     private func stopWatching(profileId: UUID) {
         logWatchers[profileId]?.stopWatching()
         logWatchers.removeValue(forKey: profileId)
-
-        directoryWatchers[profileId]?.stop()
-        directoryWatchers.removeValue(forKey: profileId)
 
         profileStates.removeValue(forKey: profileId)
     }
@@ -1010,11 +892,6 @@ final class SyncManager: ObservableObject {
                 if profileStates[profile.id] == .driveNotMounted {
                     profileStates[profile.id] = .idle
                 }
-
-                // Restart directory watcher for this profile (path is now available)
-                directoryWatchers[profile.id]?.stop()
-                directoryWatchers.removeValue(forKey: profile.id)
-                startWatchingDirectory(for: profile)
             }
         }
 
@@ -1039,62 +916,6 @@ final class SyncManager: ObservableObject {
         }
 
         updateAggregateState()
-    }
-
-    private func runSyncScript(for profile: SyncProfile) async {
-        // Check if profile is paused
-        if isPaused(for: profile.id) {
-            LimpetSettings.debugLog("Skipping sync script for paused profile: \(profile.name)")
-            return
-        }
-
-        // Check if drive is mounted
-        if !profile.drivePathToMonitor.isEmpty &&
-           !FileManager.default.fileExists(atPath: profile.drivePathToMonitor) {
-            await MainActor.run {
-                profileStates[profile.id] = .driveNotMounted
-                if !isNotificationsMuted(for: profile.id) {
-                    notificationService.notifyDriveNotMounted(profileId: profile.id, profileName: profile.name)
-                }
-                updateAggregateState()
-            }
-            return
-        }
-
-        guard FileManager.default.fileExists(atPath: SyncProfile.sharedScriptPath) else {
-            await MainActor.run {
-                profileStates[profile.id] = .error("Script not found")
-                updateAggregateState()
-            }
-            return
-        }
-
-        guard FileManager.default.fileExists(atPath: profile.configPath) else {
-            await MainActor.run {
-                profileStates[profile.id] = .error("Config not found")
-                updateAggregateState()
-            }
-            return
-        }
-
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/bin/bash")
-        process.arguments = [SyncProfile.sharedScriptPath, profile.configPath]
-
-        do {
-            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-                process.terminationHandler = { _ in
-                    continuation.resume()
-                }
-                do {
-                    try process.run()
-                } catch {
-                    continuation.resume(throwing: error)
-                }
-            }
-        } catch {
-            print("Failed to run sync script for \(profile.name): \(error)")
-        }
     }
 
     private func processLogEvent(_ event: ParsedLogEvent, profileId: UUID) {
@@ -1196,19 +1017,6 @@ final class SyncManager: ObservableObject {
                 if !isNotificationsMuted(for: profileId) {
                     notificationService.notifyDriveNotMounted(profileId: profileId, profileName: profileName)
                 }
-            }
-
-        case .syncSkipped:
-            // A scheduled run exited early without syncing (remote failed the
-            // pre-flight reachability check). "Starting sync" already set the
-            // profile to `.syncing`; reset it here so the profile returns to
-            // rest instead of appearing to sync until the next run.
-            logWatchers[profileId]?.setActivelySyncing(false)
-            profileProgress[profileId] = nil
-            // Only downgrade from `.syncing`; never clobber a real error,
-            // paused, or driveNotMounted state.
-            if profileStates[profileId] == .syncing {
-                profileStates[profileId] = .idle
             }
 
         case .syncAlreadyRunning:

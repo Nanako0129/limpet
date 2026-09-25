@@ -62,6 +62,14 @@ enum ConfigSelfTest {
             testDoctorPureChecks,
             testCLIResolveAndList,
             testShimInstallIdempotentNonClobber,
+            testWatchScheduler,
+            testGeneratedScriptText,
+            testGeneratedPlistShape,
+            testMissingSourceIsNotCreated,
+            testShimQuotesHostilePath,
+            testTransfersChangeReinstalls,
+            testTranslocatedAppRefused,
+            testInstallRefusesNonOwnedShim,
         ]
 
         for check in checks {
@@ -703,7 +711,6 @@ enum ConfigSelfTest {
         installProfile: @escaping (SyncProfile) -> String? = { _ in nil },
         uninstallProfile: @escaping (SyncProfile) -> String? = { _ in nil },
         deleteProfileFile: @escaping (SyncProfile) -> Void = { _ in },
-        runSyncScript: @escaping (_ configPath: String) -> Int32 = { _ in 0 },
         readStdin: @escaping () -> String? = { nil },
         readFile: @escaping (String) -> String? = { _ in nil },
         stdout: @escaping (String) -> Void = { _ in },
@@ -719,7 +726,6 @@ enum ConfigSelfTest {
             installProfile: installProfile,
             uninstallProfile: uninstallProfile,
             deleteProfileFile: deleteProfileFile,
-            runSyncScript: runSyncScript,
             readStdin: readStdin,
             readFile: readFile,
             stdout: stdout,
@@ -828,15 +834,28 @@ enum ConfigSelfTest {
         }
 
 
-        // sync runs the script for a sync profile (script + config present).
-        var ranScript = false
+        // sync signals the watcher via `launchctl kill SIGUSR1` — it never
+        // runs the script itself (limpet-plan.md L3(c)).
+        var killArgs: [String] = []
         let syncEnv = fakeCLIEnvironment(
             readProfiles: { [enabled] },
-            fileExists: { _ in true },
-            runSyncScript: { _ in ranScript = true; return 0 }
+            runLaunchctl: { args in killArgs = args; return (0, "") }
         )
-        guard LimpetCLI.execute(["sync", enabled.shortId], env: syncEnv) == 0, ranScript else {
-            return report("AC-CLI6", "cli-write-commands", false, "(sync did not run the script)")
+        guard LimpetCLI.execute(["sync", enabled.shortId], env: syncEnv) == 0,
+              killArgs == ["kill", "SIGUSR1", "gui/\(getuid())/\(enabled.launchdLabel)"] else {
+            return report("AC-CLI6", "cli-write-commands", false, "(sync did not launchctl kill SIGUSR1: got \(killArgs))")
+        }
+
+        // No watcher running (non-zero launchctl kill) → exits non-zero, greppable.
+        var syncStderr = ""
+        let noWatcherEnv = fakeCLIEnvironment(
+            readProfiles: { [enabled] },
+            runLaunchctl: { _ in (1, "") },
+            stderr: { syncStderr += $0 }
+        )
+        guard LimpetCLI.execute(["sync", enabled.shortId], env: noWatcherEnv) != 0,
+              syncStderr.contains("no watcher running") else {
+            return report("AC-CLI6", "cli-write-commands", false, "(sync with no watcher did not report it)")
         }
 
         return report("AC-CLI6", "cli-write-commands", true)
@@ -1167,7 +1186,7 @@ enum ConfigSelfTest {
             return report("AC-CLI4", "shim-install-idempotent-nonclobber", false, "(install failed on an absent shim path)")
         }
         guard let contents = try? String(contentsOfFile: shimPath, encoding: .utf8),
-              contents.contains("exec \"/tmp/fake-limpet-binary\" \"$@\"") else {
+              contents.contains("exec '/tmp/fake-limpet-binary' \"$@\"") else {
             return report("AC-CLI4", "shim-install-idempotent-nonclobber", false, "(shim content missing exec line)")
         }
         guard let attrs = try? FileManager.default.attributesOfItem(atPath: shimPath),
@@ -1194,6 +1213,396 @@ enum ConfigSelfTest {
         }
 
         return report("AC-CLI4", "shim-install-idempotent-nonclobber", true)
+    }
+
+    // MARK: - AC-W1 — SyncWatchScheduler: exact rerun counts (limpet-plan.md L3)
+
+    /// A deterministic fake clock/queue for `SchedulerRunner.scheduleAfter`:
+    /// records `(fireAt, action)` pairs instead of touching a real timer, and
+    /// `advance(by:)` fires everything due, in fire-order, including actions
+    /// scheduled by an action that just fired — exactly what lets the "runner
+    /// returns 75 repeatedly while the clock advances 60s" case simulate a
+    /// full minute of 10s backoffs in a single synchronous call.
+    private final class VirtualClock {
+        private(set) var now: TimeInterval = 0
+        private var scheduled: [(fireAt: TimeInterval, action: () -> Void)] = []
+
+        func scheduleAfter(_ seconds: TimeInterval, _ action: @escaping () -> Void) {
+            scheduled.append((now + seconds, action))
+        }
+
+        func advance(by seconds: TimeInterval) {
+            let target = now + seconds
+            while true {
+                guard let nextIndex = scheduled.indices
+                    .filter({ scheduled[$0].fireAt <= target })
+                    .min(by: { scheduled[$0].fireAt < scheduled[$1].fireAt })
+                else { break }
+                let entry = scheduled.remove(at: nextIndex)
+                now = entry.fireAt
+                entry.action()
+            }
+            now = target
+        }
+    }
+
+    /// Builds a `SchedulerRunner` whose `runChild` calls `completion`
+    /// SYNCHRONOUSLY and immediately with whatever `exitCode()` currently
+    /// returns — the scheduler is pure, so no dispatch queue or real process
+    /// is needed to drive it deterministically.
+    private static func fakeSchedulerRunner(
+        sourceExists: @escaping () -> Bool = { true },
+        exitCode: @escaping () -> Int32,
+        clock: VirtualClock,
+        onLogSourceMissing: (() -> Void)? = nil
+    ) -> SchedulerRunner {
+        SchedulerRunner(
+            sourceExists: sourceExists,
+            runChild: { completion in completion(exitCode()) },
+            now: { clock.now },
+            scheduleAfter: { seconds, action in clock.scheduleAfter(seconds, action) },
+            logSourceMissing: { onLogSourceMissing?() }
+        )
+    }
+
+    private static func testWatchScheduler() -> Bool {
+        // Case 1: trigger during a run -> exactly 1 rerun. `runChild` here
+        // does NOT call completion synchronously — it captures it, so the
+        // test can trigger() a SECOND time while genuinely still "running"
+        // before manually finishing the first run.
+        do {
+            var pendingCompletions: [(Int32) -> Void] = []
+            let clock = VirtualClock()
+            let runner = SchedulerRunner(
+                sourceExists: { true },
+                runChild: { completion in pendingCompletions.append(completion) },
+                now: { clock.now },
+                scheduleAfter: { s, a in clock.scheduleAfter(s, a) },
+                logSourceMissing: {}
+            )
+            let scheduler = SyncWatchScheduler(runner: runner)
+            scheduler.trigger()  // run 1 starts, held open
+            guard pendingCompletions.count == 1 else {
+                return report("AC-W1", "watch-scheduler", false, "(expected run 1 to start immediately)")
+            }
+            scheduler.trigger()  // trigger while running -> sets pending
+            let firstCompletion = pendingCompletions.removeFirst()
+            firstCompletion(0)  // run 1 exits 0 -> pending causes exactly 1 rerun
+            guard scheduler.runCount == 2, pendingCompletions.count == 1 else {
+                return report(
+                    "AC-W1", "watch-scheduler", false,
+                    "(trigger-during-run: expected exactly 1 rerun, runCount=\(scheduler.runCount))")
+            }
+            pendingCompletions.removeFirst()(0)  // finish run 2 cleanly
+            guard scheduler.runCount == 2, scheduler.state == .idle else {
+                return report("AC-W1", "watch-scheduler", false, "(trigger-during-run: did not settle idle at 2 runs)")
+            }
+        }
+
+        // Case 2: 5 triggers during a run -> still exactly 1 rerun (coalesced).
+        do {
+            var pendingCompletions: [(Int32) -> Void] = []
+            let clock = VirtualClock()
+            let runner = SchedulerRunner(
+                sourceExists: { true },
+                runChild: { completion in pendingCompletions.append(completion) },
+                now: { clock.now },
+                scheduleAfter: { s, a in clock.scheduleAfter(s, a) },
+                logSourceMissing: {}
+            )
+            let scheduler = SyncWatchScheduler(runner: runner)
+            scheduler.trigger()
+            for _ in 0..<5 { scheduler.trigger() }
+            pendingCompletions.removeFirst()(0)
+            guard scheduler.runCount == 2, pendingCompletions.count == 1 else {
+                return report(
+                    "AC-W1", "watch-scheduler", false,
+                    "(5-triggers-during-run: expected exactly 1 rerun, runCount=\(scheduler.runCount))")
+            }
+            pendingCompletions.removeFirst()(0)
+            guard scheduler.runCount == 2 else {
+                return report("AC-W1", "watch-scheduler", false, "(5-triggers-during-run: extra rerun happened)")
+            }
+        }
+
+        // Case 3: a manual sync-now (also just `trigger()`) during a run -> 1 rerun.
+        // Same mechanism as case 1 — SIGUSR1 and FSEvents both funnel into the
+        // same `trigger()`, so this is the identical assertion under the name
+        // the plan uses for it.
+        do {
+            var pendingCompletions: [(Int32) -> Void] = []
+            let clock = VirtualClock()
+            let runner = SchedulerRunner(
+                sourceExists: { true },
+                runChild: { completion in pendingCompletions.append(completion) },
+                now: { clock.now },
+                scheduleAfter: { s, a in clock.scheduleAfter(s, a) },
+                logSourceMissing: {}
+            )
+            let scheduler = SyncWatchScheduler(runner: runner)
+            scheduler.trigger()          // run 1 (e.g. FSEvents)
+            scheduler.trigger()          // manual "sync now" while running
+            pendingCompletions.removeFirst()(1)  // exit 1 (a real failure) still reruns once
+            guard scheduler.runCount == 2 else {
+                return report("AC-W1", "watch-scheduler", false, "(manual-during-run: expected exactly 1 rerun)")
+            }
+            pendingCompletions.removeFirst()(0)
+        }
+
+        // Case 4: a trigger while idle -> 1 run (the debounce itself is
+        // `DirectoryWatcher`'s, already exercised upstream of `trigger()`).
+        do {
+            let clock = VirtualClock()
+            let scheduler = SyncWatchScheduler(
+                runner: fakeSchedulerRunner(exitCode: { 0 }, clock: clock))
+            scheduler.trigger()
+            guard scheduler.runCount == 1, scheduler.state == .idle else {
+                return report("AC-W1", "watch-scheduler", false, "(trigger-while-idle: expected exactly 1 run)")
+            }
+        }
+
+        // Case 5: runner returns 75 repeatedly while the clock advances 60s ->
+        // runs <= 60/10 + 1 (fixed 10s backoff between retries, never a hot loop).
+        do {
+            let clock = VirtualClock()
+            let scheduler = SyncWatchScheduler(
+                runner: fakeSchedulerRunner(exitCode: { 75 }, clock: clock))
+            scheduler.trigger()  // run 1 at t=0
+            clock.advance(by: 60)
+            guard scheduler.runCount <= 7, scheduler.runCount >= 2 else {
+                return report(
+                    "AC-W1", "watch-scheduler", false,
+                    "(exit-75-backoff: expected 2...7 runs over 60s at a 10s backoff, got \(scheduler.runCount))")
+            }
+        }
+
+        // Case 6: a missing source path never runs the child.
+        do {
+            let clock = VirtualClock()
+            var missingLogCount = 0
+            let scheduler = SyncWatchScheduler(
+                runner: fakeSchedulerRunner(
+                    sourceExists: { false },
+                    exitCode: { 0 },
+                    clock: clock,
+                    onLogSourceMissing: { missingLogCount += 1 }))
+            scheduler.trigger()
+            scheduler.trigger()
+            clock.advance(by: 5)
+            scheduler.trigger()
+            guard scheduler.runCount == 0 else {
+                return report("AC-W1", "watch-scheduler", false, "(missing-source: expected 0 runs, got \(scheduler.runCount))")
+            }
+            guard missingLogCount >= 1 else {
+                return report("AC-W1", "watch-scheduler", false, "(missing-source: expected at least one source-missing log)")
+            }
+        }
+
+        return report("AC-W1", "watch-scheduler", true)
+    }
+
+    // MARK: - AC-W2 — generated sync script text (limpet-plan.md L3(b))
+
+    private static func testGeneratedScriptText() -> Bool {
+        let script = SyncSetupService.shared.generateSyncScript()
+
+        guard script.contains("--links") else {
+            return report("AC-W2", "watch-script-text", false, "(missing --links)")
+        }
+        guard script.contains("exit 75") else {
+            return report("AC-W2", "watch-script-text", false, "(missing exit 75 in the lock-held branch)")
+        }
+        guard script.contains("exit 2") else {
+            return report("AC-W2", "watch-script-text", false, "(missing exit 2 for a missing source)")
+        }
+        guard !script.contains(#"mkdir -p "$LOCAL_PATH""#) else {
+            return report("AC-W2", "watch-script-text", false, "(still unconditionally creates $LOCAL_PATH)")
+        }
+        guard !script.lowercased().contains("hard-delete"), !script.lowercased().contains("hard_delete") else {
+            return report("AC-W2", "watch-script-text", false, "(contains a hard-delete flag)")
+        }
+
+        return report("AC-W2", "watch-script-text", true)
+    }
+
+    // MARK: - AC-W3 — generated launchd plist shape (limpet-plan.md L3(c))
+
+    // MARK: - AC-W8 — the shim passes a hostile executable path through literally
+
+    /// The shim is what every LaunchAgent executes, so a path containing shell
+    /// metacharacters must neither break it nor be expanded. Runs the generated shim
+    /// with /bin/sh against a fake executable inside such a directory.
+    private static func testShimQuotesHostilePath() -> Bool {
+        let fm = FileManager.default
+        let root = (selfTestRoot as NSString).appendingPathComponent("shim-quote")
+        try? fm.removeItem(atPath: root)
+        let marker = (root as NSString).appendingPathComponent("expanded")
+        let hostileDir = (root as NSString).appendingPathComponent("a\"b$(touch \(marker))`x`c'd")
+        let fakeExe = (hostileDir as NSString).appendingPathComponent("limpet")
+        let shim = (root as NSString).appendingPathComponent("limpet-shim")
+        do {
+            try fm.createDirectory(atPath: hostileDir, withIntermediateDirectories: true)
+            try "#!/bin/sh\nprintf '%s|' \"$@\"\n".write(toFile: fakeExe, atomically: true, encoding: .utf8)
+            try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeExe)
+        } catch {
+            return report("AC-W8", "shim-quotes-hostile-path", false, "(fixture setup failed: \(error))")
+        }
+        guard CLIShimInstaller.install(executablePath: fakeExe, shimPath: shim) else {
+            return report("AC-W8", "shim-quotes-hostile-path", false, "(shim was not written)")
+        }
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/sh")
+        process.arguments = [shim, "watch", "ab12cd34"]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        do { try process.run() } catch {
+            return report("AC-W8", "shim-quotes-hostile-path", false, "(could not run shim: \(error))")
+        }
+        process.waitUntilExit()
+        let output = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        guard process.terminationStatus == 0, output == "watch|ab12cd34|" else {
+            return report("AC-W8", "shim-quotes-hostile-path", false,
+                          "(status \(process.terminationStatus), output \(output.debugDescription))")
+        }
+        guard !fm.fileExists(atPath: marker) else {
+            return report("AC-W8", "shim-quotes-hostile-path", false, "(command substitution in the path was executed)")
+        }
+        return report("AC-W8", "shim-quotes-hostile-path", true)
+    }
+
+    // MARK: - AC-W4 — a missing localToRemote source is refused, never created
+
+    /// Creating a missing source would hand the watcher an empty directory, and the
+    /// first sync would delete everything on the remote. Only the localToRemote branch
+    /// is exercised: it returns before `cleanupLegacyCheckFiles`, which would run rclone.
+    private static func testMissingSourceIsNotCreated() -> Bool {
+        var profile = sampleProfile()
+        profile.localSyncPath = (selfTestRoot as NSString).appendingPathComponent("missing-source")
+        profile.syncDirection = .localToRemote
+        try? FileManager.default.removeItem(atPath: profile.localSyncPath)
+
+        let error = SyncSetupService.shared.initializeSyncPaths(for: profile)
+        guard error != nil else {
+            return report("AC-W4", "missing-source-not-created", false, "(expected an error for a missing source)")
+        }
+        guard !FileManager.default.fileExists(atPath: profile.localSyncPath) else {
+            return report("AC-W4", "missing-source-not-created", false, "(the missing source directory was created)")
+        }
+        return report("AC-W4", "missing-source-not-created", true)
+    }
+
+    // MARK: - AC-W5 — changing only `transfers` reinstalls the agent
+
+    private static func testTransfersChangeReinstalls() -> Bool {
+        let current = sampleProfile()
+        var updated = current
+        updated.transfers = current.transfers + 8
+        let action = SyncManager.reconcileAction(from: current, to: updated)
+        return report("AC-W5", "transfers-change-reinstalls", action == .reinstall, "(got \(action))")
+    }
+
+    private static func testGeneratedPlistShape() -> Bool {
+        let profile = sampleProfile()
+        // A fake shim path distinct from the real ~/.local/bin/limpet, so this
+        // assertion is meaningless unless ProgramArguments actually carries the
+        // value passed in (and not, say, the app's own executable path).
+        let fakeShimPath = "/tmp/limpet-selftest-shim/limpet"
+        let plist = SyncSetupService.shared.generateLaunchdPlist(for: profile, shimPath: fakeShimPath)
+
+        // Match the key together with its value: a bare `contains("<true/>")` is also
+        // satisfied by RunAtLoad's value and would pass with KeepAlive set to false.
+        guard plist.range(of: #"<key>KeepAlive</key>\s*<true/>"#, options: .regularExpression) != nil else {
+            return report("AC-W3", "watch-plist-shape", false, "(missing KeepAlive true)")
+        }
+        guard plist.range(of: #"<key>RunAtLoad</key>\s*<true/>"#, options: .regularExpression) != nil else {
+            return report("AC-W3", "watch-plist-shape", false, "(missing RunAtLoad)")
+        }
+        // A shim path with XML-special characters must still yield a valid plist that
+        // round-trips to the exact path (the plist is serialized, not templated), AND
+        // ProgramArguments[0] must be exactly the shim path — never the app binary.
+        let oddPath = "/tmp/a&b<c>/limpet-shim/limpet"
+        let oddXML = SyncSetupService.shared.generateLaunchdPlist(for: profile, shimPath: oddPath)
+        guard let parsed = try? PropertyListSerialization.propertyList(
+                  from: Data(oddXML.utf8), options: [], format: nil) as? [String: Any],
+              let args = parsed["ProgramArguments"] as? [String],
+              args == [oddPath, "watch", profile.shortId] else {
+            return report("AC-W3", "watch-plist-shape", false, "(plist with an XML-special shim path did not round-trip)")
+        }
+        guard let fakeParsed = try? PropertyListSerialization.propertyList(
+                  from: Data(plist.utf8), options: [], format: nil) as? [String: Any],
+              let fakeArgs = fakeParsed["ProgramArguments"] as? [String],
+              fakeArgs == [fakeShimPath, "watch", profile.shortId] else {
+            return report(
+                "AC-W3", "watch-plist-shape", false,
+                "(ProgramArguments is not exactly [shimPath, \"watch\", shortId])")
+        }
+        guard !plist.contains("StartInterval") else {
+            return report("AC-W3", "watch-plist-shape", false, "(still has StartInterval)")
+        }
+
+        return report("AC-W3", "watch-plist-shape", true)
+    }
+
+    // MARK: - AC-W6 — App Translocation refuses install / shim write
+
+    /// A translocated executable path must be refused both by the shim
+    /// installer (called on every GUI launch) and by the guard
+    /// `SyncSetupService.install(profile:)` checks before doing anything else.
+    /// Exercises the pure, no-side-effect `isTranslocated` predicate plus
+    /// `CLIShimInstaller.install` against a temp path — never the real
+    /// ~/.local/bin/limpet, and `install(profile:)` itself is never called
+    /// here since it also touches real ~/Library/LaunchAgents paths.
+    private static func testTranslocatedAppRefused() -> Bool {
+        let translocatedPath = "/private/tmp/AppTranslocation/ABCDEF12-3456/d/limpet.app/Contents/MacOS/limpet"
+        guard CLIShimInstaller.isTranslocated(translocatedPath) else {
+            return report("AC-W6", "translocated-app-refused", false, "(isTranslocated didn't flag a translocated path)")
+        }
+        guard !CLIShimInstaller.isTranslocated("/Applications/limpet.app/Contents/MacOS/limpet") else {
+            return report("AC-W6", "translocated-app-refused", false, "(isTranslocated false-positived on a normal path)")
+        }
+
+        let shimDir = "\(selfTestRoot)/ac-w6-shim"
+        try? FileManager.default.removeItem(atPath: shimDir)
+        let shimPath = "\(shimDir)/limpet"
+        guard CLIShimInstaller.install(executablePath: translocatedPath, shimPath: shimPath) == false else {
+            return report("AC-W6", "translocated-app-refused", false, "(shim install did not refuse a translocated executable path)")
+        }
+        guard !FileManager.default.fileExists(atPath: shimPath) else {
+            return report("AC-W6", "translocated-app-refused", false, "(shim was written despite a translocated executable path)")
+        }
+
+        return report("AC-W6", "translocated-app-refused", true)
+    }
+
+    // MARK: - AC-W7 — install() refuses to write over a non-owned shim
+
+    /// `SyncSetupService.install(profile:)` must never point a LaunchAgent at
+    /// a file it doesn't own. `canWriteShim` is the exact guard `install`
+    /// checks before calling `CLIShimInstaller.install` — verified here
+    /// against a temp path with a foreign (unmarked) file, never the real
+    /// ~/.local/bin/limpet.
+    private static func testInstallRefusesNonOwnedShim() -> Bool {
+        let shimDir = "\(selfTestRoot)/ac-w7-shim"
+        try? FileManager.default.removeItem(atPath: shimDir)
+        try? FileManager.default.createDirectory(atPath: shimDir, withIntermediateDirectories: true)
+        let shimPath = "\(shimDir)/limpet"
+
+        guard SyncSetupService.canWriteShim(at: shimPath) else {
+            return report("AC-W7", "install-refuses-nonowned-shim", false, "(refused an absent shim path)")
+        }
+
+        let foreignContent = "#!/bin/sh\necho not ours\n"
+        try? foreignContent.write(toFile: shimPath, atomically: true, encoding: .utf8)
+        guard SyncSetupService.canWriteShim(at: shimPath) == false else {
+            return report("AC-W7", "install-refuses-nonowned-shim", false, "(allowed writing over a foreign, unmarked file)")
+        }
+
+        try? "\(CLIShimInstaller.ownershipMarker)\necho ours\n".write(toFile: shimPath, atomically: true, encoding: .utf8)
+        guard SyncSetupService.canWriteShim(at: shimPath) else {
+            return report("AC-W7", "install-refuses-nonowned-shim", false, "(refused a file limpet owns)")
+        }
+
+        return report("AC-W7", "install-refuses-nonowned-shim", true)
     }
 
 }

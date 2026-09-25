@@ -5,7 +5,6 @@ struct ParsedLogEvent {
         case syncStarted
         case syncCompleted
         case syncFailed(exitCode: Int, message: String?)
-        case syncSkipped(reason: String)
         case driveNotMounted
         case syncAlreadyRunning
         case fileChange(FileChange)
@@ -169,14 +168,6 @@ final class LogParser {
 
         if SyncLogPatterns.isSyncAlreadyRunning(message) {
             return .syncAlreadyRunning
-        }
-
-        // A scheduled run that exited early after failing the pre-flight
-        // reachability check. This closes the sync span/state that
-        // `syncStarted` ("Starting sync") opened moments earlier; without it
-        // the profile stays stuck in `.syncing` until the next run.
-        if SyncLogPatterns.isSyncSkipped(message) {
-            return .syncSkipped(reason: "remote_unreachable")
         }
 
         return .unknown

@@ -20,9 +20,21 @@ enum CLIShimInstaller {
         "\(NSHomeDirectory())/.local/bin/limpet"
     }
 
+    /// Whether `path` runs through macOS's App Translocation
+    /// (`.../AppTranslocation/<random>/...`) — a randomized, non-persistent
+    /// mount Gatekeeper uses for an unmoved, quarantined app. A shim `exec`ing
+    /// a path under here will start working and then, the moment the mount
+    /// disappears (reboot, app relaunch from its real location), point at
+    /// nothing. Exposed so `ConfigSelfTest` can assert the guard without a
+    /// real translocated launch.
+    static func isTranslocated(_ path: String) -> Bool {
+        path.contains("/AppTranslocation/")
+    }
+
     /// Write (or refresh) the shim. No-op, logged, when a file already exists
     /// at `shimPath` that lacks the ownership marker — that's a user's own
-    /// file and must never be overwritten.
+    /// file and must never be overwritten. Also a no-op, logged, when
+    /// `executablePath` is an App Translocation path — see `isTranslocated`.
     ///
     /// - Parameter shimPath: overridable so `ConfigSelfTest` can target an
     ///   isolated temp path instead of the real `~/.local/bin/limpet`.
@@ -32,6 +44,10 @@ enum CLIShimInstaller {
         shimPath: String = CLIShimInstaller.shimPath
     ) -> Bool {
         guard !executablePath.isEmpty else { return false }
+        guard !isTranslocated(executablePath) else {
+            LimpetSettings.debugLog("[CLIShimInstaller] \(executablePath) is an App Translocation path; skipping shim write")
+            return false
+        }
 
         let fm = FileManager.default
         let binDir = (shimPath as NSString).deletingLastPathComponent
@@ -51,12 +67,16 @@ enum CLIShimInstaller {
         // bare — a bare launch starts the GUI/menu-bar app, which is surprising
         // for a command typed in a terminal. `open -a limpet` remains the way
         // to launch the app. Any subcommand is forwarded verbatim.
+        // Single-quoted for the shell: inside '...' nothing is special, so a path with
+        // `"`, `$` or backticks is passed through literally instead of breaking the
+        // shim or being expanded. The shim is what each LaunchAgent executes.
+        let quoted = shellSingleQuoted(executablePath)
         let script = """
         \(ownershipMarker)
         if [ "$#" -eq 0 ]; then
-          exec "\(executablePath)" help
+          exec \(quoted) help
         fi
-        exec "\(executablePath)" "$@"
+        exec \(quoted) "$@"
         """
 
         do {
@@ -67,6 +87,11 @@ enum CLIShimInstaller {
             LimpetSettings.debugLog("[CLIShimInstaller] Failed to write shim at \(shimPath): \(error)")
             return false
         }
+    }
+
+    /// POSIX single-quoting: wrap in '...' and turn each embedded `'` into `'\\''`.
+    static func shellSingleQuoted(_ value: String) -> String {
+        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 
     /// Whether the file at `path` carries limpet's ownership marker as its

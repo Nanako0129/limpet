@@ -44,6 +44,8 @@
 		F2B3C4D5E6F7089012AB0001 /* MigrationRunner.swift in Sources */ = {isa = PBXBuildFile; fileRef = F2B3C4D5E6F7089012AB0002 /* MigrationRunner.swift */; };
 		F9268603C9EA887930F58C52 /* ConfigSchemaInstaller.swift in Sources */ = {isa = PBXBuildFile; fileRef = C537381AA63EEF38035C8CA0 /* ConfigSchemaInstaller.swift */; };
 		F99405AC91359147E15ABEFD /* LimpetCLI.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5FF13407D6D0E3A3B55ED862 /* LimpetCLI.swift */; };
+		DB4E59F0E420CE6646D68AC1 /* SyncWatchScheduler.swift in Sources */ = {isa = PBXBuildFile; fileRef = E4B39B125799EEA16074BEEF /* SyncWatchScheduler.swift */; };
+		646C48499514A2F19CAA7F85 /* SyncWatchDaemon.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7409E6588DEAD56B2E5D6744 /* SyncWatchDaemon.swift */; };
 		FC42AD91FD4C3FCBE784DE4F /* AppSettingsFileStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 48C81844C44AA7C559B6730B /* AppSettingsFileStore.swift */; };
 		FC6298CE8767141C78EB8D75 /* ConfigSelfTest.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7F52EB2FA3D07D3E970F226D /* ConfigSelfTest.swift */; };
 /* End PBXBuildFile section */
@@ -57,6 +59,8 @@
 		58F65D759543D11557E77A58 /* settings.schema.json */ = {isa = PBXFileReference; includeInIndex = 1; path = settings.schema.json; sourceTree = "<group>"; };
 		5AD2D42E871A6CC074379689 /* ConfigReconciler.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = ConfigReconciler.swift; sourceTree = "<group>"; };
 		5FF13407D6D0E3A3B55ED862 /* LimpetCLI.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = LimpetCLI.swift; sourceTree = "<group>"; };
+		E4B39B125799EEA16074BEEF /* SyncWatchScheduler.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = SyncWatchScheduler.swift; sourceTree = "<group>"; };
+		7409E6588DEAD56B2E5D6744 /* SyncWatchDaemon.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = SyncWatchDaemon.swift; sourceTree = "<group>"; };
 		6E8B026F33644146D215E2A3 /* CLIShimInstaller.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = CLIShimInstaller.swift; sourceTree = "<group>"; };
 		75E6545555EB74D6B9B97A02 /* ConfigFileWatcher.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = ConfigFileWatcher.swift; sourceTree = "<group>"; };
 		77CC26F6DC209C0F0B6626D7 /* ProviderFieldsView.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = ProviderFieldsView.swift; sourceTree = "<group>"; };
@@ -132,6 +136,8 @@
 			children = (
 				5FF13407D6D0E3A3B55ED862 /* LimpetCLI.swift */,
 				6E8B026F33644146D215E2A3 /* CLIShimInstaller.swift */,
+				E4B39B125799EEA16074BEEF /* SyncWatchScheduler.swift */,
+				7409E6588DEAD56B2E5D6744 /* SyncWatchDaemon.swift */,
 			);
 			name = CLI;
 			path = CLI;
@@ -353,6 +359,8 @@
 				FC6298CE8767141C78EB8D75 /* ConfigSelfTest.swift in Sources */,
 				F99405AC91359147E15ABEFD /* LimpetCLI.swift in Sources */,
 				97D529370EB9EC5B06EFB9EE /* CLIShimInstaller.swift in Sources */,
+				DB4E59F0E420CE6646D68AC1 /* SyncWatchScheduler.swift in Sources */,
+				646C48499514A2F19CAA7F85 /* SyncWatchDaemon.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

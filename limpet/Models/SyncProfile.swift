@@ -13,6 +13,7 @@ struct SyncProfile: Identifiable, Codable, Equatable {
     var isEnabled: Bool                 // whether scheduled sync is active
     var isMuted: Bool                   // whether notifications are muted for this profile
     var syncDirection: SyncDirection    // direction for one-way sync
+    var transfers: Int                  // rclone --transfers (checkers = 2x this); default: 16
 
     /// Short ID for file naming (first 8 chars of UUID)
     var shortId: String {
@@ -119,7 +120,8 @@ struct SyncProfile: Identifiable, Codable, Equatable {
         additionalRcloneFlags: String = "",
         isEnabled: Bool = false,
         isMuted: Bool = false,
-        syncDirection: SyncDirection = .localToRemote
+        syncDirection: SyncDirection = .localToRemote,
+        transfers: Int = 16
     ) {
         self.id = id
         self.name = name
@@ -132,6 +134,7 @@ struct SyncProfile: Identifiable, Codable, Equatable {
         self.isEnabled = isEnabled
         self.isMuted = isMuted
         self.syncDirection = syncDirection
+        self.transfers = transfers
     }
 
     /// Create a new profile with default values
@@ -146,7 +149,7 @@ extension SyncProfile {
     enum CodingKeys: String, CodingKey {
         case id, name, rcloneRemote, remotePath, localSyncPath
         case drivePathToMonitor, syncIntervalMinutes, additionalRcloneFlags
-        case isEnabled, isMuted, syncDirection
+        case isEnabled, isMuted, syncDirection, transfers
     }
 
     init(from decoder: Decoder) throws {
@@ -168,6 +171,8 @@ extension SyncProfile {
         isMuted = try container.decodeIfPresent(Bool.self, forKey: .isMuted) ?? false
         // Backwards compatibility: default to localToRemote if not present
         syncDirection = try container.decodeIfPresent(SyncDirection.self, forKey: .syncDirection) ?? .localToRemote
+        // Backwards compatibility: default to 16 if not present.
+        transfers = try container.decodeIfPresent(Int.self, forKey: .transfers) ?? 16
     }
 }
 
