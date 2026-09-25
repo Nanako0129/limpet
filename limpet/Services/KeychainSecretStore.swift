@@ -98,7 +98,16 @@ struct KeychainSecretStore {
         case timedOut
     }
 
+    /// Set by `ConfigSelfTest.run()`: while true, the real `/usr/bin/security`
+    /// is never started, whatever a test injects. The self-test drives only a
+    /// fake runner; this makes a test that forgot to inject one fail instead
+    /// of raising keychain dialogs on the machine running it.
+    nonisolated(unsafe) static var realKeychainForbidden = false
+
     private func run(_ arguments: [String], stdin: String? = nil) -> RunResult {
+        if Self.realKeychainForbidden, securityPath == Self.trustedApplication {
+            return .exited(-1, Data())
+        }
         let process = Process()
         process.executableURL = URL(fileURLWithPath: securityPath)
         process.arguments = arguments

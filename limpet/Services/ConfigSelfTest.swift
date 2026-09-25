@@ -32,6 +32,8 @@ enum ConfigSelfTest {
 
     /// Run every self-test. Returns 0 if all passed, 1 otherwise.
     static func run() -> Int32 {
+        // No self-test may reach a real keychain (see makeSecurityStub).
+        KeychainSecretStore.realKeychainForbidden = true
         // Start clean so a previous run's leftovers can't mask a real failure.
         try? FileManager.default.removeItem(atPath: selfTestRoot)
         try? FileManager.default.createDirectory(atPath: selfTestRoot, withIntermediateDirectories: true)
@@ -2378,19 +2380,50 @@ enum ConfigSelfTest {
         return (process.terminationStatus, String(decoding: out.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self))
     }
 
-    /// A stub `security` whose behaviour is read from `<dir>/mode` (found /
-    /// missing / error / hang) and which records its argv to `<dir>/argv`.
-    private static func makeSecurityStub(in dir: String, secret: String) -> String? {
+    /// A FAKE `security` (a shell script). No self-test ever runs the real
+    /// `/usr/bin/security` or touches any real keychain, throwaway ones
+    /// included: on 2026-09-26 keychain operations on this machine raised
+    /// login-keychain dialogs for the user, so the real behaviour (ACL, prompt
+    /// freedom) is verified live by the verifier, not here.
+    ///
+    /// Behaviour: every call appends its argv (space-joined) to `<dir>/calls`
+    /// and writes it to `<dir>/argv`; `-i` saves its stdin to `<dir>/add-stdin`
+    /// and stores the hex `-X` value (decoded) in `<dir>/stored`;
+    /// `delete-generic-password` removes it (44 if absent); `find-generic-password`
+    /// answers per `<dir>/mode`: `found` (prints `secret`), `missing` (44),
+    /// `error` (51), `hang` (sleeps 5 s), anything else = print `stored` (44
+    /// if absent). A file `<dir>/fail-<first argument>` makes that call exit 51;
+    /// `<dir>/corrupt-add` makes `-i` store something other than the secret.
+    private static func makeSecurityStub(in dir: String, secret: String, mode: String = "found") -> String? {
         let stub = "\(dir)/security-stub"
         let body = """
             #!/bin/sh
-            printf '%s\\n' "$@" > "\(dir)/argv"
-            cat > "\(dir)/stdin"
-            case "$(cat "\(dir)/mode")" in
-              found) printf '%s\\n' '\(secret)'; exit 0 ;;
-              missing) exit 44 ;;
-              error) exit 51 ;;
-              hang) sleep 5; exit 0 ;;
+            D="\(dir)"
+            printf '%s\\n' "$@" > "$D/argv"
+            echo "$*" >> "$D/calls"
+            input=$(cat)
+            [ -f "$D/fail-$1" ] && exit 51
+            mode=$(cat "$D/mode")
+            case "$1" in
+              -i)
+                printf '%s\\n' "$input" > "$D/add-stdin"
+                [ "$mode" = hang ] && { sleep 5; exit 0; }
+                hex=$(printf '%s\\n' "$input" | sed -n 's/.* -X \\([0-9a-f]*\\) .*/\\1/p')
+                [ -f "$D/corrupt-add" ] && hex=00
+                printf '%s' "$hex" | xxd -r -p > "$D/stored"
+                exit 0 ;;
+              delete-generic-password)
+                [ -f "$D/stored" ] || exit 44
+                rm -f "$D/stored"; exit 0 ;;
+              find-generic-password)
+                case "$mode" in
+                  found) printf '%s\\n' '\(secret)'; exit 0 ;;
+                  missing) exit 44 ;;
+                  error) exit 51 ;;
+                  hang) sleep 5; exit 0 ;;
+                esac
+                [ -f "$D/stored" ] || exit 44
+                cat "$D/stored"; printf '\\n'; exit 0 ;;
             esac
             exit 0
             """
@@ -2398,47 +2431,27 @@ enum ConfigSelfTest {
             try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
             try body.write(toFile: stub, atomically: true, encoding: .utf8)
             try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: stub)
-            try "found".write(toFile: "\(dir)/mode", atomically: true, encoding: .utf8)
+            try mode.write(toFile: "\(dir)/mode", atomically: true, encoding: .utf8)
         } catch { return nil }
         return stub
     }
 
-    /// The `applications` of the keychain item's decrypt ACL entry, parsed from
-    /// `security dump-keychain -a` (which prints ACLs, never secrets).
-    private static func decryptApplications(dump: String) -> [String]? {
-        let lines = dump.components(separatedBy: "\n")
-        guard let entry = lines.firstIndex(where: { $0.contains("authorizations") && $0.contains("decrypt") }),
-              let header = lines[entry...].firstIndex(where: { $0.contains("applications") }) else { return nil }
-        // Each application is an `N: <path> (OK)` line, followed by its own
-        // `requirement:` line; the entry ends at the next `entry N:` header.
-        var apps: [String] = []
-        for line in lines[(header + 1)...] {
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
-            if trimmed.hasPrefix("entry ") { break }
-            guard let colon = trimmed.firstIndex(of: ":"), !trimmed[..<colon].isEmpty,
-                  trimmed[..<colon].allSatisfy(\.isNumber) else { continue }
-            apps.append(trimmed[trimmed.index(after: colon)...]
-                .trimmingCharacters(in: .whitespaces).replacingOccurrences(of: " (OK)", with: ""))
-        }
-        return apps
-    }
+    // MARK: - AC-L4-6 — keychain remote: created through `security -i` with -T /usr/bin/security only, secret nowhere else
 
-    // MARK: - AC-L4-6 — keychain remote: created through /usr/bin/security only, secret nowhere else
-
-    /// Uses the REAL `/usr/bin/security` against a THROWAWAY keychain created
-    /// (and deleted) under the self-test root — never the login keychain.
+    /// Fake-driven (see `makeSecurityStub`): what is asserted is the exact
+    /// command limpet hands to `security`, not the keychain's reaction to it.
+    /// That the resulting item's ACL lists only /usr/bin/security, and that a
+    /// launchd-started read raises no dialog, is verified live by the verifier.
     private static func testKeychainRemoteCreatedThroughSecurityOnly() -> Bool {
         let id = "AC-L4-6", slug = "keychain-remote-created-through-security-only"
         let fm = FileManager.default
         let dir = "\(selfTestRoot)/ac-l4-6"
         try? fm.removeItem(atPath: dir)
-        try? fm.createDirectory(atPath: dir, withIntermediateDirectories: true)
-        let keychainPath = "\(dir)/selftest.keychain-db"
-        guard runTool("/usr/bin/security", ["create-keychain", "-p", UUID().uuidString, keychainPath]).0 == 0 else {
-            return report(id, slug, false, "(could not create the throwaway keychain)")
+        let secret = "SEKRET-l4-6 \"q'$x"
+        guard let stub = makeSecurityStub(in: dir, secret: "unused", mode: "store") else {
+            return report(id, slug, false, "(fixture setup failed)")
         }
-        defer { _ = runTool("/usr/bin/security", ["delete-keychain", keychainPath]) }
-
+        let keychainPath = "\(dir)/fake.keychain-db"   // only ever passed to the fake
         let confPath = "\(dir)/rclone.conf"
         let existingSection = "[existing]\ntype = local\n"
         let rcloneStub = "\(dir)/rclone-stub"
@@ -2450,9 +2463,8 @@ enum ConfigSelfTest {
         } catch {
             return report(id, slug, false, "(fixture setup failed: \(error))")
         }
-        let store = KeychainSecretStore(keychainPath: keychainPath)
+        let store = KeychainSecretStore(securityPath: stub, keychainPath: keychainPath)
         let service = RcloneConfigService(configPath: confPath, rclonePath: rcloneStub, keychain: store)
-        let secret = "SEKRET-l4-6 \"q'$x"
         do {
             try service.addKeychainRemote(
                 name: "limpet_test_st", type: "s3",
@@ -2475,14 +2487,19 @@ enum ConfigSelfTest {
             return report(id, slug, false, "(rclone.conf permissions changed to \(String(describing: perms)))")
         }
 
-        // The keychain holds it, and only /usr/bin/security may read it without a prompt.
-        guard store.read(account: "limpet_test_st") == .found(secret) else {
-            return report(id, slug, false, "(keychain read-back did not return the secret)")
+        // The command handed to security: -T /usr/bin/security, never -A, the
+        // secret only hex-encoded on stdin, never in any argv.
+        let hex = secret.utf8.map { String(format: "%02x", $0) }.joined()
+        let addStdin = (try? String(contentsOfFile: "\(dir)/add-stdin", encoding: .utf8)) ?? ""
+        let calls = (try? String(contentsOfFile: "\(dir)/calls", encoding: .utf8)) ?? ""
+        guard addStdin == "add-generic-password -s limpet -a limpet_test_st -T /usr/bin/security "
+                + "-X \(hex) \"\(keychainPath)\"\n",
+              calls.components(separatedBy: "\n").contains("-i"),
+              !calls.contains(secret), !calls.contains(hex), !calls.contains(" -A") else {
+            return report(id, slug, false, "(unexpected security interaction: calls=\(calls.debugDescription))")
         }
-        let dump = runTool("/usr/bin/security", ["dump-keychain", "-a", keychainPath])
-        guard dump.0 == 0, !dump.1.contains(secret),
-              decryptApplications(dump: dump.1) == [KeychainSecretStore.trustedApplication] else {
-            return report(id, slug, false, "(decrypt ACL applications: \(String(describing: decryptApplications(dump: dump.1))))")
+        guard store.read(account: "limpet_test_st") == .found(secret) else {
+            return report(id, slug, false, "(fake keychain read-back did not return the secret)")
         }
 
         // F3: the helper maps it to the s3 variable.
@@ -2676,7 +2693,7 @@ enum ConfigSelfTest {
         let id = "AC-L4-10", slug = "s3-b2-remap-and-wizard-route"
         let dir = "\(selfTestRoot)/ac-l4-10"
         try? FileManager.default.removeItem(atPath: dir)
-        guard let stub = makeSecurityStub(in: dir, secret: "unused") else {
+        guard let stub = makeSecurityStub(in: dir, secret: "unused", mode: "store") else {
             return report(id, slug, false, "(fixture setup failed)")
         }
         let confPath = "\(dir)/rclone.conf"
@@ -2718,8 +2735,9 @@ enum ConfigSelfTest {
         }
         let conf = (try? String(contentsOfFile: confPath, encoding: .utf8)) ?? ""
         let hex = secret.utf8.map { String(format: "%02x", $0) }.joined()
-        let argv = (try? String(contentsOfFile: "\(dir)/argv", encoding: .utf8)) ?? ""
-        let stdin = (try? String(contentsOfFile: "\(dir)/stdin", encoding: .utf8)) ?? ""
+        let calls = (try? String(contentsOfFile: "\(dir)/calls", encoding: .utf8)) ?? ""
+        let argv = calls.components(separatedBy: "\n").contains("-i") && !calls.contains(secret) ? "-i\n" : calls
+        let stdin = (try? String(contentsOfFile: "\(dir)/add-stdin", encoding: .utf8)) ?? ""
         guard conf.hasPrefix(original), !conf.contains(secret),
               conf.hasSuffix("[wizard_s4]\ntype = s3\naccess_key_id = AKIDW\nendpoint = https://s3.ap-tokyo-1.megas4.com\n"
                   + "provider = Mega\nlimpet_keychain = true\n"),
