@@ -206,8 +206,9 @@ what the current rclone.conf section gives.
 `KeychainSecretStore` asks a lock-status provider (production:
 `SecKeychainGetStatus`, unverified that it can never prompt). While the login
 keychain is locked nothing reads it: the watcher logs `Keychain locked — open
-limpet and click "Allow keychain access"`, starts no rclone and waits for its
-next trigger; the menu shows "Allow keychain access", the only action that
+limpet and click "Allow keychain access"` (like every keychain line, at most
+once per 30 s, the refusal and source-missing throttle), starts no rclone and
+waits for its next trigger; the menu shows "Allow keychain access", the only action that
 may raise the system unlock dialog, which then sends the waiting watchers
 SIGUSR1.
 

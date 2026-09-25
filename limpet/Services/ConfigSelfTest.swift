@@ -106,6 +106,7 @@ enum ConfigSelfTest {
             testWizardRetryKeepsProfileId,
             testPruneKeepsUndecodableFile,
             testEditKeepsNonSecretRequiredErrors,
+            testKeychainLockedLogThrottled,
         ]
 
         for check in checks {
@@ -1316,7 +1317,7 @@ enum ConfigSelfTest {
     ) -> SchedulerRunner {
         SchedulerRunner(
             sourceExists: sourceExists,
-            runChild: { completion in completion(exitCode()) },
+            runChild: { _, completion in completion(exitCode()) },
             now: { clock.now },
             scheduleAfter: { seconds, action in clock.scheduleAfter(seconds, action) },
             logSourceMissing: { onLogSourceMissing?() },
@@ -1337,7 +1338,7 @@ enum ConfigSelfTest {
             let clock = VirtualClock()
             let runner = SchedulerRunner(
                 sourceExists: { true },
-                runChild: { completion in pendingCompletions.append(completion) },
+                runChild: { _, completion in pendingCompletions.append(completion) },
                 now: { clock.now },
                 scheduleAfter: { s, a in clock.scheduleAfter(s, a) },
                 logSourceMissing: {},
@@ -1371,7 +1372,7 @@ enum ConfigSelfTest {
             let clock = VirtualClock()
             let runner = SchedulerRunner(
                 sourceExists: { true },
-                runChild: { completion in pendingCompletions.append(completion) },
+                runChild: { _, completion in pendingCompletions.append(completion) },
                 now: { clock.now },
                 scheduleAfter: { s, a in clock.scheduleAfter(s, a) },
                 logSourceMissing: {},
@@ -1404,7 +1405,7 @@ enum ConfigSelfTest {
             let clock = VirtualClock()
             let runner = SchedulerRunner(
                 sourceExists: { true },
-                runChild: { completion in pendingCompletions.append(completion) },
+                runChild: { _, completion in pendingCompletions.append(completion) },
                 now: { clock.now },
                 scheduleAfter: { s, a in clock.scheduleAfter(s, a) },
                 logSourceMissing: {},
@@ -2891,7 +2892,7 @@ enum ConfigSelfTest {
                        clock: VirtualClock, runs: @escaping () -> Void) -> SyncWatchScheduler {
             SyncWatchScheduler(runner: SchedulerRunner(
                 sourceExists: { true },
-                runChild: { completion in runs(); completion(SyncWatchScheduler.deleteLimitExitCode) },
+                runChild: { _, completion in runs(); completion(SyncWatchScheduler.deleteLimitExitCode) },
                 now: { clock.now },
                 scheduleAfter: { s, a in clock.scheduleAfter(s, a) },
                 logSourceMissing: {},
@@ -3082,7 +3083,7 @@ enum ConfigSelfTest {
         let clock = VirtualClock()
         let scheduler = SyncWatchScheduler(runner: SchedulerRunner(
             sourceExists: { true },
-            runChild: { completion in runs += 1; completion(0) },
+            runChild: { _, completion in runs += 1; completion(0) },
             now: { clock.now },
             scheduleAfter: { s, act in clock.scheduleAfter(s, act) },
             logSourceMissing: {},
@@ -3550,6 +3551,59 @@ enum ConfigSelfTest {
         return report(id, slug, true)
     }
 
+    // MARK: - AC-L4-27 — a locked keychain logs once per throttle window, not once per trigger
+
+    /// Internal review F6: `secretEnvironment`'s lines were written on every
+    /// trigger (~5 s while files change), unlike refusal and source-missing
+    /// lines. The run now asks the scheduler's `mayLog`, throttled per kind.
+    /// Wired as in `SyncWatchDaemon.productionRunner`, minus its main-queue hop.
+    private static func testKeychainLockedLogThrottled() -> Bool {
+        let id = "AC-L4-27", slug = "keychain-locked-log-throttled"
+        let dir = "\(selfTestRoot)/ac-l4-27"
+        try? FileManager.default.removeItem(atPath: dir)
+        guard let stub = makeSecurityStub(in: dir, secret: "unused", mode: "found") else {
+            return report(id, slug, false, "(fixture setup failed)")
+        }
+        let confPath = "\(dir)/rclone.conf"
+        try? "[ks3]\ntype = s3\nprovider = Mega\nlimpet_keychain = true\n"
+            .write(toFile: confPath, atomically: true, encoding: .utf8)
+        let store = KeychainSecretStore(
+            securityPath: stub, keychainPath: "\(dir)/fake.keychain-db", lockStatus: { _ in .locked })
+        let service = RcloneConfigService(configPath: confPath, rclonePath: "/usr/bin/false", keychain: store)
+        let profile = SyncProfile(name: "p", rcloneRemote: "ks3:", remotePath: "b", localSyncPath: "/tmp/x")
+        var lines: [String] = [], refusals = 0, spawned = 0
+        let clock = VirtualClock()
+        let scheduler = SyncWatchScheduler(runner: SchedulerRunner(
+            sourceExists: { true },
+            runChild: { mayLog, completion in
+                completion(SyncWatchDaemon.runSyncChild(
+                    profile: profile, service: service,
+                    log: { if mayLog() { lines.append($0) } },
+                    spawn: { _ in spawned += 1; return 0 }))
+            },
+            now: { clock.now },
+            scheduleAfter: { s, a in clock.scheduleAfter(s, a) },
+            logSourceMissing: {},
+            refusalReason: { nil },
+            logRefusal: { _ in refusals += 1 },
+            deleteLimitReached: { false },
+            recordDeleteLimit: { true }))
+        for _ in 0..<4 {              // four debounced triggers, 5 s apart
+            scheduler.trigger()
+            clock.advance(by: 5)
+        }
+        guard scheduler.runCount == 4, lines == [KeychainSecretStore.lockedMessage], spawned == 0 else {
+            return report(id, slug, false, "(within the window: runs=\(scheduler.runCount) lines=\(lines.count) spawned=\(spawned))")
+        }
+        clock.advance(by: 30)
+        scheduler.trigger()
+        guard lines.count == 2, spawned == 0, refusals == 0, scheduler.state == .idle,
+              !FileManager.default.fileExists(atPath: "\(dir)/calls") else {
+            return report(id, slug, false, "(after the window: lines=\(lines.count) spawned=\(spawned) state=\(scheduler.state))")
+        }
+        return report(id, slug, true)
+    }
+
     // MARK: - AC-L4-5 — the watcher refuses before every run (catch-up, trigger, SIGUSR1, retry)
 
     /// Drives `SyncWatchScheduler` with the PRODUCTION refusal closure
@@ -3567,7 +3621,7 @@ enum ConfigSelfTest {
         let clock = VirtualClock()
         let runner = SchedulerRunner(
             sourceExists: { true },
-            runChild: { completion in childRuns += 1; completion(exitCode) },
+            runChild: { _, completion in childRuns += 1; completion(exitCode) },
             now: { clock.now },
             scheduleAfter: { s, a in clock.scheduleAfter(s, a) },
             logSourceMissing: {},
@@ -3602,7 +3656,7 @@ enum ConfigSelfTest {
         var badRuns = 0
         let badScheduler = SyncWatchScheduler(runner: SchedulerRunner(
             sourceExists: { true },
-            runChild: { completion in badRuns += 1; completion(0) },
+            runChild: { _, completion in badRuns += 1; completion(0) },
             now: { clock.now },
             scheduleAfter: { s, a in clock.scheduleAfter(s, a) },
             logSourceMissing: {},
@@ -3622,7 +3676,7 @@ enum ConfigSelfTest {
         var present = true, pendingCompletion: ((Int32) -> Void)?, runs = 0
         let stuckScheduler = SyncWatchScheduler(runner: SchedulerRunner(
             sourceExists: { present },
-            runChild: { completion in runs += 1; pendingCompletion = completion },
+            runChild: { _, completion in runs += 1; pendingCompletion = completion },
             now: { clock.now },
             scheduleAfter: { s, a in clock.scheduleAfter(s, a) },
             logSourceMissing: {},

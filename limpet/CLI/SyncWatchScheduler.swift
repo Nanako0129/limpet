@@ -13,7 +13,11 @@ struct SchedulerRunner {
     /// once it finishes. Asynchronous by signature so a real run doesn't have
     /// to block whatever queue the scheduler operates on; the self-test's
     /// fakes are free to call `completion` synchronously and immediately.
-    var runChild: (_ completion: @escaping (Int32) -> Void) -> Void
+    /// Before writing a line of its own to the profile log (a locked keychain
+    /// or a failed secret read, which fail every trigger alike), the run asks
+    /// `mayLog`, which is throttled like `logRefusal`. `mayLog` mutates
+    /// scheduler state, so it must be called on the scheduler's queue.
+    var runChild: (_ mayLog: @escaping () -> Bool, _ completion: @escaping (Int32) -> Void) -> Void
     /// Monotonic-ish wall-clock seconds. Production uses the real clock; the
     /// self-test uses a `VirtualClock`.
     var now: () -> TimeInterval
@@ -75,6 +79,7 @@ final class SyncWatchScheduler {
     private let missingSourceRecheckInterval: TimeInterval
     private var lastMissingSourceLogAt: TimeInterval?
     private var lastRefusalLogAt: TimeInterval?
+    private var lastRunLogAt: TimeInterval?
     /// A run exited 76 but the marker could not be written: stay stopped for
     /// the life of this process rather than trust a marker that is not there.
     private var deleteLimitUnrecorded = false
@@ -132,9 +137,12 @@ final class SyncWatchScheduler {
         }
         state = .running(pending: pending)
         runCount += 1
-        runner.runChild { [weak self] code in
+        runner.runChild({ [weak self] in
+            guard let self else { return false }
+            return self.throttle(&self.lastRunLogAt)
+        }, { [weak self] code in
             self?.handleExit(code: code)
-        }
+        })
     }
 
     private func handleExit(code: Int32) {

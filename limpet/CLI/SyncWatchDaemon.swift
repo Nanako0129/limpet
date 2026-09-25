@@ -84,12 +84,14 @@ enum SyncWatchDaemon {
     private static func productionRunner(for profile: SyncProfile) -> SchedulerRunner {
         SchedulerRunner(
             sourceExists: { FileManager.default.fileExists(atPath: profile.localSyncPath) },
-            runChild: { completion in
+            runChild: { mayLog, completion in
                 DispatchQueue.global(qos: .utility).async {
                     let code = runSyncChild(
                         profile: profile,
                         service: .shared,
-                        log: { appendProfileLogLine($0, profile: profile) },
+                        // Throttled: a locked keychain fails every ~5 s trigger alike.
+                        // mayLog touches scheduler state, which lives on main.
+                        log: { if DispatchQueue.main.sync(execute: mayLog) { appendProfileLogLine($0, profile: profile) } },
                         spawn: { environment in
                             runChildProcess(
                                 scriptPath: SyncProfile.sharedScriptPath,
