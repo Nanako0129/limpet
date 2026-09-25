@@ -55,6 +55,11 @@
       "type": "string",
       "enum": ["localToRemote", "remoteToLocal"],
       "description": "Direction for one-way sync."
+    },
+    "transfers": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "rclone --transfers for this profile's sync (--checkers is 2x this value). Default 16."
     }
   },
   "required": [
