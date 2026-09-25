@@ -392,33 +392,75 @@ final class SyncSetupService {
             SYNC_DIRECTION=$(parse_json "syncDirection" "localToRemote")
             REMOTE_PATH=$(parse_json "remotePath" "")
             TRANSFERS=$(parse_json "transfers" "16")
-            CHECKERS=$((TRANSFERS * 2))
 
             if [[ -z "$REMOTE" || -z "$LOCAL_PATH" ]]; then
                 echo "Error: Invalid config - missing remote or localPath"
                 exit 1
             fi
 
+            # additionalFlags is whitespace-separated and passed to rclone as literal
+            # argv elements (documented in CLAUDE.md and the profile schema) — never
+            # re-parsed as shell syntax, so there is no quoting or expansion left for
+            # a flag to use. A quoted flag like `--exclude "*.tmp"` would otherwise
+            # reach rclone as the single literal token `"*.tmp"` (quotes included),
+            # which matches nothing and silently starts syncing files meant to be
+            # excluded; `--log-file ~/x.log` would create a directory literally named
+            # `~`. Refuse instead of doing either silently: a quote, $, backtick, or
+            # a token starting with ~ exits 64 before rclone is ever invoked. Write
+            # flags as --flag=value, e.g. --exclude=*.tmp.
+            # `transfers` reaches bash arithmetic below, which would run command
+            # substitutions inside an array subscript (`a[$(cmd)]`); accept digits only.
+            if [[ ! "$TRANSFERS" =~ ^[0-9]+$ ]]; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S') - Refusing to sync: transfers must be a whole number" >> "$LOG_FILE"
+                exit 64
+            fi
+            CHECKERS=$((TRANSFERS * 2))
+
+            # `read -r -a` only consumes the first line, so a flag after a newline would
+            # be dropped silently (turning `--exclude=*.tmp` + newline + `--dry-run` into
+            # a real sync). Refuse instead.
+            if [[ "$ADDITIONAL_FLAGS" == *$'\\n'* || "$ADDITIONAL_FLAGS" == *$'\\r'* ]]; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S') - Refusing to sync: additionalRcloneFlags contains a line break; put all flags on one line" >> "$LOG_FILE"
+                exit 64
+            fi
+
+            if [[ -n "$ADDITIONAL_FLAGS" ]]; then
+                read -r -a ADDITIONAL_FLAGS_ARRAY <<< "$ADDITIONAL_FLAGS"
+            else
+                ADDITIONAL_FLAGS_ARRAY=()
+            fi
+            for flag_token in "${ADDITIONAL_FLAGS_ARRAY[@]}"; do
+                if [[ "$flag_token" == *'"'* || "$flag_token" == *"'"* || "$flag_token" == *'`'* || "$flag_token" == *'$'* || "$flag_token" == '~'* ]]; then
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') - Refusing to sync: additionalRcloneFlags contains quotes, dollar signs, backticks or ~, which limpet passes to rclone literally. Write flags as --flag=value without quotes, e.g. --exclude=*.tmp" >> "$LOG_FILE"
+                    exit 64
+                fi
+            done
+
             # Find rclone binary. Cover the common package-manager locations,
             # including nix-darwin's system and per-user profiles which live outside
             # Homebrew's dirs (issue #53). $USER can be unset under launchd, so derive
             # it. Fall back to a PATH lookup for any other install layout.
             RCLONE_USER="${USER:-$(id -un)}"
-            RCLONE_BIN=""
-            RCLONE_CANDIDATES=(
-                /opt/homebrew/bin/rclone
-                /usr/local/bin/rclone
-                /run/current-system/sw/bin/rclone
-                "/etc/profiles/per-user/$RCLONE_USER/bin/rclone"
-                "$HOME/.nix-profile/bin/rclone"
-                /usr/bin/rclone
-            )
-            for path in "${RCLONE_CANDIDATES[@]}"; do
-                if [[ -x "$path" ]]; then
-                    RCLONE_BIN="$path"
-                    break
-                fi
-            done
+            # Honor an RCLONE_BIN already set in the environment (e.g. a test
+            # harness injecting a stub) before falling back to the hardcoded
+            # candidates below.
+            if [[ -z "${RCLONE_BIN:-}" || ! -x "$RCLONE_BIN" ]]; then
+                RCLONE_BIN=""
+                RCLONE_CANDIDATES=(
+                    /opt/homebrew/bin/rclone
+                    /usr/local/bin/rclone
+                    /run/current-system/sw/bin/rclone
+                    "/etc/profiles/per-user/$RCLONE_USER/bin/rclone"
+                    "$HOME/.nix-profile/bin/rclone"
+                    /usr/bin/rclone
+                )
+                for path in "${RCLONE_CANDIDATES[@]}"; do
+                    if [[ -x "$path" ]]; then
+                        RCLONE_BIN="$path"
+                        break
+                    fi
+                done
+            fi
 
             if [[ -z "$RCLONE_BIN" ]]; then
                 RCLONE_BIN=$(command -v rclone 2>/dev/null || true)
@@ -494,27 +536,32 @@ final class SyncSetupService {
                 exit 2
             fi
 
-            # One-way sync
+            # One-way sync. Built as an argv array and run directly — never a
+            # string re-interpreted by the shell (a value like `~/Data$old` in
+            # LOCAL_PATH/REMOTE/FILTER_FILE must never be re-expanded, or `$old`
+            # collapses to empty and the wrong directory gets synced/deleted).
             if [[ "$SYNC_DIRECTION" == "localToRemote" ]]; then
                 # Local is source, remote is destination (backup/upload)
                 echo "$(date '+%Y-%m-%d %H:%M:%S') - Starting sync (local → remote)" >> "$LOG_FILE"
-                RCLONE_CMD="$RCLONE_BIN sync \\"$LOCAL_PATH\\" \\"$REMOTE\\" --verbose --use-json-log --stats 2s --filter-from \\"$FILTER_FILE\\" --links --fast-list --transfers $TRANSFERS --checkers $CHECKERS"
+                cmd=("$RCLONE_BIN" sync "$LOCAL_PATH" "$REMOTE" --verbose --use-json-log --stats 2s --filter-from "$FILTER_FILE" --links --fast-list --transfers "$TRANSFERS" --checkers "$CHECKERS")
             else
                 # Remote is source, local is destination (download/mirror)
                 echo "$(date '+%Y-%m-%d %H:%M:%S') - Starting sync (remote → local)" >> "$LOG_FILE"
-                RCLONE_CMD="$RCLONE_BIN sync \\"$REMOTE\\" \\"$LOCAL_PATH\\" --verbose --use-json-log --stats 2s --filter-from \\"$FILTER_FILE\\" --links --fast-list --transfers $TRANSFERS --checkers $CHECKERS"
+                cmd=("$RCLONE_BIN" sync "$REMOTE" "$LOCAL_PATH" --verbose --use-json-log --stats 2s --filter-from "$FILTER_FILE" --links --fast-list --transfers "$TRANSFERS" --checkers "$CHECKERS")
             fi
 
             if [[ -n "$NO_CHECK_CERT" ]]; then
-                RCLONE_CMD="$RCLONE_CMD $NO_CHECK_CERT"
+                cmd+=("$NO_CHECK_CERT")
             fi
 
-            if [[ -n "$ADDITIONAL_FLAGS" ]]; then
-                RCLONE_CMD="$RCLONE_CMD $ADDITIONAL_FLAGS"
+            # additionalFlags was already validated and split into
+            # ADDITIONAL_FLAGS_ARRAY above; append its tokens as-is.
+            if [[ ${#ADDITIONAL_FLAGS_ARRAY[@]} -gt 0 ]]; then
+                cmd+=("${ADDITIONAL_FLAGS_ARRAY[@]}")
             fi
 
             # Run sync command
-            eval "$RCLONE_CMD" 2>&1 | tee -a "$LOG_FILE"
+            "${cmd[@]}" 2>&1 | tee -a "$LOG_FILE"
 
             EXIT_CODE=${PIPESTATUS[0]}
 
@@ -525,6 +572,8 @@ final class SyncSetupService {
             fi
 
             echo "" >> "$LOG_FILE"
+
+            exit "$EXIT_CODE"
             """
     }
 

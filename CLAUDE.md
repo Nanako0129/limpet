@@ -20,6 +20,21 @@ limpet is a macOS menu bar application that provides Google Drive-style backgrou
 | One-Way Upload | `rclone sync local remote` | Local is authoritative, uploads to remote |
 | One-Way Download | `rclone sync remote local` | Remote is authoritative, downloads to local |
 
+### Additional rclone Flags
+
+The per-profile `additionalRcloneFlags` field (free text, `Any additional rclone flags`
+in the UI) is appended to the generated sync script's rclone invocation. The
+script builds that invocation as a bash argv array and runs it directly — never
+through `eval` — so `additionalRcloneFlags` is split on whitespace (`read -r -a`)
+into literal argv elements with **no shell quoting or expansion**. Write flags
+as `--flag=value` (e.g. `--exclude=*.tmp --bwlimit=5M`); a flag's value cannot
+contain a space, because there is no quoting syntax left to express one. A
+value containing a quote (`"`/`'`), a backtick, `$`, or a token starting with
+`~` is refused before rclone ever runs (`exit 64`, logged as `Refusing to
+sync: ...`) instead of being passed through — quoting or expanding it would
+otherwise reach rclone as literal, meaningless text (e.g. `--exclude "*.tmp"`
+would arrive as the single token `"*.tmp"`, quotes included, matching nothing).
+
 ### How It Works
 1. User configures a profile: local path, rclone remote, and sync interval
 2. limpet generates a shell script and launchd plist for scheduled syncs
