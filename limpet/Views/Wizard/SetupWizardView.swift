@@ -540,7 +540,7 @@ struct SetupWizardView: View {
                     advanceToNextStep(nextStep)
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(!canAdvance)
+                .disabled(!canAdvance || isLoading)
             }
         }
     }
@@ -639,14 +639,24 @@ struct SetupWizardView: View {
         isLoading = true
         errorMessage = nil
 
-        do {
-            try configService.addRemote(remoteConfig)
-            selectedRemote = "\(remoteConfig.name):"
-            isLoading = false
-            completion()
-        } catch {
-            isLoading = false
-            errorMessage = error.localizedDescription
+        // Off the main thread, as AddRemoteSheet.createRemote does: for s3/b2,
+        // addRemote runs addKeychainRemote, which spawns /usr/bin/security.
+        let capturedConfig = remoteConfig
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                try configService.addRemote(capturedConfig)
+                let remoteName = "\(capturedConfig.name):"
+                DispatchQueue.main.async {
+                    isLoading = false
+                    selectedRemote = remoteName
+                    completion()
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    isLoading = false
+                    errorMessage = error.localizedDescription
+                }
+            }
         }
     }
 
