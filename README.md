@@ -248,7 +248,7 @@ When syncing to an external drive:
 | `settings.json` | App settings: launch at login, debug logging |
 | `schema/*.schema.json` | JSON Schemas for validating the files above |
 
-- **Live apply**: a file watcher (~1s debounce) reconciles every external edit through the same path as the app's Save button — an enabled/disabled toggle installs or removes the launchd agent, a warm-field edit re-warms offline folders.
+- **Live apply**: a file watcher (~1s debounce) reconciles every external edit through the same path as the app's Save button — an enabled/disabled toggle installs or removes the launchd agent.
 - **Create by dropping a file**: write a new `*.profile.json` with a fresh `id` and SyncTray creates that profile. Only five keys are required — `id`, `name`, `rcloneRemote`, `remotePath`, `localSyncPath` — every other field takes its default. The launchd agent installs only once the profile is also `isEnabled` and valid, so you can stage a profile disabled, then flip it on in a second edit.
 - **Credential-free**: rclone secrets live in `~/.config/rclone/rclone.conf`, never in these files. Validate a profile against `schema/profile.schema.json` before writing it.
 
