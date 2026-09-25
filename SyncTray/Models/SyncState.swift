@@ -186,39 +186,6 @@ enum SyncState: Equatable {
     }
 }
 
-/// Which transport is currently active for a profile's sync
-enum ActiveTransport: Equatable {
-    case primary
-    case fallback(remoteName: String)
-    case unknown
-
-    var isPrimary: Bool {
-        if case .primary = self { return true }
-        return false
-    }
-
-    var isFallback: Bool {
-        if case .fallback = self { return true }
-        return false
-    }
-
-    var iconName: String {
-        switch self {
-        case .primary: return "wifi"
-        case .fallback: return "antenna.radiowaves.left.and.right"
-        case .unknown: return "questionmark.circle"
-        }
-    }
-
-    var label: String {
-        switch self {
-        case .primary: return "Primary"
-        case .fallback(let name): return "Fallback (\(name))"
-        case .unknown: return "Unknown"
-        }
-    }
-}
-
 struct FileChange: Identifiable, Equatable {
     let id = UUID()
     let timestamp: Date
@@ -315,10 +282,8 @@ enum SyncLogPatterns {
 
     /// Patterns indicating a scheduled run exited early WITHOUT syncing because
     /// the remote failed the read-only pre-flight reachability check.
-    /// Matches "Remote unreachable, skipping sync ..." but deliberately NOT the
-    /// fallback message "Primary remote unreachable, using fallback: ..." (which
-    /// is a transport change, handled separately) — the discriminator is the
-    /// ", skipping" clause.
+    /// Matches "Remote unreachable, skipping sync ..." — the discriminator is
+    /// the ", skipping" clause.
     static func isSyncSkipped(_ message: String) -> Bool {
         message.lowercased().contains("unreachable, skipping")
     }
@@ -346,25 +311,6 @@ enum SyncLogPatterns {
     /// Prefixes to strip from error messages for cleaner display
     static func cleanErrorMessage(_ message: String) -> String {
         message
-    }
-
-    // MARK: - Transport Detection
-
-    /// Check if message indicates fallback transport was activated
-    static func isFallbackActivated(_ message: String) -> Bool {
-        message.contains("using fallback:")
-    }
-
-    /// Check if message indicates primary transport is in use
-    static func isPrimaryTransport(_ message: String) -> Bool {
-        message.contains("Using primary remote:")
-    }
-
-    /// Extract the fallback remote name from a fallback log message
-    static func extractFallbackRemoteName(from message: String) -> String? {
-        // Format: "Primary remote unreachable, using fallback: synology-sftp"
-        guard let range = message.range(of: "using fallback: ") else { return nil }
-        return String(message[range.upperBound...]).trimmingCharacters(in: .whitespaces)
     }
 
     // MARK: - Exit Code Extraction

@@ -102,7 +102,6 @@ final class TelemetryService {
     private var syncErrorCounter: LongCounterSdk?
     private var mountOperationCounter: LongCounterSdk?
     private var directoryWatchTriggerCounter: LongCounterSdk?
-    private var transportFallbackCounter: LongCounterSdk?
     private var fileOperationCounter: LongCounterSdk?
     private var remoteConfigCounter: LongCounterSdk?
     private var syncContentionCounter: LongCounterSdk?
@@ -309,12 +308,6 @@ final class TelemetryService {
             .setUnit("1")
             .build()
 
-        transportFallbackCounter = meter
-            .counterBuilder(name: "synctray.transport.fallback_activations")
-            .setDescription("Number of times fallback remote was activated")
-            .setUnit("1")
-            .build()
-
         fileOperationCounter = meter
             .counterBuilder(name: "synctray.sync.file_operations")
             .setDescription("Number of file operations by type and extension")
@@ -503,14 +496,12 @@ final class TelemetryService {
         profileId: UUID,
         profileName: String,
         syncMode: String,
-        syncDirection: SyncDirection? = nil,
-        hasFallback: Bool = false
+        syncDirection: SyncDirection? = nil
     ) -> [String: AttributeValue] {
         var attrs: [String: AttributeValue] = [
             "synctray.profile.id": .string(profileId.uuidString),
             "synctray.profile.name": .string(profileName),
             "sync.mode": .string(syncMode),
-            "sync.has_fallback": .bool(hasFallback),
         ]
         if let direction = syncDirection {
             attrs["sync.direction"] = .string(direction.rawValue)
@@ -526,7 +517,6 @@ final class TelemetryService {
         profileName: String,
         syncMode: String,
         syncDirection: SyncDirection? = nil,
-        hasFallback: Bool = false,
         trigger: String = "scheduled"  // manual | directory_watch | scheduled | startup
     ) {
         guard SyncTraySettings.telemetryEnabled else { return }
@@ -544,8 +534,7 @@ final class TelemetryService {
             profileId: profileId,
             profileName: profileName,
             syncMode: syncMode,
-            syncDirection: syncDirection,
-            hasFallback: hasFallback
+            syncDirection: syncDirection
         )
         // What kicked off this sync: an app-initiated run sets the trigger; a bare
         // launchd/scheduled run leaves it at the default.
@@ -846,34 +835,6 @@ final class TelemetryService {
         )
     }
 
-    // MARK: - Transport Changes
-
-    /// Record when transport switches between primary and fallback.
-    func recordTransportChange(
-        profileId: UUID,
-        profileName: String,
-        transport: String           // "primary" or "fallback"
-    ) {
-        guard SyncTraySettings.telemetryEnabled else { return }
-        ensureSetup()
-
-        if transport == "fallback" {
-            transportFallbackCounter?.add(value: 1, attribute: [
-                "synctray.profile.name": .string(profileName),
-            ])
-        }
-
-        emitLog(
-            severity: transport == "fallback" ? .warn : .info,
-            body: "Transport changed to \(transport)",
-            attributes: [
-                "synctray.profile.id": .string(profileId.uuidString),
-                "synctray.profile.name": .string(profileName),
-                "sync.transport": .string(transport),
-            ]
-        )
-    }
-
     // MARK: - Sync Errors (logged outside of sync lifecycle)
 
     /// Record a sync error detected in logs (for real-time error visibility).
@@ -986,7 +947,6 @@ final class TelemetryService {
                 "config.sync_mode": .string("sync"),
                 "config.sync_direction": .string(profile.syncDirection.rawValue),
                 "config.sync_interval_bucket": .string(intervalBucket),
-                "config.has_fallback": .bool(profile.hasFallback),
                 "config.has_external_drive": .bool(!profile.drivePathToMonitor.isEmpty),
                 "config.is_enabled": .bool(profile.isEnabled),
                 "config.is_muted": .bool(profile.isMuted),
@@ -1004,7 +964,6 @@ final class TelemetryService {
         let modeBreakdown = Dictionary(grouping: profiles, by: { _ in "sync" })
             .mapValues { $0.count }
         let enabledCount = profiles.filter { $0.isEnabled }.count
-        let fallbackCount = profiles.filter { $0.hasFallback }.count
         let externalDriveCount = profiles.filter { !$0.drivePathToMonitor.isEmpty }.count
 
         emitLog(
@@ -1016,7 +975,6 @@ final class TelemetryService {
                 "config.bisync_profiles": .int(modeBreakdown["bisync"] ?? 0),
                 "config.sync_profiles": .int(modeBreakdown["sync"] ?? 0),
                 "config.mount_profiles": .int(modeBreakdown["mount"] ?? 0),
-                "config.fallback_configured_count": .int(fallbackCount),
                 "config.external_drive_count": .int(externalDriveCount),
             ]
         )

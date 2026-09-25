@@ -55,18 +55,6 @@
       "type": "string",
       "enum": ["localToRemote", "remoteToLocal"],
       "description": "Direction for one-way sync."
-    },
-    "fallbackRemote": {
-      "type": "string",
-      "description": "Fallback rclone remote used when the primary is unreachable (empty = no fallback)."
-    },
-    "fallbackRemotePath": {
-      "type": "string",
-      "description": "Path on the fallback remote (empty = same as remotePath)."
-    },
-    "fallbackRequiresCacheRebuild": {
-      "type": "boolean",
-      "description": "Whether primary/fallback use different rclone wire types, forcing a full REMOTE swap on failover instead of an env-var override."
     }
   },
   "required": [

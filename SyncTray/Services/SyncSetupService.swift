@@ -346,9 +346,6 @@ final class SyncSetupService {
             ADDITIONAL_FLAGS=$(parse_json "additionalFlags" "")
             FILTER_FILE=$(parse_json "filterPath" "")
             SYNC_DIRECTION=$(parse_json "syncDirection" "localToRemote")
-            FALLBACK_REMOTE=$(parse_json "fallbackRemote" "")
-            FALLBACK_PATH=$(parse_json "fallbackRemotePath" "")
-            FALLBACK_REQUIRES_CACHE_REBUILD=$(parse_json "fallbackRequiresCacheRebuild" "false")
             REMOTE_PATH=$(parse_json "remotePath" "")
 
             if [[ -z "$REMOTE" || -z "$LOCAL_PATH" ]]; then
@@ -408,25 +405,6 @@ final class SyncSetupService {
             REMOTE_NAME="${REMOTE%%:*}"
             NO_CHECK_CERT=$(check_no_cert "$REMOTE_NAME")
 
-            # Run a command with a HARD wall-clock timeout. macOS ships no
-            # coreutils `timeout`, and rclone's own --contimeout/--timeout are
-            # not always honoured by the SMB backend (a hibernating/unreachable
-            # NAS could hang the reachability probe for many minutes while
-            # holding the lock). This kills the probe if it overruns so the run
-            # exits promptly and releases the lock. Returns 124 on timeout.
-            run_with_timeout() {
-                local secs="$1"; shift
-                "$@" &
-                local cmd_pid=$!
-                ( sleep "$secs"; kill -TERM "$cmd_pid" 2>/dev/null; sleep 2; kill -KILL "$cmd_pid" 2>/dev/null ) &
-                local watchdog_pid=$!
-                wait "$cmd_pid" 2>/dev/null
-                local status=$?
-                kill "$watchdog_pid" 2>/dev/null
-                wait "$watchdog_pid" 2>/dev/null
-                return $status
-            }
-
             # Check if drive is mounted (if configured)
             if [[ -n "$DRIVE_PATH" && ! -d "$DRIVE_PATH" ]]; then
                 echo "$(date '+%Y-%m-%d %H:%M:%S') - Drive not mounted, skipping sync" >> "$LOG_FILE"
@@ -462,35 +440,6 @@ final class SyncSetupService {
             # Ensure local sync directory exists
             mkdir -p "$LOCAL_PATH"
 
-            # Remote fallback: if primary remote is unreachable, try fallback remote
-            if [[ -n "$FALLBACK_REMOTE" ]]; then
-                REMOTE_NAME="${REMOTE%%:*}"
-                # Quick reachability check on primary remote (3s connect timeout)
-                if ! run_with_timeout 15 $RCLONE_BIN lsd "${REMOTE_NAME}:" --contimeout 3s --timeout 8s --max-depth 0 $NO_CHECK_CERT &>/dev/null; then
-                    echo "$(date '+%Y-%m-%d %H:%M:%S') - Primary remote unreachable, using fallback: $FALLBACK_REMOTE" >> "$LOG_FILE"
-                    # Re-check cert setting for the fallback remote
-                    NO_CHECK_CERT=$(check_no_cert "$FALLBACK_REMOTE")
-
-                    if [[ -z "$FALLBACK_PATH" && "$FALLBACK_REQUIRES_CACHE_REBUILD" != "true" && "$FALLBACK_REQUIRES_CACHE_REBUILD" != "True" ]]; then
-                        # Same remote name preserved: use env var overrides to swap transport.
-                        UPPER_NAME=$(echo "$REMOTE_NAME" | tr '[:lower:]' '[:upper:]' | tr '-' '_')
-                        eval "$($RCLONE_BIN config dump 2>/dev/null | python3 -c "
-            import json, sys
-            d = json.load(sys.stdin).get('${FALLBACK_REMOTE}', {})
-            name = '${UPPER_NAME}'
-            for k, v in d.items():
-                safe_k = k.upper().replace('-', '_')
-                print(f'export RCLONE_CONFIG_{name}_{safe_k}=\\\"' + str(v).replace('\\\"', '\\\\\\\"') + '\\\"')
-            ")"
-                    else
-                        # Different wire type OR explicit path change: swap entire REMOTE reference.
-                        REMOTE="${FALLBACK_REMOTE}:${FALLBACK_PATH:-$REMOTE_PATH}"
-                    fi
-                else
-                    echo "$(date '+%Y-%m-%d %H:%M:%S') - Using primary remote: $REMOTE_NAME" >> "$LOG_FILE"
-                fi
-            fi
-
             # One-way sync
             if [[ "$SYNC_DIRECTION" == "localToRemote" ]]; then
                 # Local is source, remote is destination (backup/upload)
@@ -525,34 +474,6 @@ final class SyncSetupService {
             """
     }
 
-    /// Returns true when primary and fallback remotes have different rclone wire types,
-    /// meaning the sync script must swap the full remote reference on fallback activation.
-    /// Uses rcloneType (e.g. "webdav", "smb", "sftp") so that .synology and .webdav
-    /// (both wire type "webdav") are treated as compatible.
-    ///
-    /// Limitation: RcloneConfigService.providerFromRcloneType maps unrecognised rclone
-    /// types (s3, azureblob, b2, ftp, etc.) to .webdav as a fallback, so two different
-    /// unrecognised types both resolve to rcloneType "webdav" and are incorrectly treated
-    /// as cache-compatible. This is safe for the wizard-supported type set; users with
-    /// manually-added exotic remotes should set fallbackRemotePath explicitly to force a
-    /// REMOTE swap via the existing path-based branch.
-    private func computeFallbackRequiresCacheRebuild(profile: SyncProfile) -> Bool {
-        guard profile.hasFallback else { return false }
-        let configService = RcloneConfigService.shared
-        let primaryName = profile.rcloneRemote.hasSuffix(":")
-            ? String(profile.rcloneRemote.dropLast())
-            : profile.rcloneRemote
-        let fallbackName = profile.fallbackRemote.hasSuffix(":")
-            ? String(profile.fallbackRemote.dropLast())
-            : profile.fallbackRemote
-        guard let primaryConfig = configService.readRemoteConfig(name: primaryName),
-              let fallbackConfig = configService.readRemoteConfig(name: fallbackName) else {
-            // Cannot read config — default to safe behaviour (force REMOTE swap, no cache poisoning)
-            return true
-        }
-        return primaryConfig.provider.rcloneType != fallbackConfig.provider.rcloneType
-    }
-
     /// Generate profile-specific JSON config.
     /// Not private — `ConfigSelfTest` calls this directly to verify the
     /// derived config's key set stays frozen (AC-2) without going through
@@ -570,9 +491,6 @@ final class SyncSetupService {
             "filterPath": profile.filterFilePath,
             "syncIntervalMinutes": profile.syncIntervalMinutes,
             "syncDirection": profile.syncDirection.rawValue,
-            "fallbackRemote": profile.fallbackRemote,
-            "fallbackRemotePath": profile.fallbackRemotePath,
-            "fallbackRequiresCacheRebuild": computeFallbackRequiresCacheRebuild(profile: profile),
             "remotePath": profile.remotePath,
         ]
 

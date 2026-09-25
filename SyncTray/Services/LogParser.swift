@@ -11,7 +11,6 @@ struct ParsedLogEvent {
         case fileChange(FileChange)
         case stats(RcloneStats)
         case errorMessage(String)
-        case transportChanged(ActiveTransport)
         case unknown
     }
 
@@ -178,16 +177,6 @@ final class LogParser {
         // the profile stays stuck in `.syncing` until the next run.
         if SyncLogPatterns.isSyncSkipped(message) {
             return .syncSkipped(reason: "remote_unreachable")
-        }
-
-        // Transport fallback detection
-        if SyncLogPatterns.isFallbackActivated(message) {
-            let remoteName = SyncLogPatterns.extractFallbackRemoteName(from: message) ?? "unknown"
-            return .transportChanged(.fallback(remoteName: remoteName))
-        }
-
-        if SyncLogPatterns.isPrimaryTransport(message) {
-            return .transportChanged(.primary)
         }
 
         return .unknown

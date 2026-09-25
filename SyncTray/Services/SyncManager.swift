@@ -37,9 +37,6 @@ final class SyncManager: ObservableObject {
     /// Last error message per profile (for display in UI)
     @Published private(set) var profileErrors: [UUID: String] = [:]
 
-    /// Active transport per profile (primary or fallback)
-    @Published private(set) var profileTransports: [UUID: ActiveTransport] = [:]
-
     /// Paused profiles (session-only, not persisted - resets on app restart)
     @Published private(set) var pausedProfiles: Set<UUID> = []
 
@@ -472,11 +469,6 @@ final class SyncManager: ObservableObject {
     /// Get state for a specific profile
     func state(for profileId: UUID) -> SyncState {
         profileStates[profileId] ?? .idle
-    }
-
-    /// Get active transport for a specific profile
-    func activeTransport(for profileId: UUID) -> ActiveTransport {
-        profileTransports[profileId] ?? .unknown
     }
 
     /// Get last error message for a specific profile
@@ -1233,7 +1225,6 @@ final class SyncManager: ObservableObject {
                 profileName: profileName,
                 syncMode: "sync",
                 syncDirection: profile?.syncDirection,
-                hasFallback: profile?.hasFallback ?? false,
                 // An app-initiated run recorded its cause in runSyncScript; a bare
                 // launchd/scheduled run left none, so default to "scheduled".
                 trigger: pendingSyncTrigger.removeValue(forKey: profileId) ?? "scheduled"
@@ -1314,14 +1305,6 @@ final class SyncManager: ObservableObject {
                 )
             }
             currentSyncChanges[profileId] = nil
-
-        case .transportChanged(let transport):
-            profileTransports[profileId] = transport
-            TelemetryService.shared.recordTransportChange(
-                profileId: profileId,
-                profileName: profileName,
-                transport: transport.isPrimary ? "primary" : "fallback"
-            )
 
         case .errorMessage(let message):
             // Track all error messages so we can correlate with syncFailed events

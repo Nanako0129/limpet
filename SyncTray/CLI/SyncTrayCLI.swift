@@ -132,7 +132,7 @@ enum SyncTrayCLI {
     profile set keys: name, rcloneRemote, remotePath, localSyncPath,
       drivePathToMonitor, additionalRcloneFlags,
       syncDirection (localToRemote|remoteToLocal), syncIntervalMinutes,
-      fallbackRemote, fallbackRemotePath, isMuted. Use enable/disable for isEnabled.
+      isMuted. Use enable/disable for isEnabled.
 
     Profiles author JSON against schema/profile.schema.json under the config
     directory; the same file an agent can drop in or edit directly.
@@ -858,10 +858,9 @@ enum SyncTrayCLI {
 
     /// Apply one `key`→`value` assignment to `profile` in place. Returns an error
     /// message (unknown key, or a value that fails validation) or `nil` on
-    /// success. The key set MIRRORS `SyncProfile.CodingKeys` minus three
-    /// deliberately-excluded keys: `id` (immutable), `isEnabled` (use
-    /// enable/disable), and `fallbackRequiresCacheRebuild` (derived at
-    /// install/save time from the two remotes' wire types). Pure — no I/O — so the
+    /// success. The key set MIRRORS `SyncProfile.CodingKeys` minus two
+    /// deliberately-excluded keys: `id` (immutable) and `isEnabled` (use
+    /// enable/disable). Pure — no I/O — so the
     /// self-test drives the whole matrix without touching disk.
     static func applyProfileAssignment(_ profile: inout SyncProfile, key: String, value: String) -> String? {
         func bool(_ raw: String) -> Bool? {
@@ -886,8 +885,6 @@ enum SyncTrayCLI {
         // Optional strings.
         case "drivePathToMonitor": profile.drivePathToMonitor = value
         case "additionalRcloneFlags": profile.additionalRcloneFlags = value
-        case "fallbackRemote": profile.fallbackRemote = value
-        case "fallbackRemotePath": profile.fallbackRemotePath = value
 
         // Ints (with range validation where the model clamps).
         case "syncIntervalMinutes":
@@ -911,8 +908,6 @@ enum SyncTrayCLI {
             return "id is immutable and cannot be changed"
         case "isEnabled":
             return "use 'synctray profile enable|disable' to change isEnabled"
-        case "fallbackRequiresCacheRebuild":
-            return "fallbackRequiresCacheRebuild is derived at install time and cannot be set directly"
 
         default:
             return "unknown key \"\(key)\" (see 'synctray help' for the profile set key list)"

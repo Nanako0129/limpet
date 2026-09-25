@@ -14,15 +14,6 @@ struct SyncProfile: Identifiable, Codable, Equatable {
     var isMuted: Bool                   // whether notifications are muted for this profile
     var syncDirection: SyncDirection    // direction for one-way sync
 
-    // Fallback remote (used when primary remote is unreachable)
-    var fallbackRemote: String          // e.g., "synology-sftp" (empty = no fallback)
-    var fallbackRemotePath: String      // e.g., "/volume1/Kaiju" (empty = same as primary remotePath)
-    /// True when primary and fallback remotes use different rclone wire types (e.g. smb vs sftp).
-    /// When true, the sync script swaps the full REMOTE reference on fallback activation instead of
-    /// using env-var overrides, to avoid NFD/NFC filename-encoding divergence between wire types.
-    /// Populated at install/save time. Defaults to false for profiles created before this field existed.
-    var fallbackRequiresCacheRebuild: Bool
-
     /// Short ID for file naming (first 8 chars of UUID)
     var shortId: String {
         String(id.uuidString.prefix(8)).lowercased()
@@ -88,23 +79,6 @@ struct SyncProfile: Identifiable, Codable, Equatable {
         return "\(remote):\(remotePath)"
     }
 
-    // MARK: - Fallback
-
-    /// Whether a fallback remote is configured
-    var hasFallback: Bool {
-        !fallbackRemote.isEmpty
-    }
-
-    /// Full fallback remote path for rclone (e.g., "synology-sftp:/volume1/Kaiju")
-    var fullFallbackRemotePath: String {
-        let path = fallbackRemotePath.isEmpty ? remotePath : fallbackRemotePath
-        let remote = fallbackRemote.hasSuffix(":") ? String(fallbackRemote.dropLast()) : fallbackRemote
-        if path.isEmpty {
-            return "\(remote):"
-        }
-        return "\(remote):\(path)"
-    }
-
     // MARK: - Validation
 
     var isValid: Bool {
@@ -145,10 +119,7 @@ struct SyncProfile: Identifiable, Codable, Equatable {
         additionalRcloneFlags: String = "",
         isEnabled: Bool = false,
         isMuted: Bool = false,
-        syncDirection: SyncDirection = .localToRemote,
-        fallbackRemote: String = "",
-        fallbackRemotePath: String = "",
-        fallbackRequiresCacheRebuild: Bool = false
+        syncDirection: SyncDirection = .localToRemote
     ) {
         self.id = id
         self.name = name
@@ -161,9 +132,6 @@ struct SyncProfile: Identifiable, Codable, Equatable {
         self.isEnabled = isEnabled
         self.isMuted = isMuted
         self.syncDirection = syncDirection
-        self.fallbackRemote = fallbackRemote
-        self.fallbackRemotePath = fallbackRemotePath
-        self.fallbackRequiresCacheRebuild = fallbackRequiresCacheRebuild
     }
 
     /// Create a new profile with default values
@@ -179,7 +147,6 @@ extension SyncProfile {
         case id, name, rcloneRemote, remotePath, localSyncPath
         case drivePathToMonitor, syncIntervalMinutes, additionalRcloneFlags
         case isEnabled, isMuted, syncDirection
-        case fallbackRemote, fallbackRemotePath, fallbackRequiresCacheRebuild
     }
 
     init(from decoder: Decoder) throws {
@@ -201,12 +168,6 @@ extension SyncProfile {
         isMuted = try container.decodeIfPresent(Bool.self, forKey: .isMuted) ?? false
         // Backwards compatibility: default to localToRemote if not present
         syncDirection = try container.decodeIfPresent(SyncDirection.self, forKey: .syncDirection) ?? .localToRemote
-        // Backwards compatibility: fallback remote defaults to empty (disabled)
-        fallbackRemote = try container.decodeIfPresent(String.self, forKey: .fallbackRemote) ?? ""
-        fallbackRemotePath = try container.decodeIfPresent(String.self, forKey: .fallbackRemotePath) ?? ""
-        // Backwards compatibility: defaults to false (preserves env-var-override behaviour for old profiles)
-        fallbackRequiresCacheRebuild = try container.decodeIfPresent(
-            Bool.self, forKey: .fallbackRequiresCacheRebuild) ?? false
     }
 }
 

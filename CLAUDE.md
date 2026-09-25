@@ -12,7 +12,6 @@ SyncTray is a macOS menu bar application that provides Google Drive-style backgr
 - **External drive support**: Auto-detects when external drives are mounted/unmounted
 - **Live progress tracking**: Parses rclone JSON logs for real-time transfer progress
 - **macOS notifications**: Batch notifications for file changes with "Open Directory" action
-- **Fallback remote**: Automatic failover to an alternative remote when the primary is unreachable
 
 ### Sync Modes
 
@@ -43,8 +42,8 @@ SyncTray/
 
 | File | Purpose |
 |------|---------|
-| `SyncProfile.swift` | Profile model with sync paths, remote config, fallback remote config, computed file paths |
-| `SyncState.swift` | Sync state enum, progress struct, file change model, `ActiveTransport`, `SyncLogPatterns` for log parsing |
+| `SyncProfile.swift` | Profile model with sync paths, remote config, computed file paths |
+| `SyncState.swift` | Sync state enum, progress struct, file change model, `SyncLogPatterns` for log parsing |
 | `RcloneLogEntry.swift` | JSON models for parsing rclone `--use-json-log` output |
 | `Settings.swift` | Global app settings (debug logging toggle) |
 
@@ -215,7 +214,7 @@ isn't SyncTray's own.
 | `synctray profile create --from <file>` / `... create -` | Create a profile from a `.profile.json` file (or stdin `-`). Validates by decoding (a bad file exits `65` with the decode error — the feedback an agent needs); refuses a colliding `id`/`shortId` (`1`); writes the authoritative file, then installs the launchd agent iff `isEnabled && isValid` — the SAME persist-then-install rule as the file-watcher create path (`applyExternalCreateIfNeeded`). |
 | `synctray profile enable <name\|shortId>` | Set `isEnabled=true`, rewrite the file, install the agent. |
 | `synctray profile disable <name\|shortId>` | Set `isEnabled=false`, rewrite the file, uninstall the agent. |
-| `synctray profile set <name\|shortId> <key> <value> [<key> <value> …]` | Edit fields on an existing profile from a BOUNDED key set (mirrors `SyncProfile.CodingKeys` minus `id`/`isEnabled`/`fallbackRequiresCacheRebuild`; positional `key value` pairs), rewrite the authoritative `.profile.json`, then drive the launchd delta `SyncManager.reconcileAction` dictates (reinstall as needed). Validates ALL assignments against a copy first — an unknown key or invalid value exits `65` and writes nothing. Use `enable`/`disable` for `isEnabled`. |
+| `synctray profile set <name\|shortId> <key> <value> [<key> <value> …]` | Edit fields on an existing profile from a BOUNDED key set (mirrors `SyncProfile.CodingKeys` minus `id`/`isEnabled`; positional `key value` pairs), rewrite the authoritative `.profile.json`, then drive the launchd delta `SyncManager.reconcileAction` dictates (reinstall as needed). Validates ALL assignments against a copy first — an unknown key or invalid value exits `65` and writes nothing. Use `enable`/`disable` for `isEnabled`. |
 | `synctray profile delete <name\|shortId>` | Uninstall the agent and remove the `.profile.json`. |
 | `synctray install <name\|shortId>` | Install an already-enabled profile's launchd agent (idempotent; runs `SyncSetupService.install`). Complements `profile enable`, which early-returns without installing when the profile is ALREADY enabled — so `install` re-creates an agent that went missing. Refuses a disabled or incomplete profile. Never flips `isEnabled`. |
 | `synctray reinstall <name\|shortId>` | Regenerate script+plist and reinstall the agent (uninstall → install), i.e. the settings-save reinstall path. Works for any sync mode. Refuses a disabled profile. |
@@ -301,51 +300,6 @@ SyncManager.triggerManualSync() called
 Sync script executed → log written → monitoring pipeline picks up
 ```
 
-### Fallback Remote Pipeline
-```
-Sync script starts
-        ↓
-Check if FALLBACK_REMOTE is configured (from profile JSON)
-        ↓
-If set: rclone lsd primary remote (3s connect timeout)
-        ↓
-Unreachable? → Log "using fallback: X"
-    ├─ Same wire type + no path change (fallbackRequiresCacheRebuild=false):
-    │   env var overrides swap transport
-    └─ Different wire type OR explicit path (fallbackRequiresCacheRebuild=true):
-        swap entire REMOTE reference
-        ↓
-Reachable? → Log "Using primary remote: X"
-        ↓
-LogParser detects transport message → SyncManager.profileTransports updated
-        ↓
-MenuBarView shows transport icon (wifi=primary, antenna=fallback)
-```
-
-**Primary recovery (fallback → primary switch-back).** The reachability check above runs
-once per *script execution*, and profiles re-run on their `StartInterval`, so they
-naturally return to the primary on the next scheduled sync once it's reachable — no
-separate recovery monitor is needed.
-
-**Transport env-var override:** When primary and fallback remotes share the same
-rclone wire type (e.g., WebDAV LAN → WebDAV QuickConnect, both `type = webdav`)
-and `fallbackRemotePath` is empty, the sync script uses `RCLONE_CONFIG_*`
-environment variable overrides to change the transport while keeping the rclone
-remote name unchanged.
-
-When primary and fallback have **different** wire types (e.g., SMB → SFTP), the
-script swaps the full remote reference to `<fallbackRemote>:<path>` regardless of
-whether `fallbackRemotePath` is set. This avoids cache poisoning from byte-level
-filename encoding differences (macOS SMB normalises to NFD; SFTP passes NFC
-verbatim — same human-readable name, different byte sequence).
-
-The branching condition is determined at profile install/save time by comparing
-`provider.rcloneType` for the primary and fallback remotes (read via
-`RcloneConfigService.readRemoteConfig`), stored as `fallbackRequiresCacheRebuild`
-in the profile JSON. Profiles created before this field was added default to
-`false` (legacy env-var-override behaviour). The field re-evaluates on every
-profile save, so users can correct it by re-saving the profile.
-
 ## Key Design Patterns
 
 ### Multi-Profile State Management
@@ -356,7 +310,6 @@ SyncManager maintains parallel dictionaries keyed by profile UUID:
 @Published private(set) var profileStates: [UUID: SyncState] = [:]
 @Published private(set) var profileProgress: [UUID: SyncProgress] = [:]
 @Published private(set) var profileErrors: [UUID: String] = [:]
-@Published private(set) var profileTransports: [UUID: ActiveTransport] = [:]
 private var logWatchers: [UUID: LogWatcher] = [:]
 private var directoryWatchers: [UUID: DirectoryWatcher] = [:]
 ```
@@ -545,7 +498,7 @@ Anonymous, opt-in telemetry using OpenTelemetry (opentelemetry-swift 1.17.1). Al
 ### Three signals
 - **Traces**: Sync lifecycle spans with real duration (start→complete/fail), mount/unmount spans
 - **Metrics**: 20 instruments — sync duration + check phase histograms, operation counters (sync, mount, file ops, contention, recovery, volume events, filter stats, offline pin/unpin), profile gauge (delta temporality, 30s export interval)
-- **Logs**: Structured log records for all key events (sync lifecycle, mount, transport changes, errors, config snapshots, session heartbeat, stale lock cleanup, precondition failures)
+- **Logs**: Structured log records for all key events (sync lifecycle, mount, errors, config snapshots, session heartbeat, stale lock cleanup, precondition failures)
 
 ### User correlation
 - `service.instance.id` — random UUID per install (changes on reinstall)
