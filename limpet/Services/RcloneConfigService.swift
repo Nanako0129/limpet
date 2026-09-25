@@ -395,6 +395,9 @@ final class RcloneConfigService: Sendable {  // every stored property is an immu
             log("Keychain read failed for remote \"\(name)\" (security exit \(status)); rclone was not started")
         case .timedOut:
             log("Keychain read timed out after \(Int(keychain.timeout))s for remote \"\(name)\"; rclone was not started")
+        case .locked:
+            // No read was attempted; the next trigger checks again.
+            log(KeychainSecretStore.lockedMessage)
         }
         return nil
     }

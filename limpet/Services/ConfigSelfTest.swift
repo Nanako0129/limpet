@@ -100,6 +100,7 @@ enum ConfigSelfTest {
             testOverlapOnlyAmongEnabledInstalled,
             testProfileChangeRefusedBeforePersist,
             testKeychainRemoteEditDeleteConsistency,
+            testKeychainLockedNoRead,
         ]
 
         for check in checks {
@@ -2478,7 +2479,7 @@ enum ConfigSelfTest {
         } catch {
             return report(id, slug, false, "(fixture setup failed: \(error))")
         }
-        let store = KeychainSecretStore(securityPath: stub, keychainPath: keychainPath)
+        let store = KeychainSecretStore(securityPath: stub, keychainPath: keychainPath, lockStatus: { _ in .unlocked })
         let service = RcloneConfigService(configPath: confPath, rclonePath: rcloneStub, keychain: store)
         do {
             try service.addKeychainRemote(
@@ -2558,7 +2559,7 @@ enum ConfigSelfTest {
         try? original.write(toFile: confPath, atomically: true, encoding: .utf8)
         let service = RcloneConfigService(
             configPath: confPath, rclonePath: "/usr/bin/false",
-            keychain: KeychainSecretStore(securityPath: stub, keychainPath: "\(dir)/unused.keychain-db"))
+            keychain: KeychainSecretStore(securityPath: stub, keychainPath: "\(dir)/unused.keychain-db", lockStatus: { _ in .unlocked }))
         let good: [String: String] = ["provider": "Mega", "access_key_id": "AKID"]
         let refused: [(String, String, [String: String], String)] = [
             ("bad-name", "s3", good, "s"),                                          // name charset
@@ -2620,7 +2621,7 @@ enum ConfigSelfTest {
         let keychainPath = "\(dir)/k.keychain-db"
         let service = RcloneConfigService(
             configPath: confPath, rclonePath: "/usr/bin/false",
-            keychain: KeychainSecretStore(securityPath: stub, keychainPath: keychainPath, timeout: 0.5))
+            keychain: KeychainSecretStore(securityPath: stub, keychainPath: keychainPath, timeout: 0.5, lockStatus: { _ in .unlocked }))
         func setMode(_ mode: String) { try? mode.write(toFile: "\(dir)/mode", atomically: true, encoding: .utf8) }
 
         // Non-keychain remote: empty env, security never runs.
@@ -2719,7 +2720,7 @@ enum ConfigSelfTest {
         try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: rcloneStub)
         let service = RcloneConfigService(
             configPath: confPath, rclonePath: rcloneStub,
-            keychain: KeychainSecretStore(securityPath: stub, keychainPath: "\(dir)/k.keychain-db"))
+            keychain: KeychainSecretStore(securityPath: stub, keychainPath: "\(dir)/k.keychain-db", lockStatus: { _ in .unlocked }))
 
         // F5 remap: an existing s3/b2 remote edits as itself, never as webdav.
         guard let s4 = service.readRemoteConfig(name: "s4"), s4.provider == .s3Compatible,
@@ -3208,7 +3209,7 @@ enum ConfigSelfTest {
         try? "[before]\ntype = local\n".write(toFile: confPath, atomically: true, encoding: .utf8)
         try? "#!/bin/sh\n[ -f \"\(dir)/rclone-fail\" ] && exit 1\nexit 0\n".write(toFile: rcloneStub, atomically: true, encoding: .utf8)
         try? fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: rcloneStub)
-        let store = KeychainSecretStore(securityPath: stub, keychainPath: "\(dir)/fake.keychain-db")
+        let store = KeychainSecretStore(securityPath: stub, keychainPath: "\(dir)/fake.keychain-db", lockStatus: { _ in .unlocked })
         let service = RcloneConfigService(configPath: confPath, rclonePath: rcloneStub, keychain: store)
         func conf() -> String { (try? String(contentsOfFile: confPath, encoding: .utf8)) ?? "" }
         func flag(_ name: String, _ on: Bool) {
@@ -3277,6 +3278,72 @@ enum ConfigSelfTest {
         }
         guard (try? service.deleteRemote("kr")) != nil, store.read(account: "kr") == .notFound else {
             return report(id, slug, false, "(a clean delete did not remove the item)")
+        }
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L4-21 — a locked keychain is never read (no unprompted dialogs)
+
+    /// limpet-plan.md L4 "No unprompted keychain dialogs": with the injected
+    /// lock-status provider saying locked (or unknown), no `security` call is
+    /// made at all, no rclone starts, and each attempt logs exactly the one
+    /// fixed line. The production provider (SecKeychainGetStatus) is never
+    /// called here; that it cannot prompt is for the user to check live.
+    private static func testKeychainLockedNoRead() -> Bool {
+        let id = "AC-L4-21", slug = "keychain-locked-no-read"
+        let dir = "\(selfTestRoot)/ac-l4-21"
+        try? FileManager.default.removeItem(atPath: dir)
+        guard let stub = makeSecurityStub(in: dir, secret: "SEKRET-locked-2b7", mode: "found") else {
+            return report(id, slug, false, "(fixture setup failed)")
+        }
+        let confPath = "\(dir)/rclone.conf"
+        try? "[ks3]\ntype = s3\nprovider = Mega\nlimpet_keychain = true\n\n[plain]\ntype = local\n"
+            .write(toFile: confPath, atomically: true, encoding: .utf8)
+        let statusFile = "\(dir)/lock-status"
+        let store = KeychainSecretStore(
+            securityPath: stub, keychainPath: "\(dir)/fake.keychain-db",
+            lockStatus: { _ in
+                switch (try? String(contentsOfFile: statusFile, encoding: .utf8)) ?? "" {
+                case "unlocked": return .unlocked
+                case "locked": return .locked
+                default: return .unknown
+                }
+            })
+        let service = RcloneConfigService(configPath: confPath, rclonePath: "/usr/bin/false", keychain: store)
+        let profile = SyncProfile(name: "p", rcloneRemote: "ks3:", remotePath: "b", localSyncPath: "/tmp/x")
+        for status in ["locked", "unknown"] {
+            try? status.write(toFile: statusFile, atomically: true, encoding: .utf8)
+            var lines: [String] = [], spawned = 0
+            for _ in 0..<2 {
+                let code = SyncWatchDaemon.runSyncChild(
+                    profile: profile, service: service, log: { lines.append($0) }, spawn: { _ in spawned += 1; return 0 })
+                guard code == SyncWatchDaemon.secretUnavailableExitCode else {
+                    return report(id, slug, false, "(\(status): exit \(code))")
+                }
+            }
+            guard spawned == 0, lines == [KeychainSecretStore.lockedMessage, KeychainSecretStore.lockedMessage],
+                  lines[0] == "Keychain locked — open limpet and click \"Allow keychain access\"",
+                  !FileManager.default.fileExists(atPath: "\(dir)/calls") else {
+                return report(id, slug, false, "(\(status): spawned=\(spawned) lines=\(lines) security called=\(FileManager.default.fileExists(atPath: "\(dir)/calls")))")
+            }
+            // Writes are refused the same way, before any security call.
+            guard store.add(account: "ks3", secret: "x") == KeychainSecretStore.lockedMessage,
+                  store.delete(account: "ks3") == KeychainSecretStore.lockedMessage,
+                  !FileManager.default.fileExists(atPath: "\(dir)/calls") else {
+                return report(id, slug, false, "(\(status): a keychain write reached security)")
+            }
+        }
+        // A remote without the marker never asks the keychain at all.
+        guard service.secretEnvironment(forRemote: "plain:", log: { _ in }) == [:] else {
+            return report(id, slug, false, "(a non-keychain remote was affected by the lock)")
+        }
+        // Unlocked: normal read, the child starts with the secret.
+        try? "unlocked".write(toFile: statusFile, atomically: true, encoding: .utf8)
+        var childEnvironment: [String: String] = [:]
+        _ = SyncWatchDaemon.runSyncChild(
+            profile: profile, service: service, log: { _ in }, spawn: { childEnvironment = $0; return 0 })
+        guard childEnvironment["RCLONE_CONFIG_KS3_SECRET_ACCESS_KEY"] == "SEKRET-locked-2b7" else {
+            return report(id, slug, false, "(unlocked: the secret was not read)")
         }
         return report(id, slug, true)
     }

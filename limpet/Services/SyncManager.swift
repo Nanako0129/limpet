@@ -128,6 +128,39 @@ final class SyncManager: ObservableObject {
         }
     }
 
+    /// Whether an enabled profile needs a keychain secret while the login
+    /// keychain is locked — its watcher then waits instead of reading (and
+    /// raising a dialog). Drives the menu's "Allow keychain access" button.
+    var isKeychainAccessNeeded: Bool {
+        let service = RcloneConfigService.shared
+        return !keychainBackedEnabledProfiles.isEmpty
+            && service.keychain.lockStatus(service.keychain.keychainPath) != .unlocked
+    }
+
+    private var keychainBackedEnabledProfiles: [SyncProfile] {
+        profileStore.enabledProfiles.filter {
+            RcloneConfigService.shared.section(named: String($0.rcloneRemote.prefix { $0 != ":" }))?[
+                RcloneConfigService.keychainMarker] == "true"
+        }
+    }
+
+    /// The user clicked "Allow keychain access": the only path that may raise
+    /// a keychain dialog (the system unlock prompt). Afterwards the waiting
+    /// watchers are asked to sync now.
+    func allowKeychainAccess() {
+        let path = RcloneConfigService.shared.keychain.keychainPath
+        let profiles = keychainBackedEnabledProfiles
+        DispatchQueue.global(qos: .userInitiated).async {
+            let unlocked = KeychainSecretStore.requestUnlock(keychainPath: path)
+            DispatchQueue.main.async {
+                if unlocked {
+                    for profile in profiles { self.sendSyncNowSignal(to: profile) }
+                }
+                self.objectWillChange.send()
+            }
+        }
+    }
+
     /// Whether `profile` is stopped by the persistent delete-limit marker
     /// (limpet-plan.md L4 F6).
     func isDeleteLimitReached(for profile: SyncProfile) -> Bool {

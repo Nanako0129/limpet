@@ -42,6 +42,16 @@ struct MenuBarView: View {
                 .font(.caption)
                 .foregroundColor(.secondary)
 
+            // A keychain-backed profile is waiting for the login keychain to be
+            // unlocked; only this button may raise the unlock dialog.
+            if syncManager.isKeychainAccessNeeded {
+                Button(action: { syncManager.allowKeychainAccess() }) {
+                    Label("Allow keychain access", systemImage: "lock.fill")
+                        .font(.system(size: 11))
+                }
+                .help(KeychainSecretStore.lockedMessage)
+            }
+
             ForEach(syncManager.profileStore.profiles) { profile in
                 HStack(spacing: 8) {
                     // Status indicator - show pause icon when paused

@@ -1,4 +1,5 @@
 import Foundation
+import Security
 
 /// Creates, reads and deletes the secrets of keychain-backed rclone remotes
 /// (limpet-plan.md L4 F2/F3/F7): generic-password items with service `limpet`
@@ -33,12 +34,60 @@ struct KeychainSecretStore {
     /// F3: a hung `security` (e.g. waiting on an invisible prompt) must not
     /// wedge the watcher.
     var timeout: TimeInterval = 10
+    /// "No unprompted keychain dialogs" (limpet-plan.md L4, user requirement
+    /// 2026-09-26): asked before EVERY `security` call. Anything but
+    /// `.unlocked` means no call at all, because reading from a locked keychain
+    /// raises the system unlock dialog. Injectable; the self-test never uses
+    /// the production provider.
+    var lockStatus: @Sendable (_ keychainPath: String) -> LockStatus = KeychainSecretStore.systemLockStatus
+
+    enum LockStatus: Equatable {
+        case unlocked
+        case locked
+        /// The status query itself failed: treated as locked.
+        case unknown
+    }
+
+    /// The one log line (and GUI message) for a locked keychain.
+    static let lockedMessage = "Keychain locked — open limpet and click \"Allow keychain access\""
 
     enum ReadResult: Equatable {
         case found(String)
         case notFound
         case failed(Int32)
         case timedOut
+        case locked
+    }
+
+    /// Production lock-status provider: `SecKeychainOpen` + `SecKeychainGetStatus`
+    /// on the keychain path, which only reads the unlock state.
+    ///
+    /// UNVERIFIED: that this never raises a dialog was NOT measured. On
+    /// 2026-09-26 keychain work on the development machine raised dialogs for
+    /// the user, and every keychain call there stopped; the user checks it
+    /// live (lock the login keychain, confirm no dialog within two sync
+    /// cycles). `security show-keychain-info` is known to prompt and is not used.
+    @Sendable static func systemLockStatus(_ keychainPath: String) -> LockStatus {
+        if realKeychainForbidden { return .unknown }
+        var keychain: SecKeychain?
+        guard SecKeychainOpen(keychainPath, &keychain) == errSecSuccess, let keychain else { return .unknown }
+        var status: SecKeychainStatus = 0
+        guard SecKeychainGetStatus(keychain, &status) == errSecSuccess else { return .unknown }
+        return status & SecKeychainStatus(kSecUnlockStateStatus) != 0 ? .unlocked : .locked
+    }
+
+    /// The ONE path allowed to raise a keychain dialog: the user clicked
+    /// "Allow keychain access" in the menu. `SecKeychainUnlock` without a
+    /// password asks the system to show its unlock dialog. UNVERIFIED on the
+    /// development machine for the same reason as `systemLockStatus`. Blocks
+    /// until the user answers; call it off the main thread. Returns whether
+    /// the keychain is unlocked afterwards.
+    static func requestUnlock(keychainPath: String) -> Bool {
+        if realKeychainForbidden { return false }
+        var keychain: SecKeychain?
+        guard SecKeychainOpen(keychainPath, &keychain) == errSecSuccess, let keychain,
+              SecKeychainUnlock(keychain, 0, nil, false) == errSecSuccess else { return false }
+        return systemLockStatus(keychainPath) == .unlocked
     }
 
     /// `[A-Za-z0-9_]+`: the account doubles as the rclone remote name, which is
@@ -64,6 +113,7 @@ struct KeychainSecretStore {
         case .exited(0, _): break
         case .exited(let status, _): return "security add-generic-password failed (exit \(status))"
         case .timedOut: return "security add-generic-password timed out"
+        case .locked: return Self.lockedMessage
         }
         // `security -i`'s exit status is not trusted as proof of success (review
         // finding 7). Its failure semantics were NOT measured beyond two cases on
@@ -88,6 +138,7 @@ struct KeychainSecretStore {
         case .exited(0, _), .exited(44, _): return nil
         case .exited(let status, _): return "security delete-generic-password failed (exit \(status))"
         case .timedOut: return "security delete-generic-password timed out"
+        case .locked: return Self.lockedMessage
         }
     }
 
@@ -100,12 +151,14 @@ struct KeychainSecretStore {
         case .exited(44, _): return .notFound
         case .exited(let status, _): return .failed(status)
         case .timedOut: return .timedOut
+        case .locked: return .locked
         }
     }
 
     private enum RunResult {
         case exited(Int32, Data)
         case timedOut
+        case locked
     }
 
     /// Set by `ConfigSelfTest.run()`: while true, the real `/usr/bin/security`
@@ -118,6 +171,9 @@ struct KeychainSecretStore {
         if Self.realKeychainForbidden, securityPath == Self.trustedApplication {
             return .exited(-1, Data())
         }
+        // No `security` call on anything but an unlocked keychain: it would
+        // raise the unlock dialog (limpet-plan.md L4, "No unprompted keychain dialogs").
+        guard lockStatus(keychainPath) == .unlocked else { return .locked }
         let process = Process()
         process.executableURL = URL(fileURLWithPath: securityPath)
         process.arguments = arguments
