@@ -169,7 +169,12 @@ The app's edit paths (Save, the wizard, enable/disable, an external edit)
 check F4 and the overlap BEFORE persisting (`SyncManager.profileChangeRefusal`
 / `applyProfileChange`) and show refusals and install errors in the UI
 (`profileErrors`, the detail view's and wizard's error text) instead of only
-printing them.
+printing them. A refused external edit of an existing profile file (or one
+that is JSON with the profile's id but no longer decodes) is rolled back: the
+last accepted profile is written back through the self-write path and the
+refused content is copied to `profiles/refused/`, both named in
+`profileErrors`. A wizard retry after a failed install updates the profile
+the first attempt saved instead of creating a second one.
 
 **Delete limit (limpet-plan.md L4 F6).** For remotes that keep no deleted
 versions — s3 `provider = Mega` (MEGA S4) and `Cloudflare` (R2) always, any

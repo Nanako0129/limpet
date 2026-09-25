@@ -125,7 +125,20 @@ extension SyncManager {
     /// below `~/.config/limpet`) ever sees it again. Returns the new path, or
     /// `nil` if the move failed.
     nonisolated static func quarantineRefusedDrop(at path: String, now: Date = Date()) -> String? {
-        let fm = FileManager.default
+        let destination = refusedDestination(for: path, now: now)
+        do {
+            try FileManager.default.createDirectory(
+                atPath: (destination as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
+            try FileManager.default.moveItem(atPath: path, toPath: destination)
+            return destination
+        } catch {
+            return nil
+        }
+    }
+
+    /// Where a refused profile file's content goes: `<dir>/refused/<stem>.<UTC
+    /// timestamp>.json`, a name no `*.profile.json` scanner or watcher matches.
+    nonisolated static func refusedDestination(for path: String, now: Date) -> String {
         let refusedDir = ((path as NSString).deletingLastPathComponent as NSString).appendingPathComponent("refused")
         var stem = (path as NSString).lastPathComponent
         for suffix in [".profile.json", ".json"] where stem.hasSuffix(suffix) {
@@ -135,14 +148,75 @@ extension SyncManager {
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyyMMdd'T'HHmmss'Z'"
         formatter.timeZone = TimeZone(identifier: "UTC")
-        let destination = (refusedDir as NSString).appendingPathComponent("\(stem).\(formatter.string(from: now)).json")
-        do {
-            try fm.createDirectory(atPath: refusedDir, withIntermediateDirectories: true)
-            try fm.moveItem(atPath: path, toPath: destination)
-            return destination
-        } catch {
-            return nil
+        return (refusedDir as NSString).appendingPathComponent("\(stem).\(formatter.string(from: now)).json")
+    }
+
+    /// Outcome of an external write to a `*.profile.json` (second review, finding 1).
+    enum ExternalEditOutcome: Equatable {
+        /// An edit of a known profile, accepted and applied.
+        case applied
+        /// An edit of a known profile that was refused or no longer decodes:
+        /// the file holds the last accepted profile again, and the refused
+        /// content was copied to `refusedCopy` (nil if that write failed).
+        case restored(refusedCopy: String?)
+        /// A decodable file with an unknown id: a create, for the caller.
+        case create(SyncProfile)
+        /// Not a JSON object with a known id (e.g. caught mid-write): nothing done.
+        case ignored
+    }
+
+    /// Apply an external write to a profile file. A refused edit of a KNOWN
+    /// profile — F4/F6/`transfers`, or content that no longer decodes although
+    /// it is JSON carrying the profile's id — must not stay on disk, where the
+    /// other profile's watcher would read it, this profile's watcher would
+    /// keep the old values, and the next launch would load it without a
+    /// reinstall. So the last accepted in-memory profile (`known`) is written
+    /// back through `ProfileStore.writeProfileFile`, i.e. the self-write path
+    /// `ConfigFileWatcher` ignores, a differently named file carrying that id
+    /// is removed, the refused content is copied under `profiles/refused/`,
+    /// and `reportError` names both. Text that is not a JSON object (a
+    /// half-written file) is left alone; the completed write re-triggers.
+    static func applyExternalEdit(
+        data: Data,
+        path: String,
+        known: (UUID) -> SyncProfile?,
+        others: [SyncProfile],
+        isInstalled: (SyncProfile) -> Bool,
+        persist: (SyncProfile) -> Void,
+        install: (SyncProfile) throws -> Void,
+        uninstall: (SyncProfile) throws -> Void,
+        reportError: (UUID, String) -> Void,
+        now: Date = Date()
+    ) -> ExternalEditOutcome {
+        let decoded = try? JSONDecoder().decode(SyncProfile.self, from: data)
+        let rawId = ((try? JSONSerialization.jsonObject(with: data)) as? [String: Any])?["id"] as? String
+        guard let id = decoded?.id ?? rawId.flatMap(UUID.init(uuidString:)), let current = known(id) else {
+            return decoded.map { .create($0) } ?? .ignored
         }
+        var messages: [String] = []
+        if let decoded, applyProfileChange(
+            from: current, to: decoded, others: others, isInstalled: isInstalled,
+            persist: persist, install: install, uninstall: uninstall, reportError: { messages.append($0) }) {
+            messages.forEach { reportError(id, $0) }  // e.g. an install error after persisting
+            return .applied
+        }
+
+        let fm = FileManager.default
+        let directory = (path as NSString).deletingLastPathComponent
+        let copy = refusedDestination(for: path, now: now)
+        let copied = (try? fm.createDirectory(
+            atPath: (copy as NSString).deletingLastPathComponent, withIntermediateDirectories: true)) != nil
+            && fm.createFile(atPath: copy, contents: data)
+        let restoredName = ProfileStore.writeProfileFile(current, in: directory)
+        if let restoredName, (path as NSString).lastPathComponent != restoredName {
+            try? fm.removeItem(atPath: path)
+        }
+        let reason = messages.first ?? "Not saved: the edited file no longer decodes as a valid profile"
+        reportError(id, "\(reason). "
+            + (restoredName != nil ? "Restored \(current.shortId).profile.json to the last accepted profile"
+                                   : "Could NOT restore \(current.shortId).profile.json")
+            + (copied ? "; the refused content is in \(copy)" : "; the refused content could not be copied aside"))
+        return .restored(refusedCopy: copied ? copy : nil)
     }
 
     /// Decide what reconcile work a profile edit requires, given the

@@ -102,6 +102,8 @@ enum ConfigSelfTest {
             testKeychainRemoteEditDeleteConsistency,
             testKeychainLockedNoRead,
             testDoctorWarnsStaleMaxDelete,
+            testRefusedExternalEditRestored,
+            testWizardRetryKeepsProfileId,
         ]
 
         for check in checks {
@@ -3390,6 +3392,95 @@ enum ConfigSelfTest {
               warnings(derivedMaxDelete: 100, provider: "AWS").first?.status == .warn,
               warnings(derivedMaxDelete: 0, provider: "Mega").first?.status == .warn else {
             return report(id, slug, false, "(stale maxDelete warning wrong)")
+        }
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L4-23 — a refused external edit is rolled back, its content kept aside
+
+    /// Second review, finding 1: an external edit making A overlap B, or one
+    /// that no longer decodes, must not stay in A's file.
+    private static func testRefusedExternalEditRestored() -> Bool {
+        let id = "AC-L4-23", slug = "refused-external-edit-restored"
+        let fm = FileManager.default
+        let dir = "\(selfTestRoot)/ac-l4-23/profiles"
+        try? fm.removeItem(atPath: "\(selfTestRoot)/ac-l4-23")
+        var a = sampleProfile(name: "A")
+        a.remotePath = "PathA"
+        var b = sampleProfile(name: "B")
+        b.remotePath = "PathB"
+        let derivedA = "\(dir)/\(a.shortId).json"
+        guard ProfileStore.writeProfileFile(a, in: dir) != nil, ProfileStore.writeProfileFile(b, in: dir) != nil,
+              fm.createFile(atPath: derivedA, contents: Data("{\"remotePath\":\"PathA\"}".utf8)) else {
+            return report(id, slug, false, "(fixture setup failed)")
+        }
+        let aPath = "\(dir)/\(a.shortId).profile.json"
+        var events: [String] = [], errors: [(UUID, String)] = []
+        func apply(_ data: Data) -> SyncManager.ExternalEditOutcome {
+            SyncManager.applyExternalEdit(
+                data: data, path: aPath, known: { $0 == a.id ? a : ($0 == b.id ? b : nil) },
+                others: [a, b], isInstalled: { _ in true },
+                persist: { _ in events.append("persist") }, install: { _ in events.append("install") },
+                uninstall: { _ in events.append("uninstall") }, reportError: { errors.append(($0, $1)) })
+        }
+        func fileProfile() -> SyncProfile? {
+            fm.contents(atPath: aPath).flatMap { try? JSONDecoder().decode(SyncProfile.self, from: $0) }
+        }
+
+        // A edited to overlap B.
+        var overlapping = a
+        overlapping.remotePath = "PathB/inside"
+        guard let edit = try? JSONEncoder().encode(overlapping), (try? edit.write(to: URL(fileURLWithPath: aPath))) != nil,
+              case .restored(let copy?) = apply(edit) else {
+            return report(id, slug, false, "(overlapping edit was not restored)")
+        }
+        guard events.isEmpty, fileProfile() == a, fileProfile()?.remotePath == "PathA",
+              fm.contents(atPath: copy) == edit, copy.hasPrefix("\(dir)/refused/"),
+              fm.contents(atPath: derivedA) == Data("{\"remotePath\":\"PathA\"}".utf8),
+              errors.count == 1, errors[0].0 == a.id, errors[0].1.contains("Restored"), errors[0].1.contains(copy) else {
+            return report(id, slug, false, "(overlap: events=\(events) errors=\(errors.map(\.1)))")
+        }
+        // B's watcher still runs: A's file no longer overlaps it.
+        guard SyncWatchDaemon.refusalReason(for: b, profilesDirectory: dir, isInstalled: { _ in true }) == nil else {
+            return report(id, slug, false, "(B's watcher still refuses)")
+        }
+
+        // An edit that no longer decodes (F4 value) is rolled back the same way.
+        errors = []
+        let undecodable = Data(profileJSON(a, rcloneRemote: connectionStringRemote).utf8)
+        try? undecodable.write(to: URL(fileURLWithPath: aPath))
+        guard case .restored(let copy2?) = apply(undecodable), fileProfile() == a,
+              fm.contents(atPath: copy2) == undecodable, events.isEmpty,
+              errors.count == 1, errors[0].1.contains("no longer decodes"),
+              !errors[0].1.contains(connectionStringSecret) else {
+            return report(id, slug, false, "(undecodable edit not restored: \(errors.map(\.1)))")
+        }
+        // A half-written file is left alone; an acceptable edit applies.
+        let partial = Data("{\"id\": \"\(a.id.uuidString)\", \"na".utf8)
+        guard apply(partial) == .ignored else {
+            return report(id, slug, false, "(a half-written file was not ignored)")
+        }
+        var renamed = a
+        renamed.name = "A renamed"
+        guard let ok = try? JSONEncoder().encode(renamed), apply(ok) == .applied, events == ["persist"] else {
+            return report(id, slug, false, "(an acceptable edit was not applied: \(events))")
+        }
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L4-24 — a wizard retry installs the same profile, never a second one
+
+    private static func testWizardRetryKeepsProfileId() -> Bool {
+        let id = "AC-L4-24", slug = "wizard-retry-keeps-profile-id"
+        func build(_ existing: SyncProfile?) -> SyncProfile {
+            SetupWizardView.profileToSave(
+                existing: existing, name: "W", remote: "r", remotePath: "p", localPath: "/tmp/w",
+                drivePath: "", interval: 5, direction: .localToRemote)
+        }
+        let first = build(nil)
+        let retry = build(first)
+        guard first.isEnabled, retry.id == first.id, retry.isEnabled else {
+            return report(id, slug, false, "(retry got id \(retry.id), first \(first.id))")
         }
         return report(id, slug, true)
     }

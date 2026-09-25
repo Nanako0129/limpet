@@ -25,6 +25,8 @@ struct SetupWizardView: View {
     // UI state
     @State private var isLoading: Bool = false
     @State private var errorMessage: String?
+    /// Set once a save has persisted a NEW profile, so a retry updates it.
+    @State private var savedProfile: SyncProfile?
     @State private var isOAuthInProgress: Bool = false
 
     // Non-empty local folder confirmation (warns about local/remote merge on first sync)
@@ -701,6 +703,26 @@ struct SetupWizardView: View {
         """
     }
 
+    /// The profile the wizard saves: `existing` (the profile being edited, or
+    /// the one an earlier failed attempt already saved) updated in place, or a
+    /// new one. Always enabled: the wizard installs what it saves, and an
+    /// installed-but-disabled profile would escape the F6 overlap rule.
+    static func profileToSave(
+        existing: SyncProfile?, name: String, remote: String, remotePath: String, localPath: String,
+        drivePath: String, interval: Int, direction: SyncDirection
+    ) -> SyncProfile {
+        var profile = existing ?? SyncProfile(name: "New Profile")
+        if !name.isEmpty { profile.name = name }
+        profile.rcloneRemote = remote
+        profile.remotePath = remotePath
+        profile.localSyncPath = localPath
+        profile.drivePathToMonitor = drivePath
+        profile.syncIntervalMinutes = interval
+        profile.syncDirection = direction
+        profile.isEnabled = true
+        return profile
+    }
+
     private func saveProfile() {
         isLoading = true
         errorMessage = nil
@@ -716,36 +738,13 @@ struct SetupWizardView: View {
             }
         }
 
-        var profileToInstall: SyncProfile
-
-        if let existingProfile = editingProfile {
-            // Update existing profile
-            var updatedProfile = existingProfile
-            updatedProfile.name = profileName.isEmpty ? existingProfile.name : profileName
-            updatedProfile.rcloneRemote = remoteName
-            updatedProfile.remotePath = remotePath
-            updatedProfile.localSyncPath = localPath
-            updatedProfile.drivePathToMonitor = drivePath
-            updatedProfile.syncIntervalMinutes = syncInterval
-            updatedProfile.syncDirection = syncDirection
-            // The wizard installs what it saves, so the profile is enabled;
-            // an installed-but-disabled profile would escape the F6 overlap rule.
-            updatedProfile.isEnabled = true
-            profileToInstall = updatedProfile
-        } else {
-            // Create new profile
-            let profile = SyncProfile(
-                name: profileName.isEmpty ? "New Profile" : profileName,
-                rcloneRemote: remoteName,
-                remotePath: remotePath,
-                localSyncPath: localPath,
-                drivePathToMonitor: drivePath,
-                syncIntervalMinutes: syncInterval,
-                isEnabled: true,
-                syncDirection: syncDirection
-            )
-            profileToInstall = profile
-        }
+        // A retry after "Saved, but … could not be installed" updates the
+        // profile the first attempt created (same id) instead of adding a
+        // second one (second review, finding 3).
+        let existing = editingProfile ?? savedProfile
+        let profileToInstall = Self.profileToSave(
+            existing: existing, name: profileName, remote: remoteName, remotePath: remotePath,
+            localPath: localPath, drivePath: drivePath, interval: syncInterval, direction: syncDirection)
 
         // Refuse BEFORE persisting anything (review finding 6).
         if let reason = SyncManager.profileChangeRefusal(
@@ -754,11 +753,12 @@ struct SetupWizardView: View {
             errorMessage = "Not saved: \(reason)"
             return
         }
-        if editingProfile != nil {
+        if existing != nil {
             profileStore.update(profileToInstall)
         } else {
             profileStore.add(profileToInstall)
         }
+        savedProfile = profileToInstall
 
         // Automatically install the scheduled sync
         do {

@@ -315,19 +315,23 @@ final class SyncManager: ObservableObject {
             others: profileStore.profiles,
             isInstalled: SyncProfile.agentInstalled,
             persist: { profileStore.update($0) },
-            install: { [self] profile in
-                try setupService.install(profile: profile)
-                startWatching(profile: profile)
-            },
-            uninstall: { [self] profile in
-                try setupService.uninstall(profile: profile)
-                stopWatching(profileId: profile.id)
-            },
+            install: { [self] in try installAndWatch($0) },
+            uninstall: { [self] in try uninstallAndStopWatching($0) },
             reportError: { [self] message in
                 profileErrors[updated.id] = message
                 LimpetSettings.debugLog("[\(updated.shortId)] \(message)")
             }
         )
+    }
+
+    private func installAndWatch(_ profile: SyncProfile) throws {
+        try setupService.install(profile: profile)
+        startWatching(profile: profile)
+    }
+
+    private func uninstallAndStopWatching(_ profile: SyncProfile) throws {
+        try setupService.uninstall(profile: profile)
+        stopWatching(profileId: profile.id)
     }
 
     // MARK: - External Config Reconcile
@@ -367,18 +371,32 @@ final class SyncManager: ObservableObject {
     /// / `SyncManager.applyExternalCreateIfNeeded`), so an agent can bootstrap a
     /// new sync purely by dropping a file.
     func applyExternalProfileEdit(fromFileAt path: String) {
-        guard let data = FileManager.default.contents(atPath: path),
-              let updatedProfile = try? JSONDecoder().decode(SyncProfile.self, from: data) else {
-            LimpetSettings.debugLog("[ConfigFileWatcher] Failed to decode external profile edit at \(path); skipping")
-            return
+        guard let data = FileManager.default.contents(atPath: path) else { return }
+        let outcome = Self.applyExternalEdit(
+            data: data,
+            path: path,
+            known: { [self] in profileStore.profile(for: $0) },
+            others: profileStore.profiles,
+            isInstalled: SyncProfile.agentInstalled,
+            persist: { [self] profile in
+                clearError(for: profile.id)
+                profileStore.update(profile)
+            },
+            install: { [self] in try installAndWatch($0) },
+            uninstall: { [self] in try uninstallAndStopWatching($0) },
+            reportError: { [self] id, message in
+                profileErrors[id] = message
+                print(message)
+                LimpetSettings.debugLog("[ConfigFileWatcher] \(message)")
+            })
+        switch outcome {
+        case .create(let profile):
+            applyExternalProfileCreate(decoded: profile, sourcePath: path)
+        case .ignored:
+            LimpetSettings.debugLog("[ConfigFileWatcher] \(path) is not a complete profile yet; skipping")
+        case .applied, .restored:
+            break
         }
-
-        guard let currentProfile = profileStore.profile(for: updatedProfile.id) else {
-            applyExternalProfileCreate(decoded: updatedProfile, sourcePath: path)
-            return
-        }
-
-        applyProfileChange(from: currentProfile, to: updatedProfile)
         updateAggregateState()
     }
 
