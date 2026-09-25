@@ -108,6 +108,8 @@ enum ConfigSelfTest {
             testEditKeepsNonSecretRequiredErrors,
             testKeychainLockedLogThrottled,
             testKeychainLargeOutputDrained,
+            testSourceMissingParses,
+            testSourceMissingClearsOnRecheck,
         ]
 
         for check in checks {
@@ -3734,6 +3736,76 @@ enum ConfigSelfTest {
         guard runs == 2 else {
             return report(id, slug, false, "(scheduler stuck after a missing-source rerun: runs=\(runs), state=\(stuckScheduler.state))")
         }
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L5-1 — source-missing line parses to .sourceMissing(path)
+
+    /// The watcher (SyncWatchDaemon.appendProfileLogLine) and the generated
+    /// script (SyncSetupService) write the identical "Source missing: <path>"
+    /// line; both must parse to the same event, and an ordinary line must not.
+    private static func testSourceMissingParses() -> Bool {
+        let id = "AC-L5-1", slug = "source-missing-parses"
+        let parser = LogParser()
+
+        func missingPath(_ line: String) -> String?? {
+            guard let event = parser.parse(line: line) else { return .some(nil) }
+            guard case .sourceMissing(let path) = event.type else { return .some(nil) }
+            return .some(path)
+        }
+
+        let watcherLine = "2026-09-26 12:00:00 - Source missing: /some/path"
+        guard case .some(.some("/some/path")) = missingPath(watcherLine) else {
+            return report(id, slug, false, "(watcher line did not parse to .sourceMissing(\"/some/path\"))")
+        }
+
+        let scriptLine = "2026-09-26 12:00:01 - Source missing: /some/path"
+        guard case .some(.some("/some/path")) = missingPath(scriptLine) else {
+            return report(id, slug, false, "(script line did not parse to .sourceMissing(\"/some/path\"))")
+        }
+
+        // The path is user text: one that contains another matcher's phrase
+        // must still parse as source-missing, not as that phrase.
+        let trickyLine = "2026-09-26 12:00:03 - Source missing: /Volumes/Backup/Sync Complete"
+        guard case .some(.some("/Volumes/Backup/Sync Complete")) = missingPath(trickyLine) else {
+            return report(id, slug, false, "(a path containing \"Sync Complete\" did not parse as .sourceMissing)")
+        }
+
+        let normalLine = "2026-09-26 12:00:02 - Starting sync (local → remote)"
+        guard case .some(.none) = missingPath(normalLine) else {
+            return report(id, slug, false, "(a normal line was mismatched as .sourceMissing)")
+        }
+
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L5-2 — source-missing clears through .syncStarted / .syncCompleted
+
+    /// Drives the exact reducer `SyncManager.processLogEvent` uses for these
+    /// three cases (`SyncManager.reduceProfileState`) — extracted because a
+    /// full `SyncManager` needs a real profile store, workspace observer and
+    /// config watcher to construct. Confirms `.syncStarted` overwrites an
+    /// `.error` state unconditionally, so the watcher's 30s recheck clears the
+    /// source-missing error once the source returns.
+    private static func testSourceMissingClearsOnRecheck() -> Bool {
+        let id = "AC-L5-2", slug = "source-missing-clears-on-recheck"
+
+        var state: SyncState = .idle
+        state = SyncManager.reduceProfileState(state, for: .sourceMissing("/some/path"))
+        guard state == .error("Source missing: /some/path") else {
+            return report(id, slug, false, "(sourceMissing did not produce .error: \(state))")
+        }
+
+        state = SyncManager.reduceProfileState(state, for: .syncStarted)
+        guard state == .syncing else {
+            return report(id, slug, false, "(syncStarted did not overwrite .error with .syncing: \(state))")
+        }
+
+        state = SyncManager.reduceProfileState(state, for: .syncCompleted)
+        guard state == .idle else {
+            return report(id, slug, false, "(syncCompleted did not produce .idle: \(state))")
+        }
+
         return report(id, slug, true)
     }
 

@@ -280,6 +280,20 @@ enum SyncLogPatterns {
         message.lowercased().contains("already running")
     }
 
+    /// Patterns indicating the local source directory is gone. Matches both the
+    /// watcher's own line (SyncWatchDaemon.appendProfileLogLine) and the
+    /// generated script's line (SyncSetupService), which write the identical
+    /// "Source missing: <path>" text.
+    static func isSourceMissing(_ message: String) -> Bool {
+        message.hasPrefix("Source missing: ")
+    }
+
+    /// Extract the missing path from a "Source missing: <path>" message.
+    static func extractSourceMissingPath(from message: String) -> String? {
+        guard isSourceMissing(message) else { return nil }
+        return String(message.dropFirst("Source missing: ".count))
+    }
+
     // MARK: - Error Categorization
 
     /// Transient "all files changed" safety-abort error that should be ignored.

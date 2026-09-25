@@ -202,15 +202,37 @@ profile is INSTALLED; after changing a remote's provider (or the profile's
 <name|shortId>`. `limpet doctor` warns when the installed value differs from
 what the current rclone.conf section gives.
 
+**Source-missing GUI state (limpet-plan.md L5.0).** When a profile's local
+source directory disappears, the watcher (`SyncWatchDaemon`) and the generated
+sync script both write `Source missing: <path>` into the profile log —
+the ONLY place the GUI ever learns about a sync outcome, since the app never
+runs syncs itself. `SyncLogPatterns.isSourceMissing` matches that line (both
+writers produce the identical text) → `LogParser` emits
+`ParsedLogEvent.sourceMissing(path)` → `SyncManager.processLogEvent` sets
+`profileStates[id] = .error("Source missing: <path>")`, shown as a red
+`exclamationmark.triangle.fill` with "Error: Source missing: <path>". No
+notification is sent for this state (menu only). It clears through the
+existing sync pipeline, not a special case: the watcher's 30s recheck runs a
+sync once the source returns, whose `Starting sync` line sets `.syncing`
+unconditionally (overwriting any prior state, including this error) and whose
+completion sets `.idle`. `SyncManager.reduceProfileState` is the pure
+transition function for these three cases, extracted so it can be driven
+without a full `SyncManager`.
+
 **No unprompted keychain dialogs.** Before any `security` call,
 `KeychainSecretStore` asks a lock-status provider (production:
-`SecKeychainGetStatus`, unverified that it can never prompt). While the login
+`SecKeychainGetStatus`). While the login
 keychain is locked nothing reads it: the watcher logs `Keychain locked — open
 limpet and click "Allow keychain access"` (like every keychain line, at most
 once per 30 s, the refusal and source-missing throttle), starts no rclone and
 waits for its next trigger; the menu shows "Allow keychain access", the only action that
 may raise the system unlock dialog, which then sends the waiting watchers
-SIGUSR1.
+SIGUSR1. Observed live 2026-09-26 with the login keychain locked: no limpet
+dialog appeared, the watcher logged the line above, the menu showed "Allow
+keychain access", and after the user unlocked it the pending file uploaded (19 s after the
+locked line; the unlock moment itself was not timed).
+That is one end-to-end observation of this path; that `SecKeychainGetStatus`
+can never prompt was not measured on its own.
 
 **Self-write suppression.** `ConfigSelfWriteRegistry` tracks the content hash
 of every file limpet itself writes; `ConfigFileWatcher.shouldReconcile`
@@ -319,7 +341,7 @@ isn't limpet's own.
 
 | Command | Purpose |
 |---------|---------|
-| `limpet sync <name\|shortId>` | Run one sync now and BLOCK until it finishes, returning the script's exit code — exactly what the app's `triggerManualSync` runs (`bash <sharedScript> <configPath>`), lock-file-guarded against a concurrent scheduled run. |
+| `limpet sync <name\|shortId>` | Send the running watcher SIGUSR1 (`launchctl kill SIGUSR1 gui/$(id -u)/<launchdLabel>`) to ask it to sync now, and return immediately — it does NOT block until the sync finishes. On success prints `sync requested for "<name>" (<shortId>) — see: limpet logs <shortId>` and exits 0; if the agent isn't loaded prints `error: no watcher running for "<name>" (<shortId>)` to stderr and exits 1. Use `limpet logs <name\|shortId> --follow` to watch the run it triggered. |
 
 `<name|shortId>` resolution tries an exact `shortId` match first, then a
 case-insensitive `name` match; an unmatched (or ambiguous) target exits
