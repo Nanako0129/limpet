@@ -44,24 +44,6 @@ struct ProfileDetailView: View {
     @State private var fallbackPathSuggestionReason: String?
     @State private var fallbackPathValidationTask: Task<Void, Never>?
 
-    // Mount mode specific settings
-    @State private var mountBackend: MountBackend = .nfs
-    @State private var vfsCacheMode: VFSCacheMode = .full
-    @State private var vfsCacheMaxSize: String = "10G"
-    @State private var vfsCacheMaxAge: String = "168h"
-    // UI-only split of the size/age strings into number + unit. The combined
-    // vfsCacheMaxSize / vfsCacheMaxAge strings above stay the source of truth
-    // (persisted, compared in hasChanges); these are recomposed on every edit.
-    @State private var cacheSizeNumber: String = "10"
-    @State private var cacheSizeUnit: String = "G"
-    @State private var cacheAgeNumber: String = "168"
-    @State private var cacheAgeUnit: String = "h"
-    @State private var vfsCachePath: String = ""
-    @State private var allowNonEmptyMount: Bool = false
-    @State private var mountAtStartup: Bool = true
-    @State private var offlineAccessEnabled: Bool = true
-    @State private var downloadConnections: Int = 2
-
     // UI State
     @State private var showAdvanced: Bool = false
     @State private var isInstalling: Bool = false
@@ -128,19 +110,6 @@ struct ProfileDetailView: View {
     @State private var pendingLocalSyncPath: String = ""
     @State private var pendingLocalSyncItemCount: Int = 0
 
-    // Cache-directory move prompt (Save changed Cache Directory on a Stream profile)
-    @State private var cacheMovePrompt: CacheMovePrompt?
-    @State private var showingCacheMoveSheet: Bool = false
-    // Whether the fields `saveProfile()` deferred-persisted alongside the
-    // cache-path change (everything except vfsCachePath) still need a
-    // reinstall to take effect. Set when the prompt is opened; cleared by
-    // whichever path actually performs that reinstall (an explicit
-    // Leave-behind/Start-fresh choice in `finalizeCachePathChange`, or a
-    // move actually starting in `CacheMoveSheet`) so the sheet's
-    // `onDismiss` only reinstalls for a bare dismissal (Cancel/close) that
-    // leaves those other fields un-applied (finding 12).
-    @State private var cacheMoveOtherFieldsNeedReinstall = false
-
     private let setupService = SyncSetupService.shared
 
     // MARK: - Computed Properties
@@ -176,23 +145,7 @@ struct ProfileDetailView: View {
         syncMode != profile.syncMode ||
         syncDirection != profile.syncDirection ||
         (fallbackEnabled ? fallbackRemote : "") != profile.fallbackRemote ||
-        ((fallbackEnabled && fallbackUseDifferentPath) ? fallbackRemotePath : "") != profile.fallbackRemotePath ||
-        mountBackend != profile.mountBackend ||
-        vfsCacheMode != profile.vfsCacheMode ||
-        vfsCacheMaxSize != profile.vfsCacheMaxSize ||
-        vfsCacheMaxAge != profile.vfsCacheMaxAge ||
-        vfsCachePath != profile.vfsCachePath ||
-        allowNonEmptyMount != profile.allowNonEmptyMount ||
-        mountAtStartup != profile.mountAtStartup ||
-        offlineAccessEnabled != profile.offlineAccessEnabled ||
-        downloadConnections != profile.downloadConnections
-    }
-
-    /// Display name for the mount folder, used in the offline-access caption
-    /// (basename of the mount point; a stable fallback when no path is set yet).
-    private var mountFolderName: String {
-        let name = (localSyncPath as NSString).lastPathComponent
-        return name.isEmpty ? "Stream" : name
+        ((fallbackEnabled && fallbackUseDifferentPath) ? fallbackRemotePath : "") != profile.fallbackRemotePath
     }
 
     private var canInstall: Bool {
@@ -204,19 +157,6 @@ struct ProfileDetailView: View {
     private func normalizedRemotePath(_ path: String) -> String {
         path.trimmingCharacters(in: .whitespaces)
             .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-    }
-
-    /// A Stream (mount) profile shares ONE VFS cache across primary and fallback, keyed by
-    /// `{cache}/vfs/{remoteName}/{remotePath}`. A different fallback path splits that cache
-    /// into a second tree and re-downloads everything. Block the save so the user reconfigures
-    /// the fallback remote to expose the same path instead. Bisync/sync are unaffected — they
-    /// legitimately use a different path (and rebuild their listing pair) on failover.
-    private var mountFallbackCacheConflict: Bool {
-        syncMode == .mount
-            && fallbackEnabled
-            && fallbackUseDifferentPath
-            && !fallbackRemotePath.isEmpty
-            && normalizedRemotePath(fallbackRemotePath) != normalizedRemotePath(remotePath)
     }
 
     private var isInstalled: Bool {
@@ -273,33 +213,14 @@ struct ProfileDetailView: View {
 
                     Divider().padding(.vertical, 4)
 
-                    // Streaming (mount) vs Scheduled Sync management — mount mode
-                    // is a continuously running mount, not a periodic sync, so it
-                    // gets Mount/Unmount controls instead of Sync Now/Pause.
-                    if syncMode == .mount {
-                        sectionHeader("Stream (Mount)", icon: "externaldrive.badge.icloud")
-                        mountManagementSection
-                    } else {
-                        sectionHeader("Automatic Sync", icon: "calendar.badge.clock")
-                        scheduledSyncSection
-                    }
+                    sectionHeader("Automatic Sync", icon: "calendar.badge.clock")
+                    scheduledSyncSection
 
                     Divider().padding(.vertical, 4)
 
                     // Configuration
-                    sectionHeader(syncMode == .mount ? "Mount Configuration" : "Sync Configuration",
-                                  icon: "arrow.triangle.2.circlepath")
+                    sectionHeader("Sync Configuration", icon: "arrow.triangle.2.circlepath")
                     syncConfigurationSection
-
-                    // Offline Files (mount mode only)
-                    if syncMode == .mount {
-                        Divider().padding(.vertical, 4)
-                        OfflineFilesSection(
-                            profile: profile,
-                            profileStore: profileStore,
-                            syncManager: syncManager
-                        )
-                    }
 
                     Divider().padding(.vertical, 4)
 
@@ -390,44 +311,6 @@ struct ProfileDetailView: View {
         .sheet(item: $editRemoteTarget) { target in
             AddRemoteSheet(editing: target.remoteName) { _ in
                 loadRcloneRemotes()
-            }
-        }
-        .sheet(isPresented: $showingCacheMoveSheet, onDismiss: {
-            // A bare dismissal (Cancel / close box) never ran Move, Leave
-            // behind, or Start fresh — the other-field changes `saveProfile()`
-            // deferred-persisted are still sitting un-applied on disk, so
-            // apply them here. Any path that DID resolve the prompt already
-            // cleared the flag itself, making this a no-op then (finding 12).
-            //
-            // MUST reinstall from the ALREADY-PERSISTED profile in
-            // `profileStore`, never from the live form via a bare
-            // `reinstallSync()` — `buildProfileFromForm()` still reads
-            // whatever the user typed into the Cache Directory field, which
-            // this whole sheet exists to gate. Calling the form-driven
-            // overload here previously installed AND persisted the exact
-            // cache-path change Cancel is supposed to refuse (finding 1 — a
-            // regression introduced by the finding-12 fix itself). The
-            // persisted profile already has every OTHER field applied with
-            // `vfsCachePath` still at its OLD value (`saveProfile()`
-            // deliberately held it there before opening this sheet).
-            if cacheMoveOtherFieldsNeedReinstall {
-                if let persisted = profileStore.profile(for: profile.id) {
-                    reinstallSync(using: persisted)
-                }
-                cacheMoveOtherFieldsNeedReinstall = false
-            }
-            cacheMovePrompt = nil
-        }) {
-            if let prompt = cacheMovePrompt {
-                CacheMoveSheet(
-                    mode: .pendingSave(prompt: prompt),
-                    profileStore: profileStore,
-                    syncManager: syncManager,
-                    onLeaveBehind: { finalizeCachePathChange(prompt: prompt, deleteOldCache: false) },
-                    onStartFresh: { finalizeCachePathChange(prompt: prompt, deleteOldCache: true) },
-                    onMoveStarted: { cacheMoveOtherFieldsNeedReinstall = false },
-                    onDismiss: { showingCacheMoveSheet = false }
-                )
             }
         }
         .alert("Delete Remote?", isPresented: $showingDeleteRemoteConfirm) {
@@ -710,11 +593,9 @@ struct ProfileDetailView: View {
 
             // Local Folder
             VStack(alignment: .leading, spacing: 4) {
-                Text(syncMode == .mount ? "Mount Point" : "Local Folder")
+                Text("Local Folder")
                     .font(.subheadline.weight(.medium))
-                Text(syncMode == .mount ?
-                     "The folder where remote files will be mounted (accessed on-demand)" :
-                     "The folder on your Mac that will be synced with the remote")
+                Text("The folder on your Mac that will be synced with the remote")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 HStack {
@@ -797,28 +678,6 @@ struct ProfileDetailView: View {
                             )
                         }
                     )
-
-                    // Mount Mode Card
-                    syncModeCard(
-                        mode: .mount,
-                        isSelected: syncMode == .mount,
-                        title: "Stream (Mount)",
-                        subtitle: "Access files on-demand",
-                        icon: "externaldrive.badge.icloud",
-                        visualContent: {
-                            AnyView(
-                                HStack(spacing: 4) {
-                                    Image(systemName: "folder.fill")
-                                        .font(.caption)
-                                    Image(systemName: "arrow.up.arrow.down")
-                                        .font(.caption2)
-                                    Image(systemName: "cloud.fill")
-                                        .font(.caption)
-                                }
-                                .foregroundStyle(.secondary)
-                            )
-                        }
-                    )
                 }
 
                 // Description based on selected mode
@@ -881,187 +740,6 @@ struct ProfileDetailView: View {
                         }
                     }
                     .padding(.top, 4)
-                }
-            }
-
-            // Mount Mode Settings (only for mount mode)
-            if syncMode == .mount {
-                VStack(alignment: .leading, spacing: 12) {
-                    Text("Mount Settings")
-                        .font(.subheadline.weight(.medium))
-
-                    // Info about mount mode
-                    HStack(spacing: 6) {
-                        Image(systemName: "info.circle.fill")
-                            .foregroundStyle(.blue)
-                            .font(.caption)
-                        Text("Files will stream on-demand from the cloud. Local path becomes a mount point.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    .padding(.vertical, 4)
-
-                    // Mount backend picker
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Mount Backend")
-                            .font(.subheadline.weight(.medium))
-                        Picker("", selection: $mountBackend) {
-                            ForEach(MountBackend.allCases) { backend in
-                                Text("\(backend.displayName) - \(backend.description)").tag(backend)
-                            }
-                        }
-                        .labelsHidden()
-                    }
-
-                    // Backend-specific requirement note
-                    if mountBackend == .macfuse {
-                        HStack(alignment: .top, spacing: 6) {
-                            Image(systemName: "exclamationmark.triangle.fill")
-                                .foregroundStyle(.orange)
-                                .font(.caption)
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text("Requires macFUSE and the official rclone binary")
-                                    .font(.caption.weight(.medium))
-                                Text("Homebrew rclone doesn't support mount. Install macFUSE via `brew install --cask macfuse`, then download rclone from rclone.org/downloads. If your Mac blocks kernel extensions (e.g. managed by an employer), use the NFS backend instead — no install required.")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-                        }
-                        .padding(8)
-                        .background(Color.orange.opacity(0.1))
-                        .clipShape(.rect(cornerRadius: 6))
-                    } else {
-                        HStack(alignment: .top, spacing: 6) {
-                            Image(systemName: "checkmark.seal.fill")
-                                .foregroundStyle(.green)
-                                .font(.caption)
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text("No macFUSE required")
-                                    .font(.caption.weight(.medium))
-                                Text("Streams via rclone's built-in NFS mount using the macOS NFS client — no kernel extension, works on locked-down/managed Macs.")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-                        }
-                        .padding(8)
-                        .background(Color.green.opacity(0.1))
-                        .clipShape(.rect(cornerRadius: 6))
-                    }
-
-                    // VFS Cache Mode
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Cache Mode")
-                            .font(.subheadline.weight(.medium))
-                        Picker("", selection: $vfsCacheMode) {
-                            ForEach(VFSCacheMode.allCases) { mode in
-                                Text("\(mode.displayName) - \(mode.description)").tag(mode)
-                            }
-                        }
-                        .labelsHidden()
-                    }
-
-                    // VFS Cache Size — numeric amount + unit picker
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Cache Size")
-                            .font(.subheadline.weight(.medium))
-                        HStack {
-                            TextField("10", text: $cacheSizeNumber)
-                                .textFieldStyle(.roundedBorder)
-                                .frame(maxWidth: 80)
-                                .onChange(of: cacheSizeNumber) { _ in updateCacheSizeString() }
-                            Picker("", selection: $cacheSizeUnit) {
-                                ForEach(Self.cacheSizeUnits, id: \.0) { unit in
-                                    Text(unit.1).tag(unit.0)
-                                }
-                            }
-                            .labelsHidden()
-                            .frame(maxWidth: 110)
-                            .onChange(of: cacheSizeUnit) { _ in updateCacheSizeString() }
-                            Text("Max local disk used for cached files. Suggested: 10 GB.")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-
-                    // VFS Cache Retention (max age since last access) — amount + unit
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Keep Cached For")
-                            .font(.subheadline.weight(.medium))
-                        HStack {
-                            TextField("168", text: $cacheAgeNumber)
-                                .textFieldStyle(.roundedBorder)
-                                .frame(maxWidth: 80)
-                                .onChange(of: cacheAgeNumber) { _ in updateCacheAgeString() }
-                            Picker("", selection: $cacheAgeUnit) {
-                                ForEach(Self.cacheAgeUnits, id: \.0) { unit in
-                                    Text(unit.1).tag(unit.0)
-                                }
-                            }
-                            .labelsHidden()
-                            .frame(maxWidth: 120)
-                            .onChange(of: cacheAgeUnit) { _ in updateCacheAgeString() }
-                            Text("How long a used file stays cached since last access. Resets each time the file is opened.")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-
-                    // VFS Cache Path
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Cache Directory")
-                            .font(.subheadline.weight(.medium))
-                        HStack {
-                            TextField("~/.cache/rclone", text: $vfsCachePath)
-                                .textFieldStyle(.roundedBorder)
-                            Button("Browse...") {
-                                browseForFolder(title: "Select Cache Directory") { path in
-                                    vfsCachePath = path
-                                }
-                            }
-                        }
-                        Text("Where cached files are stored locally")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-
-                    // Allow non-empty mount toggle (FUSE-only option; the NFS backend
-                    // ignores --allow-non-empty, so only surface it for macFUSE).
-                    if mountBackend == .macfuse {
-                        Toggle(isOn: $allowNonEmptyMount) {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text("Allow mounting to non-empty folder")
-                                    .font(.subheadline)
-                                Text("Mount even if the local folder already contains files")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-                        }
-                        .toggleStyle(.switch)
-                    }
-
-                    // Auto-mount on startup toggle
-                    Toggle(isOn: $mountAtStartup) {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("Mount automatically on startup")
-                                .font(.subheadline)
-                            Text("Mount this stream when SyncTray launches (and at login). Turn off to mount only when you click Mount.")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                    .toggleStyle(.switch)
-
-                    // Offline access toggle
-                    Toggle(isOn: $offlineAccessEnabled) {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("Offline access to cached files")
-                                .font(.subheadline)
-                            Text("Keep a read-only \u{201C}\(mountFolderName) (Offline)\u{201D} folder next to the mount that opens your already-cached files directly — browsable in Finder even with no internet, when the live stream can't reach the remote. Read-only: don't edit files there.")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                    .toggleStyle(.switch)
                 }
             }
 
@@ -1217,17 +895,6 @@ struct ProfileDetailView: View {
                           ? "Unmute profile notifications"
                           : "Mute profile notifications")
                 }
-            }
-
-            // Live streaming download progress (mount mode). A mount is never `.syncing`,
-            // so the sync-progress block above never fires for it; this surfaces the same
-            // bar + per-file list from the mount's RC /core/stats poll while it's actively
-            // downloading, and disappears when idle.
-            if profile.isMountMode,
-               syncManager.mountState(for: profile.id) == .mounted,
-               let progress = syncManager.profileProgress[profile.id],
-               !progress.transferringFiles.isEmpty {
-                SyncProgressDetailView(progress: progress)
             }
 
             // Last sync error from rclone (hide during active resync operations)
@@ -1498,180 +1165,6 @@ struct ProfileDetailView: View {
         )
     }
 
-    // Selectable units for the cache size / retention pickers. First element is the
-    // rclone suffix stored in the value string; second is the human label. rclone
-    // size suffixes are powers of 1024; duration suffixes are Go/rclone durations.
-    static let cacheSizeUnits: [(String, String)] = [
-        ("M", "MB"), ("G", "GB"), ("T", "TB"),
-    ]
-    static let cacheAgeUnits: [(String, String)] = [
-        ("h", "Hours"), ("d", "Days"), ("w", "Weeks"),
-    ]
-
-    /// Split a "<number><unit>" value (e.g. "10G", "168h") into its parts, falling
-    /// back to the given defaults when the string is empty or malformed.
-    private static func splitValueUnit(
-        _ value: String, defaultNumber: String, defaultUnit: String
-    ) -> (number: String, unit: String) {
-        let trimmed = value.trimmingCharacters(in: .whitespaces)
-        let number = String(trimmed.prefix { $0.isNumber })
-        let unit = String(trimmed.drop { $0.isNumber }).trimmingCharacters(in: .whitespaces)
-        return (number.isEmpty ? defaultNumber : number,
-                unit.isEmpty ? defaultUnit : unit)
-    }
-
-    /// Recompose vfsCacheMaxSize from the number field + unit picker (digits only).
-    private func updateCacheSizeString() {
-        let digits = cacheSizeNumber.filter(\.isNumber)
-        if digits != cacheSizeNumber { cacheSizeNumber = digits }
-        vfsCacheMaxSize = digits.isEmpty ? "10\(cacheSizeUnit)" : digits + cacheSizeUnit
-    }
-
-    /// Recompose vfsCacheMaxAge from the number field + unit picker (digits only).
-    private func updateCacheAgeString() {
-        let digits = cacheAgeNumber.filter(\.isNumber)
-        if digits != cacheAgeNumber { cacheAgeNumber = digits }
-        vfsCacheMaxAge = digits.isEmpty ? "168\(cacheAgeUnit)" : digits + cacheAgeUnit
-    }
-
-    /// Stream (Mount) management — the mount-mode counterpart to
-    /// `scheduledSyncSection`. A mount is a continuously running daemon, so this
-    /// presents Mount / Unmount + a live streaming status instead of the
-    /// sync-oriented Sync Now / Pause controls.
-    private var mountManagementSection: some View {
-        let mountState = syncManager.mountState(for: profile.id)
-        return VStack(alignment: .leading, spacing: 12) {
-            // Status
-            HStack(spacing: 8) {
-                if !isInstalled {
-                    Label("Not installed", systemImage: "circle.dashed")
-                        .foregroundColor(.secondary)
-                } else {
-                    switch mountState {
-                    case .mounting:
-                        ProgressView().controlSize(.small)
-                        Text(syncManager.profileMountProgress[profile.id] ?? "Mounting…")
-                            .foregroundStyle(.blue)
-                            .lineLimit(2)
-                    case .mounted:
-                        Label("Streaming", systemImage: "dot.radiowaves.left.and.right")
-                            .foregroundColor(.green)
-                        Text("from \(profile.fullRemotePath)")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    case .failed(let message):
-                        Label("Mount failed", systemImage: "exclamationmark.triangle.fill")
-                            .foregroundColor(.red)
-                        Text(message)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(2)
-                    case .unmounted:
-                        Label("Not mounted", systemImage: "pause.circle.fill")
-                            .foregroundColor(.gray)
-                    }
-                }
-                Spacer()
-            }
-
-            // Mounted-at + volume details. Use the persisted profile values (what
-            // the running daemon was installed with), not the form's @State edit
-            // buffers, so unsaved edits don't misrepresent the live mount.
-            if isInstalled, mountState == .mounted {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Mounted at: \(profile.localSyncPath)")
-                    Text("Volume: \((profile.localSyncPath as NSString).lastPathComponent)  ·  Cache: \(profile.vfsCacheMaxSize) / \(profile.vfsCacheMaxAge)")
-                }
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            }
-
-            // Generated files
-            if isInstalled {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Generated files:")
-                        .font(.caption.weight(.medium))
-                        .foregroundColor(.secondary)
-                    filePathLink(label: "Script", path: SyncProfile.sharedScriptPath)
-                    filePathLink(label: "Config", path: profile.configPath)
-                    filePathLink(label: "Schedule", path: profile.plistPath)
-                    filePathLink(label: "Log", path: profile.logPath)
-                }
-            }
-
-            if let error = installError {
-                Label(error, systemImage: "exclamationmark.triangle.fill")
-                    .font(.caption)
-                    .foregroundColor(.red)
-            }
-
-            // Controls
-            HStack {
-                if isInstalled {
-                    if mountState == .mounted {
-                        Button(action: { syncManager.unmountProfile(profile) }) {
-                            Label("Unmount", systemImage: "eject.fill")
-                        }
-                        .buttonStyle(.borderedProminent)
-                    } else {
-                        Button(action: { syncManager.mountProfile(profile) }) {
-                            Label("Mount", systemImage: "externaldrive.fill.badge.plus")
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .disabled(mountState == .mounting)
-                    }
-
-                    Button(action: { showingUninstallConfirm = true }) {
-                        Label("Uninstall", systemImage: "trash")
-                    }
-                    .disabled(mountState == .mounting)
-
-                    Button(action: { showingReinstallConfirm = true }) {
-                        Label("Reinstall", systemImage: "arrow.clockwise")
-                    }
-                    .disabled(!canInstall || isInstalling || mountState == .mounting)
-                } else {
-                    Button(action: installSync) {
-                        if isInstalling {
-                            ProgressView().controlSize(.small)
-                            Text("Installing…")
-                        } else {
-                            Label("Install & Mount", systemImage: "plus.circle")
-                        }
-                    }
-                    .disabled(!canInstall || isInstalling)
-                    .buttonStyle(.borderedProminent)
-                    .opacity(canInstall ? 1.0 : 0.5)
-                }
-                Spacer()
-            }
-
-            // Why install is disabled
-            if !canInstall && !isInstalled {
-                VStack(alignment: .leading, spacing: 2) {
-                    if rcloneRemote.isEmpty {
-                        Label("Select an rclone remote", systemImage: "exclamationmark.circle")
-                    }
-                    if remotePath.isEmpty {
-                        Label("Enter the folder path on the remote", systemImage: "exclamationmark.circle")
-                    }
-                    if localSyncPath.isEmpty {
-                        Label("Select a local folder", systemImage: "exclamationmark.circle")
-                    }
-                }
-                .font(.caption)
-                .foregroundStyle(.orange)
-            }
-        }
-        .padding(12)
-        .background(Color.black.opacity(0.15), in: .rect(cornerRadius: 8))
-        .overlay(
-            RoundedRectangle(cornerRadius: 8)
-                .strokeBorder(Color.white.opacity(0.06), lineWidth: 1)
-        )
-        .onAppear { syncManager.updateMountStates() }
-    }
-
     private var fallbackRemoteSection: some View {
         VStack(alignment: .leading, spacing: 12) {
             Toggle(isOn: $fallbackEnabled) {
@@ -1756,9 +1249,7 @@ struct ProfileDetailView: View {
 
                 // Proactive suggestion banner — shown when protocols differ and the toggle is OFF,
                 // so users discover they likely need to enable a different path without surprise mutations.
-                // Suppressed for mount mode: a Stream profile shares one cache and must resolve the
-                // SAME path on both remotes, so nudging toward a different path would only mislead.
-                if syncMode != .mount, let proactiveSuggestion = proactiveFallbackSuggestion {
+                if let proactiveSuggestion = proactiveFallbackSuggestion {
                     HStack(alignment: .top, spacing: 8) {
                         Image(systemName: "lightbulb.fill")
                             .foregroundStyle(.yellow)
@@ -1881,21 +1372,6 @@ struct ProfileDetailView: View {
                     .background(Color.blue.opacity(0.1), in: .rect(cornerRadius: 6))
                 }
 
-                // Stream (mount) profiles share ONE VFS cache across primary and fallback,
-                // keyed by remote name + path. A different fallback path splits the cache and
-                // re-downloads everything, so it is blocked (Save is disabled while this shows).
-                if mountFallbackCacheConflict {
-                    HStack(alignment: .top, spacing: 6) {
-                        Image(systemName: "exclamationmark.triangle.fill")
-                            .foregroundStyle(.orange)
-                            .font(.caption)
-                        Text("Stream profiles share one offline cache across both remotes, so the fallback must expose the same path (\"\(remotePath)\"). A different path would duplicate the cache and re-download every file. Configure the fallback remote to resolve that path, or turn this off.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    .padding(8)
-                    .background(Color.orange.opacity(0.1), in: .rect(cornerRadius: 6))
-                }
             }
         }
         .padding(12)
@@ -1908,39 +1384,24 @@ struct ProfileDetailView: View {
 
     private var advancedSectionContent: some View {
         VStack(alignment: .leading, spacing: 16) {
-            // Sync Interval (not applicable for mount mode)
-            if syncMode != .mount {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Sync Interval")
-                        .font(.subheadline.weight(.medium))
-                    Text("How often to run the sync")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Sync Interval")
+                    .font(.subheadline.weight(.medium))
+                Text("How often to run the sync")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
 
-                    Picker("", selection: $syncIntervalMinutes) {
-                        Text("1 minute").tag(1)
-                        Text("2 minutes").tag(2)
-                        Text("5 minutes").tag(5)
-                        Text("10 minutes").tag(10)
-                        Text("15 minutes").tag(15)
-                        Text("30 minutes").tag(30)
-                        Text("1 hour").tag(60)
-                    }
-                    .pickerStyle(.menu)
-                    .frame(width: 150, alignment: .leading)
+                Picker("", selection: $syncIntervalMinutes) {
+                    Text("1 minute").tag(1)
+                    Text("2 minutes").tag(2)
+                    Text("5 minutes").tag(5)
+                    Text("10 minutes").tag(10)
+                    Text("15 minutes").tag(15)
+                    Text("30 minutes").tag(30)
+                    Text("1 hour").tag(60)
                 }
-            } else {
-                // Mount mode info
-                VStack(alignment: .leading, spacing: 4) {
-                    HStack(spacing: 6) {
-                        Image(systemName: "info.circle.fill")
-                            .foregroundStyle(.blue)
-                            .font(.caption)
-                        Text("Mount mode runs continuously - no periodic sync needed")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                }
+                .pickerStyle(.menu)
+                .frame(width: 150, alignment: .leading)
             }
 
             Divider()
@@ -1954,31 +1415,6 @@ struct ProfileDetailView: View {
                     .foregroundStyle(.secondary)
                 TextField("--dry-run --verbose", text: $additionalRcloneFlags)
                     .textFieldStyle(.roundedBorder)
-            }
-
-            // Parallel download connections — drives the mount's --transfers and the
-            // offline-warm concurrency. Only meaningful in mount mode (offline files +
-            // streaming), so it's shown there only.
-            if syncMode == .mount {
-                Divider()
-
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Download Connections")
-                        .font(.subheadline.weight(.medium))
-                    Text("How many files download in parallel when caching offline folders "
-                        + "and streaming. Higher saturates a fast wired network; 1–2 is faster "
-                        + "on Wi-Fi, a mesh, or a slow remote, where too many parallel transfers "
-                        + "fight each other (and thrash a spinning-disk cache). Changing this "
-                        + "remounts the stream.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                    Stepper(value: $downloadConnections, in: 1...16) {
-                        Text("\(downloadConnections) \(downloadConnections == 1 ? "connection" : "connections")")
-                            .font(.subheadline.monospacedDigit())
-                    }
-                    .frame(width: 220, alignment: .leading)
-                }
             }
 
             Divider()
@@ -2023,7 +1459,7 @@ struct ProfileDetailView: View {
                 saveProfile()
             }
             .keyboardShortcut(.defaultAction)
-            .disabled(!hasChanges || mountFallbackCacheConflict)
+            .disabled(!hasChanges)
             .buttonStyle(.borderedProminent)
         }
     }
@@ -2044,23 +1480,6 @@ struct ProfileDetailView: View {
         fallbackRemotePath = profile.fallbackRemotePath
         fallbackEnabled = !profile.fallbackRemote.isEmpty
         fallbackUseDifferentPath = !profile.fallbackRemotePath.isEmpty
-        mountBackend = profile.mountBackend
-        vfsCacheMode = profile.vfsCacheMode
-        vfsCacheMaxSize = profile.vfsCacheMaxSize
-        vfsCacheMaxAge = profile.vfsCacheMaxAge
-        // Split the stored strings into the number + unit picker state. Clamp an
-        // unrecognised unit to the default so the picker always has a valid selection.
-        let size = Self.splitValueUnit(profile.vfsCacheMaxSize, defaultNumber: "10", defaultUnit: "G")
-        cacheSizeNumber = size.number
-        cacheSizeUnit = Self.cacheSizeUnits.contains { $0.0 == size.unit } ? size.unit : "G"
-        let age = Self.splitValueUnit(profile.vfsCacheMaxAge, defaultNumber: "168", defaultUnit: "h")
-        cacheAgeNumber = age.number
-        cacheAgeUnit = Self.cacheAgeUnits.contains { $0.0 == age.unit } ? age.unit : "h"
-        vfsCachePath = profile.vfsCachePath
-        allowNonEmptyMount = profile.allowNonEmptyMount
-        mountAtStartup = profile.mountAtStartup
-        offlineAccessEnabled = profile.offlineAccessEnabled
-        downloadConnections = profile.downloadConnections
 
         // Show text input if the path contains "/" (nested path) or is a custom path
         // that won't be in the folder picker dropdown
@@ -2086,56 +1505,12 @@ struct ProfileDetailView: View {
         updatedProfile.syncDirection = syncDirection
         updatedProfile.fallbackRemote = fallbackEnabled ? fallbackRemote : ""
         updatedProfile.fallbackRemotePath = (fallbackEnabled && fallbackUseDifferentPath) ? fallbackRemotePath : ""
-        updatedProfile.mountBackend = mountBackend
-        updatedProfile.vfsCacheMode = vfsCacheMode
-        updatedProfile.vfsCacheMaxSize = vfsCacheMaxSize
-        updatedProfile.vfsCacheMaxAge = vfsCacheMaxAge
-        updatedProfile.vfsCachePath = vfsCachePath
-        updatedProfile.allowNonEmptyMount = allowNonEmptyMount
-        updatedProfile.mountAtStartup = mountAtStartup
-        updatedProfile.offlineAccessEnabled = offlineAccessEnabled
-        updatedProfile.downloadConnections = downloadConnections
         return updatedProfile
     }
 
     private func saveProfile() {
-        // Backstop for the disabled Save button: never persist a Stream profile whose
-        // fallback resolves to a different remote path — it would duplicate the VFS cache.
-        guard !mountFallbackCacheConflict else {
-            installError = "Stream fallback must use the same remote path as the primary so the cache is shared. Configure the fallback remote to resolve \"\(remotePath)\", or turn off \"Fallback uses a different path\"."
-            return
-        }
-
         let updatedProfile = buildProfileFromForm()
         let currentProfile = profile
-
-        // A Stream profile whose Cache Directory changed needs a decision about
-        // the files already cached at the old location before anything reinstalls —
-        // hand off to the move sheet instead of saving vfsCachePath immediately.
-        let cacheIntent = SyncManager.cachePathChangeIntent(
-            from: currentProfile, to: updatedProfile, allProfiles: profileStore.profiles
-        )
-        if case .promptMove(let prompt) = cacheIntent {
-            // Persist every OTHER field change now, holding vfsCachePath at its
-            // CURRENT value — the sheet (Move / Leave behind / Start fresh)
-            // performs the final vfsCachePath write and any reinstall.
-            var deferredProfile = updatedProfile
-            deferredProfile.vfsCachePath = currentProfile.vfsCachePath
-            // Whether those deferred (non-cache-path) fields actually need a
-            // reinstall to take effect, computed against the SAME delta
-            // helper used below — if the sheet is simply dismissed without
-            // resolving the cache-path change (Cancel), `onDismiss` still
-            // needs to apply them (finding 12).
-            let deferredNeedsReinstall = isInstalled
-                && SyncManager.reconcileAction(from: currentProfile, to: deferredProfile) == .reinstall
-            profileStore.update(deferredProfile)
-            syncManager.clearError(for: profile.id)
-            syncManager.maintainOfflineAccessLink(for: deferredProfile)
-            cacheMovePrompt = prompt
-            cacheMoveOtherFieldsNeedReinstall = deferredNeedsReinstall
-            showingCacheMoveSheet = true
-            return
-        }
 
         // Delegates to the SAME delta helper `applyExternalProfileEdit` uses,
         // so the Save button and an external file edit can never drift on
@@ -2148,111 +1523,9 @@ struct ProfileDetailView: View {
         // Clear any cached error since config changed
         syncManager.clearError(for: profile.id)
 
-        // Create / remove / re-point the read-only "(Offline)" cache browse point
-        // to match the saved profile (offline-access toggle or cache-dir change).
-        syncManager.maintainOfflineAccessLink(for: updatedProfile)
-
         // Only reinstall if sync-related settings changed
         if needsReinstall {
             reinstallSync()
-        }
-    }
-
-    /// "Leave them behind" / "Start fresh" — persist the NEW `vfsCachePath`
-    /// (no move engine run) and reinstall. "Move existing cached files" does
-    /// NOT come through here: `CacheMoveSheet` calls
-    /// `SyncManager.startCacheMigration`, whose own orchestration already
-    /// uninstalls, moves, persists `vfsCachePath` on success, and reinstalls
-    /// on every exit path — a second reinstall here would be redundant.
-    private func finalizeCachePathChange(prompt: CacheMovePrompt, deleteOldCache: Bool) {
-        guard var latest = profileStore.profile(for: prompt.profileId) else { return }
-        if deleteOldCache {
-            deleteOldCacheSubtree(of: latest, excluding: prompt.overlappingProfileIds)
-        }
-        latest.vfsCachePath = prompt.destinationRoot
-        profileStore.update(latest)
-        // Cache dir moved → re-point the offline browse point at the new location.
-        syncManager.maintainOfflineAccessLink(for: latest)
-        if isInstalled {
-            reinstallSync()
-        }
-        // This reinstall (or the no-op fallthrough below when `!isInstalled`)
-        // already applies BOTH the cache-path edit AND every other field
-        // change `saveProfile()` deferred-persisted before opening this
-        // sheet — clear the flag so the sheet's `onDismiss` doesn't run a
-        // second, redundant reinstall for those same other fields (finding 12).
-        cacheMoveOtherFieldsNeedReinstall = false
-        showingCacheMoveSheet = false
-        cacheMovePrompt = nil
-    }
-
-    /// "Start fresh" — delete BOTH the `vfs` and `vfsMeta` subtree at the
-    /// profile's OLD cache root, EXCLUDING any overlapping sibling's nested
-    /// subtree — an overlapping profile addresses the SAME bytes on disk
-    /// (R15/R28), so a blanket delete of the moving profile's whole subtree
-    /// would also destroy that sibling's entire cache when the sibling is
-    /// nested inside it (finding 3). When the moving profile's OWN key is
-    /// nested inside an overlapping sibling's (the reverse direction),
-    /// nothing is deleted at all — the whole subtree is shared territory.
-    /// Deliberately separate from `VFSCacheService.clearCache` (which only
-    /// clears `vfs` — a known, recorded-out-of-scope gap, see plan Out of
-    /// Scope) so the freed space is fully accounted for. Values are captured
-    /// on the main thread first; the actual removal runs off it per
-    /// CLAUDE.md Critical Rule 1, since a populated cache can be many
-    /// gigabytes.
-    private func deleteOldCacheSubtree(of profile: SyncProfile, excluding overlappingIds: [UUID]) {
-        let root = CacheMigrationPlanner.normalizeRoot(profile.vfsCachePath)
-        let key = VFSCacheService.cacheRelativePath(for: profile)
-        let overlappingKeys: [String] = overlappingIds.compactMap { id in
-            profileStore.profile(for: id).map { VFSCacheService.cacheRelativePath(for: $0) }
-        }
-
-        // This profile's own key is nested inside (or equal to) an
-        // overlapping sibling's key — the WHOLE subtree at `key` is that
-        // sibling's territory too. Deleting any of it costs the sibling
-        // real cached data, so delete nothing.
-        guard !overlappingKeys.contains(where: { key == $0 || key.hasPrefix($0 + "/") }) else { return }
-
-        // Siblings whose key is nested INSIDE this profile's own key get
-        // their relative sub-path preserved during the walk below.
-        let preserveRelativePaths: [String] = overlappingKeys.compactMap { sibling in
-            guard sibling.hasPrefix(key + "/") else { return nil }
-            return String(sibling.dropFirst(key.count + 1))
-        }
-
-        DispatchQueue.global(qos: .utility).async {
-            let fm = FileManager.default
-            for kind in CacheTreeKind.allCases {
-                let path = "\(root)/\(kind.rawValue)/\(key)"
-                Self.removeCacheSubtree(at: path, base: path, preserving: preserveRelativePaths, fm: fm)
-            }
-        }
-    }
-
-    /// Recursively remove everything under `dir`, EXCEPT an entry whose path
-    /// relative to `base` is one of `preserving` (or lives inside one) — the
-    /// same preserve-a-subtree walk `VFSCacheService.clearUnpinned` uses for
-    /// pinned directories, applied here to an overlapping sibling's nested
-    /// cache instead.
-    private static func removeCacheSubtree(at dir: String, base: String, preserving: [String], fm: FileManager) {
-        guard !preserving.isEmpty else {
-            try? fm.removeItem(atPath: dir)
-            return
-        }
-        guard let entries = try? fm.contentsOfDirectory(atPath: dir) else { return }
-        for entry in entries {
-            let full = (dir as NSString).appendingPathComponent(entry)
-            let rel = String(full.dropFirst(base.count + 1))
-            if preserving.contains(where: { rel == $0 || rel.hasPrefix($0 + "/") }) {
-                continue  // the preserved subtree itself, or a file inside it
-            }
-            var isDir: ObjCBool = false
-            fm.fileExists(atPath: full, isDirectory: &isDir)
-            if isDir.boolValue && preserving.contains(where: { $0.hasPrefix(rel + "/") }) {
-                removeCacheSubtree(at: full, base: base, preserving: preserving, fm: fm)  // ancestor of a preserved subtree
-            } else {
-                try? fm.removeItem(atPath: full)
-            }
         }
     }
 
@@ -2443,11 +1716,7 @@ struct ProfileDetailView: View {
     }
 
     /// - Parameter overrideProfile: when non-nil, install exactly this
-    ///   profile instead of rebuilding one from the live form. Required by
-    ///   the cache-move-cancel backstop (finding 1): the form's
-    ///   `vfsCachePath` field can hold an unresolved, un-gated edit, so that
-    ///   path must reinstall the ALREADY-PERSISTED profile, never derive one
-    ///   from form state.
+    ///   profile instead of rebuilding one from the live form.
     private func installSync(using overrideProfile: SyncProfile?) {
         isInstalling = true
         installError = nil
@@ -2726,16 +1995,6 @@ struct ProfileDetailView: View {
 
         guard let primary = primaryType, let fallback = fallbackType else { return }
 
-        // Mount mode shares one VFS cache across both remotes, so the fallback must resolve
-        // the SAME path as the primary. Never auto-enable a different path here — that path
-        // would fragment the cache and the save is blocked. The fallback remote itself must be
-        // configured so the primary's path resolves.
-        if syncMode == .mount {
-            fallbackUseDifferentPath = false
-            fallbackRemotePath = ""
-            return
-        }
-
         if primary != fallback {
             // Protocols differ — enable the toggle by default
             if !fallbackUseDifferentPath {
@@ -2904,20 +2163,6 @@ struct ProfileDetailView: View {
     }
 
     private func runResync(loadAgentOnCompletion: Bool = false) {
-        // For mount mode, skip initial sync entirely - just load the agent
-        if syncMode == .mount {
-            isInstalling = false
-            resyncOutputLines = ["Mount mode - starting mount service..."]
-            showResyncOutput = true
-
-            if loadAgentOnCompletion {
-                if !setupService.loadAgent(for: profile) {
-                    installError = "Failed to start mount service"
-                }
-            }
-            return
-        }
-
         // Clear installing state so resync output panel is visible
         isInstalling = false
         isRunningResync = true
@@ -3249,16 +2494,10 @@ struct ProfileDetailView: View {
 
     /// Describes what the first sync will do to a non-empty local folder, tailored to
     /// the current mode/direction so warnings match actual behaviour — bisync merges,
-    /// one-way overwrites/deletes, mount overlays. Drives both the picker confirmation
+    /// one-way overwrites/deletes. Drives both the picker confirmation
     /// dialog and the inline "folder not empty" banner so they tell one consistent story.
     private var firstSyncEffect: (icon: String, headline: String, detail: String) {
         switch syncMode {
-        case .mount:
-            return (
-                "eye.slash",
-                "files already here will be hidden while the remote is mounted",
-                "Mount mode overlays the remote onto this folder. Your existing files stay on disk but become inaccessible until you unmount, and mounting can fail unless \"Mount even if the local folder already contains files\" is enabled."
-            )
         case .sync:
             switch syncDirection {
             case .localToRemote:
@@ -3299,7 +2538,7 @@ struct ProfileDetailView: View {
     }
 
     /// Whether the local folder currently entered in the form exists on disk.
-    /// False when the path is empty or missing (e.g. external drive unmounted),
+    /// False when the path is empty or missing (e.g. external drive disconnected),
     /// which disables the "Open in Finder" button instead of opening nothing.
     private var localFolderExists: Bool {
         var isDirectory: ObjCBool = false
@@ -3308,7 +2547,7 @@ struct ProfileDetailView: View {
             && isDirectory.boolValue
     }
 
-    /// Opens the local sync folder (or mount point, for Stream profiles) in Finder.
+    /// Opens the local sync folder in Finder.
     /// Uses the form's current value so the button follows unsaved edits.
     private func openLocalFolderInFinder() {
         guard localFolderExists else { return }
@@ -3355,7 +2594,6 @@ struct ProfileDetailView: View {
         case unlock
         case retrySync
         case forceSync      // Override "too many deletes" safety check
-        case mountAnyway    // Enable non-empty mount and retry
 
         /// Bounded, low-cardinality id for telemetry (`recovery.action`).
         var telemetryName: String {
@@ -3367,7 +2605,6 @@ struct ProfileDetailView: View {
             case .unlock: return "unlock"
             case .retrySync: return "retry"
             case .forceSync: return "force_sync"
-            case .mountAnyway: return "mount_anyway"
             }
         }
 
@@ -3387,8 +2624,6 @@ struct ProfileDetailView: View {
                 return "Retry Sync"
             case .forceSync:
                 return "Force Sync (Override Safety)"
-            case .mountAnyway:
-                return "Mount Anyway"
             }
         }
 
@@ -3408,8 +2643,6 @@ struct ProfileDetailView: View {
                 return "Syncing..."
             case .forceSync:
                 return "Force syncing..."
-            case .mountAnyway:
-                return "Mounting..."
             }
         }
 
@@ -3429,8 +2662,6 @@ struct ProfileDetailView: View {
                 return "arrow.clockwise"
             case .forceSync:
                 return "exclamationmark.triangle"
-            case .mountAnyway:
-                return "folder.badge.plus"
             }
         }
 
@@ -3450,18 +2681,11 @@ struct ProfileDetailView: View {
                 return "Try running the sync again"
             case .forceSync:
                 return "Override the 50% deletion safety limit and proceed with sync"
-            case .mountAnyway:
-                return "Enable mounting to non-empty folder and retry"
             }
         }
     }
 
     private func detectErrorAction(from error: String) -> ErrorAction? {
-        // Mount mode: folder is not empty
-        if error.contains("is not empty") || error.contains("not empty") {
-            return .mountAnyway
-        }
-
         // Use Smart Fix for most common bisync errors that need orchestrated recovery
         // These errors typically require: unlock → check files → resync
 
@@ -3534,48 +2758,6 @@ struct ProfileDetailView: View {
             syncManager.triggerManualSync(for: profile)
         case .forceSync:
             runForceSync()
-        case .mountAnyway:
-            enableNonEmptyMountAndReinstall()
-        }
-    }
-
-    private func enableNonEmptyMountAndReinstall() {
-        // Enable the setting
-        allowNonEmptyMount = true
-
-        // Clear any cached error
-        syncManager.clearError(for: profile.id)
-
-        // Build updated profile and save
-        var updatedProfile = buildProfileFromForm()
-        updatedProfile.allowNonEmptyMount = true
-        profileStore.update(updatedProfile)
-
-        // Reinstall with the new setting
-        isInstalling = true
-        installError = nil
-
-        DispatchQueue.global(qos: .userInitiated).async {
-            do {
-                // Uninstall first if already installed
-                if self.setupService.isInstalled(profile: updatedProfile) {
-                    try self.setupService.uninstall(profile: updatedProfile)
-                }
-
-                // Reinstall with new config
-                try self.setupService.install(profile: updatedProfile, loadAgent: true)
-
-                DispatchQueue.main.async {
-                    self.isInstalling = false
-                    self.resyncOutputLines = ["Mount service restarted with non-empty folder allowed"]
-                    self.showResyncOutput = true
-                }
-            } catch {
-                DispatchQueue.main.async {
-                    self.isInstalling = false
-                    self.installError = "Failed to reinstall: \(error.localizedDescription)"
-                }
-            }
         }
     }
 

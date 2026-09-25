@@ -43,7 +43,6 @@ enum MigrationRunner {
     /// give it the next version number, and append it here.
     private static let migrations: [ProfileMigration] = [
         MigrationV1LegacyToMultiProfile(),
-        MigrationV2FixVFSCachePath(),
         MigrationV3BlobToPerProfileFiles(),
     ]
 
@@ -189,66 +188,6 @@ struct MigrationV1LegacyToMultiProfile: ProfileMigration {
         }
 
         defaults.set(true, forKey: "hasCompletedMultiProfileMigration")
-    }
-}
-
-// MARK: - Migration V2: Fix VFS Cache Path Default
-
-/// Fixes the vfsCachePath default from "~/.cache/rclone/vfs" to "~/.cache/rclone".
-///
-/// rclone's --cache-dir flag expects the base cache directory. rclone itself
-/// creates a "vfs/" subdirectory inside it. The old default caused double-nesting:
-/// ~/.cache/rclone/vfs/vfs/<remote>/
-///
-/// This migration strips the trailing "/vfs" from affected profiles.
-struct MigrationV2FixVFSCachePath: ProfileMigration {
-    let version = 2
-    let description = "Fix VFS cache path default (remove double /vfs nesting)"
-
-    private let wrongSuffix = "/.cache/rclone/vfs"
-    private let correctSuffix = "/.cache/rclone"
-
-    func migrateUserDefaults(_ defaults: UserDefaults) throws {
-        guard var profiles = MigrationRunner.readProfileDicts(from: defaults) else { return }
-
-        var changed = false
-        for i in profiles.indices {
-            if let cachePath = profiles[i]["vfsCachePath"] as? String,
-               needsFix(cachePath) {
-                profiles[i]["vfsCachePath"] = fixPath(cachePath)
-                changed = true
-            }
-        }
-
-        if changed {
-            try MigrationRunner.writeProfileDicts(profiles, to: defaults)
-        }
-    }
-
-    func migrateOnDiskConfig(_ config: [String: Any]) -> [String: Any]? {
-        guard let cachePath = config["vfsCachePath"] as? String,
-              needsFix(cachePath) else {
-            return nil
-        }
-
-        var updated = config
-        updated["vfsCachePath"] = fixPath(cachePath)
-        return updated
-    }
-
-    /// Check if a path has the wrong /vfs suffix that needs fixing
-    private func needsFix(_ path: String) -> Bool {
-        // Match paths ending in /.cache/rclone/vfs (the wrong default)
-        // Don't match paths where /vfs is intentional (e.g., custom paths)
-        path.hasSuffix(wrongSuffix)
-    }
-
-    /// Remove the trailing /vfs from the path
-    private func fixPath(_ path: String) -> String {
-        if path.hasSuffix(wrongSuffix) {
-            return String(path.dropLast(4)) // Remove "/vfs"
-        }
-        return path
     }
 }
 

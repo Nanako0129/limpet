@@ -45,7 +45,7 @@
     },
     "isEnabled": {
       "type": "boolean",
-      "description": "Whether the scheduled sync/mount agent is installed. Toggling this installs or uninstalls the launchd agent."
+      "description": "Whether the scheduled sync agent is installed. Toggling this installs or uninstalls the launchd agent."
     },
     "isMuted": {
       "type": "boolean",
@@ -53,8 +53,8 @@
     },
     "syncMode": {
       "type": "string",
-      "enum": ["bisync", "sync", "mount"],
-      "description": "Two-way sync, one-way sync, or streaming mount."
+      "enum": ["bisync", "sync"],
+      "description": "Two-way sync or one-way sync."
     },
     "syncDirection": {
       "type": "string",
@@ -72,60 +72,6 @@
     "fallbackRequiresCacheRebuild": {
       "type": "boolean",
       "description": "Whether primary/fallback use different rclone wire types, forcing a full REMOTE swap on failover instead of an env-var override."
-    },
-    "mountBackend": {
-      "type": "string",
-      "enum": ["nfs", "macfuse"],
-      "description": "Mount backend: kext-free NFS (default) or classic macFUSE."
-    },
-    "vfsCacheMode": {
-      "type": "string",
-      "description": "rclone VFS cache mode for mount profiles."
-    },
-    "vfsCacheMaxSize": {
-      "type": "string",
-      "description": "Maximum VFS cache size, e.g. \"10G\"."
-    },
-    "vfsCacheMaxAge": {
-      "type": "string",
-      "description": "How long a cached file is kept since last access, e.g. \"168h\"."
-    },
-    "vfsCachePath": {
-      "type": "string",
-      "description": "VFS cache directory path."
-    },
-    "allowNonEmptyMount": {
-      "type": "boolean",
-      "description": "Allow mounting onto a non-empty folder (macFUSE backend only)."
-    },
-    "mountAtStartup": {
-      "type": "boolean",
-      "description": "Whether this mount profile auto-mounts at login/app launch."
-    },
-    "offlineAccessEnabled": {
-      "type": "boolean",
-      "description": "Mount mode only. When true (default), SyncTray maintains a read-only \"<mount-name> (Offline)\" folder next to the mount point that links to the VFS cache, so already-cached files stay browsable in Finder while the network is down. App-side only — not consumed by the sync script."
-    },
-    "pinnedDirectories": {
-      "type": "array",
-      "items": { "type": "string" },
-      "description": "Directories kept warm in the VFS cache for offline access (mount mode)."
-    },
-    "warmExcludePatterns": {
-      "type": "array",
-      "items": { "type": "string" },
-      "description": "Glob patterns excluded from offline warming (mount mode). Applied app-side by the warmer; not emitted into the derived {shortId}.json script config."
-    },
-    "rcPort": {
-      "type": "integer",
-      "description": "Port for rclone's RC (remote control) API (mount mode)."
-    },
-    "downloadConnections": {
-      "type": "integer",
-      "minimum": 1,
-      "maximum": 16,
-      "default": 2,
-      "description": "How many files rclone downloads in parallel — sets the mount's --transfers and the app-side offline-warm concurrency. Higher saturates a fast wired link; 1–2 is faster on Wi-Fi/mesh or a slow remote, where parallel transfers contend and collapse throughput. Clamped to 1–16; omitted defaults to 2."
     }
   },
   "required": [

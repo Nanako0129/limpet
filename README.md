@@ -6,7 +6,7 @@
 
 <p align="center">
   <strong>Google Drive-style folder sync for any cloud</strong><br>
-  A native macOS menu bar app with three sync modes: two-way sync, one-way backup, and on-demand streaming.
+  A native macOS menu bar app with two sync modes: two-way sync and one-way backup.
 </p>
 
 <p align="center">
@@ -32,7 +32,7 @@ SyncTray brings the convenience of Google Drive or Dropbox sync to **any cloud s
 Instead of running complex terminal commands, SyncTray gives you:
 
 - A **menu bar icon** showing sync status at a glance
-- **Three sync modes** to match your workflow
+- **Two sync modes** to match your workflow
 - **Automatic scheduled syncing** that runs in the background
 - **Real-time notifications** when files change
 - **Multiple sync profiles** for different folders/remotes
@@ -41,13 +41,12 @@ Instead of running complex terminal commands, SyncTray gives you:
 
 ## Sync Modes
 
-SyncTray offers three ways to connect your files to the cloud:
+SyncTray offers two ways to connect your files to the cloud:
 
-| Mode               | Best For              | How It Works                              |
-| ------------------ | --------------------- | ----------------------------------------- |
-| **Two-Way Sync**   | Active working files  | Changes on either side sync to the other  |
-| **One-Way Sync**   | Backups & mirrors     | Source overwrites destination             |
-| **Stream (Mount)** | Large media libraries | Files appear locally but stream on-demand |
+| Mode              | Best For              | How It Works                             |
+| ----------------- | ---------------------- | ----------------------------------------- |
+| **Two-Way Sync**  | Active working files  | Changes on either side sync to the other  |
+| **One-Way Sync**  | Backups & mirrors     | Source overwrites destination             |
 
 <p align="center">
   <img src="/docs/assets/profile-two-way.png" alt="Two-Way Sync Configuration" height="600">
@@ -70,22 +69,6 @@ Mirror files in one direction only. Choose your direction:
 
 The destination always matches the source exactly.
 
-### Stream (Mount)
-
-Access cloud files without downloading them. Files appear in a folder on your Mac but are streamed on-demand when opened.
-
-- No local storage used (beyond cache)
-- Ideal for large media libraries or archives
-- Configurable VFS cache with a retention window ("keep cached for N days")
-- **Live download progress**: streaming a file shows the same transfer bar and per-file list that sync/bisync profiles show, in the menu bar and the profile detail
-- **Offline files**: keep chosen folders downloaded so they open with no connection (see [Offline Files](#offline-files))
-
-<p align="center">
-  <img src="/docs/assets/profile-stream.png" alt="Stream (Mount) Configuration" height="600">
-</p>
-
-> **Note**: Stream mode is **kext-free by default** — it uses rclone's built-in NFS mount, so no macFUSE is required (it works even on locked-down/MDM-managed Macs). A legacy macFUSE backend is still selectable per profile ([details](#mount-mode-setup)).
-
 ---
 
 ## Features
@@ -94,7 +77,6 @@ Access cloud files without downloading them. Files appear in a folder on your Ma
 
 - Menu bar icon shows current state (idle, syncing, error, drive not mounted)
 - **Real-time progress** during sync: bytes transferred, percentage, ETA
-- Works for Stream (Mount) profiles too — streaming a file surfaces live download progress polled from rclone's RC API
 - Per-profile status indicators
 
 During sync, see detailed transfer progress:
@@ -148,16 +130,6 @@ Configure an alternative remote that activates automatically when the primary is
 - **Bisync cache preservation**: When the fallback uses the same directory structure, env var overrides swap the transport without invalidating rclone's bisync cache
 - **Flexible path mapping**: Supports fallback remotes with different path structures (e.g., SMB share root vs SFTP filesystem path)
 
-### Offline Files
-
-For Stream (Mount) profiles, keep chosen folders downloaded so they open instantly without a connection.
-
-- **Mark a folder offline** two ways: right-click it in Finder → **Available Offline**, or use the **Offline Files** section of the profile editor
-- **Live warming progress**: making a folder available offline downloads it with parallel transfers and shows per-file progress; interrupted runs cancel and restart cleanly on cache clear, unmount, or edit
-- **Don't Download excludes**: skip files you never want offline with wildcard patterns, including `**` folder globs
-- **Cache management**: clear the VFS cache with an option to keep pinned (offline) folders
-- The Finder right-click menu needs a one-time approval under System Settings → General → Login Items & Extensions → Extensions; the app's Offline Files section links you there
-
 ### One-Click Actions
 
 - **Sync Now**: Trigger immediate sync for all enabled profiles
@@ -182,34 +154,6 @@ rclone config
 See [rclone's documentation](https://rclone.org/docs/) for detailed setup guides for each provider.
 
 SyncTray auto-detects rclone from Homebrew, `/usr/local/bin`, `/usr/bin`, and nix installs (nix-darwin, per-user, and profile paths), so a non-Homebrew rclone works without extra configuration.
-
-### Mount Mode Setup
-
-Stream (Mount) mode works **out of the box** — no extra setup. By default it uses
-rclone's built-in **NFS** mount (kext-free), so nothing beyond rclone itself is
-required, and it works on locked-down / MDM-managed Macs where kernel extensions
-are blocked.
-
-#### Optional: macFUSE backend (legacy)
-
-If you prefer the classic FUSE mount, switch a profile's **Mount Backend** to
-**macFUSE** in the profile editor. That backend additionally requires macFUSE and
-the official rclone binary:
-
-```bash
-# 1. Install macFUSE, then restart and approve it in
-#    System Settings → Privacy & Security.
-brew install --cask macfuse
-
-# 2. Homebrew's rclone can't mount — install the official binary.
-brew uninstall rclone
-curl -O https://downloads.rclone.org/rclone-current-osx-arm64.zip
-unzip rclone-current-osx-arm64.zip
-cd rclone-*-osx-arm64
-sudo cp rclone /usr/local/bin/
-sudo chmod +x /usr/local/bin/rclone
-rclone version
-```
 
 ---
 
@@ -282,25 +226,6 @@ Click **Install** to activate the profile. SyncTray will:
 ### 4. You're Done!
 
 Your folder will now sync automatically on schedule. The menu bar shows sync status, and you'll get notifications when files change.
-
-### Using Mount Mode
-
-Mount mode is different from sync modes - it creates a virtual drive instead of syncing files:
-
-1. **Select Mount Mode**: When creating a profile, choose "Stream (Mount)" as the sync mode
-2. **Configure Mount Settings**:
-   - **Cache Mode**: Choose how aggressively to cache (Full recommended)
-   - **Cache Size**: Set maximum cache size (default: 10G)
-   - **Cache Directory**: Where cached files are stored (default: ~/.cache/rclone/vfs)
-3. **Mount Point**: The local path becomes your mount point (where files appear)
-4. **Install and Mount**: Click Install, then Mount in the menu bar
-
-**Mount vs Sync**:
-
-- Mount: Files stream on-demand, mount runs continuously
-- Sync: Files copied locally, sync runs periodically
-
-**Unmounting**: Click the eject button in the menu bar for the profile, or disable the profile.
 
 ## Menu Bar States
 
@@ -413,7 +338,7 @@ SyncTray installs a `synctray` shim at `~/.local/bin/synctray` on every launch. 
 | `synctray profile create --from <file>` | Create a profile from a `.profile.json` file (or `-` for stdin). |
 | `synctray profile enable <name\|id>` | Enable a profile and install its agent. |
 | `synctray profile disable <name\|id>` | Disable a profile and uninstall its agent. |
-| `synctray profile delete <name\|id>` | Uninstall the agent (detaching a mount first) and remove the profile. |
+| `synctray profile delete <name\|id>` | Uninstall the agent and remove the profile. |
 
 **Operate:**
 
@@ -470,43 +395,6 @@ xattr -cr /Applications/SyncTray.app
 
 - Only files actually transferred appear (unchanged files are skipped)
 - Check that `--use-json-log` is being used (automatic with SyncTray)
-
-### Mount mode: mount fails
-
-Mount mode is kext-free by default (NFS backend) and needs nothing beyond rclone. If a mount fails, check that rclone is installed and the remote is reachable (`synctray doctor`).
-
-If you switched a profile to the **macFUSE** backend, that backend needs macFUSE and the official rclone binary:
-
-```bash
-brew install --cask macfuse
-```
-
-After installation:
-
-1. Reboot your Mac
-2. Go to System Settings → Privacy & Security
-3. Approve the macFUSE system extension
-4. Replace Homebrew's rclone with the official binary (see [Mount Mode Setup](#mount-mode-setup))
-5. Try mounting again
-
-### Mount mode: Stale mount or "Device busy" error
-
-If a mount fails to unmount cleanly:
-
-```bash
-# Force unmount
-diskutil unmount force /path/to/mount/point
-
-# Or restart SyncTray (auto-cleans stale mounts)
-```
-
-### Mount mode: Slow file access
-
-Try adjusting cache settings:
-
-- Increase cache size (e.g., from 10G to 20G)
-- Use "Full" cache mode for better read performance
-- Check network speed to remote (mount streams over network)
 
 ## Development
 
@@ -567,5 +455,4 @@ MIT License - see [LICENSE](LICENSE) for details.
 ## Acknowledgments
 
 - [rclone](https://rclone.org/) - The powerful sync engine
-- [macFUSE](https://osxfuse.github.io/) - Virtual filesystem support
 - Apple's SwiftUI and MenuBarExtra APIs

@@ -6,7 +6,7 @@ SyncTray is a macOS menu bar application that provides Google Drive-style backgr
 
 ### Key Features
 - **Multi-profile support**: Configure multiple sync pairs (local folder ↔ cloud remote)
-- **Three sync modes**: Two-way sync (bisync), one-way sync (upload/download), and stream (mount)
+- **Two sync modes**: Two-way sync (bisync) and one-way sync (upload/download)
 - **Background sync via launchd**: Scheduled syncs run automatically at configurable intervals
 - **Real-time file monitoring**: FSEvents-based directory watching triggers syncs on local changes
 - **External drive support**: Auto-detects when external drives are mounted/unmounted
@@ -22,198 +22,6 @@ SyncTray is a macOS menu bar application that provides Google Drive-style backgr
 | Two-Way Sync | `rclone bisync` | Bidirectional sync - changes on either side sync to the other |
 | One-Way Upload | `rclone sync local remote` | Local is authoritative, uploads to remote |
 | One-Way Download | `rclone sync remote local` | Remote is authoritative, downloads to local |
-| Stream (Mount) | `rclone nfsmount` (default) or `rclone mount` | Virtual filesystem - files stream on-demand without local copy |
-
-#### Mount Mode Backends
-Stream (Mount) mode supports two backends, chosen per-profile via `mountBackend`
-(`MountBackend` enum). Both share the same VFS cache layer, so caching, retention,
-pinned-directory warming, and the RC API behave identically across them.
-
-| Backend | rclone command | Requirements | When to use |
-|---------|----------------|--------------|-------------|
-| **NFS** (`nfs`, default for new profiles) | `rclone nfsmount` | None beyond rclone itself | **Kext-free.** rclone runs a local NFS server and mounts it via the built-in macOS NFS client. No macFUSE, no kernel/system extension, no admin approval — works on locked-down / MDM-managed Macs where kexts are blocked. |
-| **macFUSE** (`macfuse`, legacy) | `rclone mount` | macFUSE + official rclone binary | Classic FUSE mount. Broader filesystem compatibility, but needs a kernel extension. Profiles created before the NFS backend existed default here so their behaviour is unchanged on upgrade. |
-
-**Backend defaults & migration:** the default backend is `nfs` everywhere — for
-newly created profiles and for profiles persisted before this field existed. A
-legacy profile with no `mountBackend` key decodes as `nfs` (the Swift model default)
-and the sync script applies the **same `nfs` fallback** when the key is absent from a
-profile's JSON, so the app and the generated script never disagree. This means a
-profile that previously mounted via macFUSE switches to the kext-free NFS backend on
-its next mount (the VFS cache is shared, so no re-download); users who specifically
-want FUSE can select **macFUSE** in the profile editor, which re-installs the launchd
-agent with `rclone mount`. Legacy profiles also pick up the new `--vfs-cache-max-age`
-default (168h) on the next script run — previously the flag was unset and rclone used
-its built-in 1h default; total cache size stays bounded by `--vfs-cache-max-size`.
-
-**Auto-mount on startup (`mountAtStartup`, default true):** a per-profile toggle for
-whether a Stream profile mounts on its own. It gates the launchd plist's `RunAtLoad`
-and `KeepAlive` (both `<true/>` only when enabled) — macOS reloads every LaunchAgent
-plist at each login, so those keys, not merely whether the app `launchctl load`ed the
-agent, decide login/reboot auto-mount. When enabled: mounts at login and the app also
-re-mounts it on launch (`mountProfilesAtStartup`, a safety net if the agent was
-unloaded). When disabled: the plist won't auto-start, so the profile mounts only when
-the user clicks **Mount** — which does `launchctl load` **plus** `launchctl kickstart`
-(`SyncSetupService.startAgent`), because with `RunAtLoad=false` loading alone won't
-start the job. `mountAtStartup` is an app/launchd-level setting and is deliberately
-**not** written to the script's `{shortId}.json` (the script never reads it); it does
-force a plist regeneration on save (part of `needsReinstall`).
-
-**The generated per-profile config (`{shortId}.json`) is the script's single source
-of truth.** `SyncSetupService.generateProfileConfig` writes this file (read by the
-sync script via `parse_json`); it is *separate* from the full `SyncProfile` that
-`ProfileStore` persists to `UserDefaults`. Any mount setting the script consumes
-(`mountBackend`, `vfsCacheMaxAge`, `vfsCacheMode`, `downloadConnections`, …) **must be emitted by
-`generateProfileConfig`** — a field present in the model, UI, and `Codable` but
-missing from this writer silently never reaches the script, which then falls back to
-its default. (This was the cause of the "NFS selected but macFUSE still runs" bug:
-`mountBackend`/`vfsCacheMaxAge` were added everywhere except `generateProfileConfig`.)
-
-**Cache retention (`vfsCacheMaxAge`):** the "Keep Cached For" setting maps to
-rclone's `--vfs-cache-max-age` (default `168h` = 7 days). A used file stays in the
-VFS cache until this long has passed *since it was last accessed* (the timer resets
-on each open); `--vfs-cache-max-size` still bounds total cache size with LRU
-eviction. There is no rclone-native per-file "pin" — `pinnedDirectories` are kept
-warm app-side via the RC API + reads (see Offline Files).
-
-**Offline use — read the warm cache and record with no internet, sync on return.**
-A Stream mount is a *long-lived, always-up* process (its launchd agent is
-`RunAtLoad`+`KeepAlive`), so the intended offline workflow is served entirely by the
-live mount, not by unmounting: with a full warm cache and no network, rclone serves
-fully-cached file **data** straight from disk, new files **recorded** into the mount
-land in the VFS cache as dirty and rclone retries the **write-back** until the remote
-returns. Two things make this reliable:
-- `--vfs-cache-mode full` (SyncTray's default) — required for both cache-served reads
-  and dirty-write queueing.
-- `--dir-cache-time 1000h` (~41 days, in `SyncSetupService`'s mount command) — folder
-  **listings** must survive the offline period too, or Finder browsing breaks when the
-  cache expires and rclone tries to re-list from the unreachable remote. The window is
-  deliberately long, not infinite; freshness is preserved by SyncTray's explicit
-  recursive `/vfs/refresh` on startup/mount and offline-warm (SMB has no
-  `--poll-interval` change notification), so remote-side additions still surface. Do
-  NOT symlink-swap the mount point to expose the cache offline: a file written into the
-  raw cache tree has no `vfsMeta` sidecar, so rclone never uploads it (the recording is
-  lost), and mounting NFS onto a symlink fails with `mount_nfs` exit 66.
-
-**Offline access browse point (`offlineAccessEnabled`, Advanced Options, default true).**
-The live mount is the intended offline path, but in practice `rclone nfsmount` over SMB
-does **not** always ride out a network drop — the backend connection can die, the NFS
-server stall, and macOS drop the volume ("Server connections interrupted"), so the live
-mount is not a dependable offline-read surface on its own. When this per-profile toggle
-is on (the default), SyncTray maintains a **read-only** `"<mount-name> (Offline)"`
-directory *next to* the mount point — a plain symlink to the VFS cache **data** tree
-(`{vfsCachePath}/vfs/{key}`) — so everything already cached stays browsable in Finder
-with no internet and no rclone process involved. It is a **sibling**, never the mount
-point itself (symlink-swapping the mount point is the exit-66 crash above), and it only
-ever *reads*: writing into it edits the raw cache with no `vfsMeta`, so those bytes never
-sync — the caption and docs say read-only for that reason. The whole mechanism is pure +
-a thin filesystem apply in `OfflineAccessLink.swift` (`linkPath`/`target`/`action` are
-I/O-free and shared with `VFSCacheService.cacheRelativePath`, so the link can never point
-at the wrong subtree); `SyncManager.maintainOfflineAccessLink(for:)` /
-`maintainAllOfflineAccessLinks()` apply it at launch, on a successful mount, and after
-every profile save / external-file edit / CLI write, and remove it on disable or delete.
-App-side only — like `mountAtStartup`/`pinnedDirectories` it is **not** emitted into the
-script's `{shortId}.json`. Covered by `ConfigSelfTest` AC-OA1 (pure decision matrix) and
-AC-OA2 (real filesystem apply).
-
-**Download connections (`downloadConnections`, default 2, range 1–16):** a per-profile
-"Download Connections" control (Advanced Options, mount mode only) that sets how many
-files download in parallel. It drives BOTH the mount's `--transfers` and the app-side
-offline-warm concurrency (`VFSCacheService`) from a single value — the two are kept in
-lockstep. Higher saturates a fast wired link; **1–2 is faster on a contended
-wireless/mesh backhaul or a spinning-disk cache**, where extra parallel transfers fight
-each other for airtime/seeks and *collapse* aggregate throughput (measured on one Wi-Fi
-mesh: 1 stream ≈ 4.7 MB/s, 8 streams ≈ 0.46 MB/s). The default is **2** — a safe value
-for the common NAS-over-Wi-Fi case; a profile omitting the key (any profile from before
-this field existed) decodes to 2, and users on a fast wired link raise it. Changing it
-is in `reconcileAction`'s reinstall set, so it remounts the stream to apply the new
-`--transfers`; a hand-edited value is clamped to 1–16 by the decoder.
-
-**NFS backend caveats:** writes require `--vfs-cache-mode` ≥ `writes` (default is
-`full`, so this is satisfied). The NFS client couples access/modification times,
-which can occasionally cause an extra re-upload after a file is merely viewed in
-Finder. `--allow-non-empty` is a FUSE-only option and is ignored for the NFS backend.
-
-The **macFUSE** backend additionally requires the official rclone binary
-(Homebrew's rclone can't mount):
-
-```bash
-# Only needed for the macFUSE backend — the NFS backend needs none of this.
-brew install --cask macfuse
-# Restart Mac
-
-# Replace Homebrew rclone with official binary
-brew uninstall rclone
-curl -O https://downloads.rclone.org/rclone-current-osx-arm64.zip
-unzip rclone-current-osx-arm64.zip
-cd rclone-*-osx-arm64
-sudo cp rclone /usr/local/bin/
-sudo chmod +x /usr/local/bin/rclone
-```
-
-#### Cache Directory Migration
-
-`rclone mount`/`nfsmount` keeps **two fixed-name sibling trees** under
-`--cache-dir` (`vfsCachePath`): `{root}/vfs/{key}` holds the cached file
-**data**, and `{root}/vfsMeta/{key}` is a mirror tree of per-file JSON
-sidecars — under `--vfs-cache-mode full` (SyncTray's default) this includes
-the **downloaded byte-range list**, so `vfsMeta` is load-bearing, not
-incidental: relocating `vfs` without it makes rclone treat the cache as
-unpopulated and re-download everything. `{key}` is the remote name (colon
-stripped) joined with the remote path, e.g. `synology/Kaiju/KAIJU`; the
-single home for deriving it is `VFSCacheService.cacheRelativePath(for:)`,
-called by both `cacheDirectory(for:)` and `CacheMigrationPlanner` so they
-cannot disagree about which subtree a profile owns.
-
-Changing a Stream profile's Cache Directory only re-points rclone by
-default — the already-downloaded bytes at the old location are abandoned.
-**Cache Directory Migration** physically relocates both trees (copy →
-verify byte size → delete per file, with a same-volume atomic-rename fast
-path, a free-space preflight, live progress, cancellation, resume, and
-auto-rollback on an integrity failure) so a warm cache survives a directory
-change. Two profiles can address the **same on-disk bytes** when one
-remote path nests inside another's (e.g. `Kaiju/KAIJU` and
-`Kaiju/KAIJU/Reaper` sharing a cache root) — `CacheMigrationPlanner`
-classifies siblings into **overlapping** (same bytes; an unresolved
-overlap rejects the move) vs merely **same-root** (disjoint bytes; offered
-as an optional, separate co-migration).
-
-Three entry points, all going through `SyncManager.startCacheMigration` /
-`migrateCacheDirectory`:
-
-- **Save-time prompt** — changing Cache Directory and pressing Save in
-  `ProfileDetailView` opens `CacheMoveSheet`, offering *Move existing
-  cached files* / *Leave them behind* / *Start fresh (clear the old
-  cache)*; the move (with progress and cancel) runs BEFORE the profile
-  remounts. `SyncManager.cachePathChangeIntent` (`ConfigReconciler.swift`,
-  `nonisolated static` — the headless CLI reasons about the same overlap
-  classification without a MainActor context) decides whether Save needs
-  to prompt at all.
-- **Offline Files "Move Cache…"** — `OfflineFilesSection` opens the same
-  sheet in destination-picker mode, without editing the profile form.
-- **CLI** — `synctray cache move <name|shortId> --to <path>
-  [--include-overlapping]`, blocking until done; refuses an unresolved
-  overlap unless `--include-overlapping` is passed (there's nobody to
-  prompt non-interactively).
-
-The orchestration (`SyncManager.migrateCacheDirectory`) cancels any
-in-flight offline warm for the affected profiles first (a warm actively
-reads through the mount — racing a move is a corruption path), uses the
-existing `SyncSetupService.uninstall` graceful volume detach before moving,
-runs the engine off the main actor, persists the new `vfsCachePath`
-**only** on a `.completed` outcome (so a `.profile.json` never names an
-incomplete cache), then re-installs on **every** exit path — completed,
-failed, cancelled, or a thrown error — and re-pushes the FinderSync App
-Group data. An external `~/.config/synctray/profiles/*.profile.json` edit
-of `vfsCachePath` deliberately does NOT trigger a migration (there's no one
-to prompt and a multi-hour unattended relocation from a file write would be
-a hostile surprise) — it keeps today's re-point-only `.reinstall` behavior.
-
-New source files: `SyncTray/Services/CacheMigrationPlanner.swift` (pure —
-subtree/overlap/exclusion planning, no I/O), `SyncTray/Services/CacheMigrationService.swift`
-(the injected-filesystem copy → verify → delete engine), `SyncTray/Models/CacheMigrationProgress.swift`
-(published per-profile progress), and `SyncTray/Views/Settings/CacheMoveSheet.swift`
-(the shared sheet for both UI entry points).
 
 ### How It Works
 1. User configures a profile: local path, rclone remote, and sync interval
@@ -252,8 +60,8 @@ Two distinct IPC mechanisms are used. Both use App Group ID `7HVK85DZG7.group.co
 
 | Direction | Mechanism | Key / File | Contents |
 |-----------|-----------|------------|----------|
-| Host → Extension | `UserDefaults(suiteName: "7HVK85DZG7.group.com.synctray.app")` | `com.synctray.app.mountPaths` | `[String]` — active NFS mount paths |
-| Host → Extension | `UserDefaults(suiteName: "7HVK85DZG7.group.com.synctray.app")` | `com.synctray.app.profileData` | `[[String:Any]]` — profileId, pinnedDirectories, vfsCachePath per profile |
+| Host → Extension | `UserDefaults(suiteName: "7HVK85DZG7.group.com.synctray.app")` | `com.synctray.app.mountPaths` | `[String]` — always empty now that mount mode is removed; see `SyncManager.updateAppGroupMountPaths` |
+| Host → Extension | `UserDefaults(suiteName: "7HVK85DZG7.group.com.synctray.app")` | `com.synctray.app.profileData` | `[[String:Any]]` — always empty, same reason |
 | Extension → Host | JSON file in App Group container | `pending-pin-request.json` | `{action, profileId, paths[]}` |
 | Extension ↔ Host | Darwin distributed notification | `com.synctray.app.pinRequest` | Zero-payload wake signal — **bidirectional** |
 
@@ -324,62 +132,6 @@ app**. So the FinderSync menu only appears in a **code-signed** build:
 literals in **both** `FinderSyncExtension.swift` and `SyncManager.swift` independently.
 The two targets are separate compilation units. If you rename either constant, rename both.
 
-#### VFS Content Warming (Bug Fix)
-
-`VFSCacheService.warmDirectory(_:for:)` fixes a pre-existing bug: the old
-`refreshPinnedDirectories` only called `/vfs/refresh` (listing-cache metadata), which
-does not populate the rclone VFS content cache. `warmDirectory` now:
-
-1. Calls `/vfs/refresh` first (listing cache pre-step).
-2. Walks `profile.localSyncPath/<dir>` via `FileManager.enumerator`.
-3. Opens each file ≤ 100 MB via `FileHandle` and reads 64 KB chunks — the act of
-   reading through the NFS mount populates `~/.cache/rclone/vfs/…`.
-
-I/O budget: sequential reads (not concurrent), 2 GB total ceiling per call, cancellable
-between files via `try Task.checkCancellation()`.
-
-**Skip files already fully cached (only download the missing delta).** Both
-`warmDirectory` and `estimateWarmWork` check each file against the on-disk VFS cache
-before reading it, and skip any that are already fully present. The decision is the pure
-`VFSCacheService.isCacheComplete(metaJSON:expectedSize:)`: it reads the file's `vfsMeta`
-sidecar and returns true iff the recorded `Size` matches, `Dirty` is false, and the
-downloaded byte ranges (`Rs`) contiguously cover `[0, size)`. The estimate excludes cached
-files from `filesTotal`/`bytesTotal` and reports them as `filesAlreadyCached`/
-`bytesAlreadyCached` (surfaced in `OfflineFilesSection` as "N already offline" / "All N
-files already offline"), so a re-warm of a warm cache is near-instant instead of re-fetching
-the whole pinned set. `cacheSubtreeRoots(for:)` derives the `{vfs, vfsMeta}` roots purely
-from the profile (sharing `cacheRelativePath(for:)` with `cacheDirectory(for:)`), and the
-per-file lookup keys on the **mount-relative** path. Covered by `ConfigSelfTest`'s AC-23.
-
-**Warm on mount detection, not just app-driven mounts.** A Stream profile with
-`mountAtStartup` is mounted by launchd at login/reboot (`RunAtLoad`) *without the app*,
-so when the app later launches it finds the volume already mounted and
-`mountProfilesAtStartup` skips it — meaning the app-driven mount warm never runs and
-files added to the remote while away are never pulled into the offline cache. The 5s
-mount monitor (`reconcileMountStatesOffMain`) closes this: when it first observes a
-pinned mount-mode profile mounted, it fires a one-time `startWarm(trigger: "startup")`
-(whose step 1 is a recursive `/vfs/refresh`, so newly-added remote files become visible
-and download as uncached). The decision is the pure `SyncManager.shouldAutoWarmOnMount`,
-gated by an `autoWarmedMounts` set so it warms **exactly once per mount session** — not
-every 5s tick (`startWarm` supersedes rather than coalesces, so per-tick calls would
-thrash) — and re-arms when the profile is seen unmounted, so a later remount warms again.
-The app-driven mount path (`mountProfile`) sets the same flag so the two can't double-fire.
-This also covers a slow fallback mount that established after `mountProfile`'s poll gave
-up. Covered by `ConfigSelfTest` AC-24.
-
-**The check deliberately ignores modtime — and that is the whole point.** Under
-`--vfs-cache-mode full` rclone re-validates a `size,modtime` fingerprint on every open;
-on a **fingerprint-unstable backend (SMB especially)** the modtime drifts, the fingerprint
-check fails, and rclone re-downloads a *complete* cache copy. That is exactly the bug this
-guards against (observed: a manual warm re-fetching all 12,179 files / ~95 GB over SMB at
-~1.2 MB/s ≈ 22 h, per the `synctray.offline.warm.*` telemetry), so gating the app-side skip
-on modtime would re-inherit it. By skipping the open entirely for a byte-complete cache
-entry, rclone never gets the chance to needlessly re-fetch. Trade-off: a **same-size**
-in-place remote edit won't re-warm until the cache entry is otherwise invalidated (a
-different-size edit still does, since the size check fails). On the **fallback** remote the
-primary-derived cache roots may not resolve, in which case the skip simply doesn't apply and
-the warmer reads as before — safe degradation.
-
 ### Models/
 
 | File | Purpose |
@@ -388,7 +140,6 @@ the warmer reads as before — safe degradation.
 | `SyncState.swift` | Sync state enum, progress struct, file change model, `ActiveTransport`, `SyncLogPatterns` for log parsing |
 | `RcloneLogEntry.swift` | JSON models for parsing rclone `--use-json-log` output |
 | `Settings.swift` | Global app settings (debug logging toggle, auto-fix sync issues toggle) |
-| `CacheMigrationProgress.swift` | Published per-profile progress for a cache-directory move (`CacheMigrationProgress`, shared `TransferFormat` byte/rate/elapsed helpers) |
 
 ### Services/
 
@@ -401,20 +152,18 @@ the warmer reads as before — safe degradation.
 | `LogParser.swift` | Parses plain text and JSON log lines into typed `ParsedLogEvent` |
 | `DirectoryWatcher.swift` | FSEvents-based directory monitoring with debouncing |
 | `ConfigFileWatcher.swift` | FSEvents watcher on `~/.config/synctray` for external profile/settings edits; self-write suppression via `ConfigSelfWriteRegistry` |
-| `ConfigReconciler.swift` | `SyncManager.reconcileAction` (shared launchd install/uninstall/reinstall delta logic), `SyncManager.applyExternalCreateIfNeeded`/`ExternalCreateOutcome` (create-from-file decision), `warmReconcileNeeded`/`applyWarmReconcileIfNeeded` (orthogonal app-side warm delta — pinned dirs / warm-exclude globs), and `SettingsReconciler` (isolated launch-at-login apply) |
+| `ConfigReconciler.swift` | `SyncManager.reconcileAction` (shared launchd install/uninstall/reinstall delta logic) and `SyncManager.applyExternalCreateIfNeeded`/`ExternalCreateOutcome` (create-from-file decision) |
 | `AppSettingsFileStore.swift` | Reads/writes `~/.config/synctray/settings.json` — an enumerated safe-key mirror of `SyncTraySettings` (no secrets, no telemetry IDs) |
 | `ConfigSchemaInstaller.swift` | Copies the committed JSON Schemas into `~/.config/synctray/schema/` at launch |
-| `ConfigSelfTest.swift` | `#if DEBUG` host self-test suite (`SyncTray --self-test`) — round-trip (incl. `warmExcludePatterns`), migration + migration-integrity, reconcile-delta, warm-reconcile-trigger, warm-skips-cached, self-write, isolated-login, external-create, and CLI assertions |
+| `ConfigSelfTest.swift` | `#if DEBUG` host self-test suite (`SyncTray --self-test`) — round-trip, migration + migration-integrity, reconcile-delta, self-write, isolated-login, external-create, and CLI assertions |
 | `NotificationService.swift` | Batched macOS notifications with action support |
 | `TelemetryService.swift` | Opt-in OTel telemetry (traces, metrics, logs) via OTLP/HTTP |
-| `CacheMigrationPlanner.swift` | Pure cache-directory-move planning — `CacheTreeKind` (`vfs`/`vfsMeta`), subtree/overlap/exclusion resolution, no I/O |
-| `CacheMigrationService.swift` | The cache-move engine — injected `CacheMigrationFileSystem`, free-space preflight, copy → verify → delete per file with a same-volume rename fast path, cancellation, resume, rollback |
 
 ### CLI/
 
 | File | Purpose |
 |------|---------|
-| `SyncTrayCLI.swift` | Headless `synctray` CLI — `CLICommand`, `parse`/`execute`/`run` (pure over `CLIEnvironment`), `doctorChecks`, `resolveProfile`, `applyProfileAssignment` (bounded `profile set` key set); mutating commands (`profile create`/`show`/`set`/`enable`/`disable`/`delete`, `sync`, `mount`/`unmount`, `install`/`reinstall`) drive `ProfileStore.writeProfileFile` + `SyncSetupService`; `runMeasured` records one `synctray.cli.invoked` event + flushes; dispatched from `SyncTrayApp.init` before SwiftUI/`SyncManager` |
+| `SyncTrayCLI.swift` | Headless `synctray` CLI — `CLICommand`, `parse`/`execute`/`run` (pure over `CLIEnvironment`), `doctorChecks`, `resolveProfile`, `applyProfileAssignment` (bounded `profile set` key set); mutating commands (`profile create`/`show`/`set`/`enable`/`disable`/`delete`, `sync`, `install`/`reinstall`) drive `ProfileStore.writeProfileFile` + `SyncSetupService`; `runMeasured` records one `synctray.cli.invoked` event + flushes; dispatched from `SyncTrayApp.init` before SwiftUI/`SyncManager` |
 | `CLIShimInstaller.swift` | Writes/refreshes the `~/.local/bin/synctray` shim on every launch; marker-guarded so it never clobbers a non-SyncTray file |
 
 ### File-Backed Configuration
@@ -425,7 +174,7 @@ running app applies the change live, without a restart.
 
 | Path | Contents | Notes |
 |------|----------|-------|
-| `profiles/{shortId}.profile.json` | Full `SyncProfile`, including `isEnabled`, `isMuted`, `mountAtStartup`, and the app-side warm fields `pinnedDirectories` / `warmExcludePatterns` | NEW authoritative file. Written by `ProfileStore.save()` (encodes the whole model, so any new `SyncProfile` field flows in automatically); read by `ProfileStore.load()` (file-authoritative). References `../schema/profile.schema.json` via `$schema`. |
+| `profiles/{shortId}.profile.json` | Full `SyncProfile`, including `isEnabled`, `isMuted` | NEW authoritative file. Written by `ProfileStore.save()` (encodes the whole model, so any new `SyncProfile` field flows in automatically); read by `ProfileStore.load()` (file-authoritative). References `../schema/profile.schema.json` via `$schema`. |
 | `profiles/{shortId}.json` | Derived, script-only subset (frozen key set) | Unchanged, byte-for-byte — this is `SyncSetupService.generateProfileConfig`'s output, consumed only by the sync shell script. The app never reads it back. |
 | `settings.json` | Enumerated safe subset of `SyncTraySettings` (`debugLoggingEnabled`, `autoFixSyncIssues`, `telemetryEnabled`, `launchAtLogin`) | Written by `AppSettingsFileStore`. Never contains secrets or telemetry identifiers (`installationId`, `anonymousUserId`). |
 | `schema/profile.schema.json`, `schema/settings.schema.json` | Committed JSON Schemas | Copied out of the app bundle by `ConfigSchemaInstaller` at every launch. Kept in lockstep with `SyncProfile.CodingKeys` by the fail-closed `scripts/check-schema-in-sync.sh`, run locally and in CI. |
@@ -462,16 +211,6 @@ and `launchctl load` it directly — SyncTray adds no privilege the attacker lac
 The profile files are also credential-free: rclone remotes and secrets live in
 `~/.config/rclone/rclone.conf`, never here, so a malicious drop can schedule an
 agent but can't exfiltrate or forge credentials through this path.
-
-**Warm reconcile is orthogonal to the launchd reconcile.** Editing an app-side
-warm field — `warmExcludePatterns` or `pinnedDirectories` — changes what the VFS
-warmer downloads, not the launchd script/plist/agent, so `reconcileAction`
-returns `.none` for it. `applyExternalProfileEdit` therefore ALSO runs a separate
-app-side warm reconcile (`applyWarmReconcileIfNeeded` → `applyWarmReconcile`): on
-a currently-mounted mount-mode profile it re-pushes the App Group data and
-re-warms via `VFSCacheService`, reusing the exact primitives the in-app
-pin/unpin path uses (`updateAppGroupMountPaths` + `startWarm`) so the two can't
-drift. A warm-only edit NEVER reinstalls the agent or remounts.
 
 **Self-write suppression.** `ConfigSelfWriteRegistry` tracks the content hash
 of every file SyncTray itself writes; `ConfigFileWatcher.shouldReconcile`
@@ -530,7 +269,7 @@ before writing it; the schema's top-level `description` documents the
 creation behavior. Only FIVE keys are required — `id`, `name`, `rcloneRemote`,
 `remotePath`, `localSyncPath` — so an agent can author a minimal profile and
 let every other field take its default (the decoder fills `syncMode=bisync`,
-`mountBackend=nfs`, `syncIntervalMinutes=5`, `isEnabled=false`, …, all mirrored
+`syncIntervalMinutes=5`, `isEnabled=false`, …, all mirrored
 from the memberwise-init defaults; an app-written file that emits every key
 still round-trips unchanged). A profile is created whenever the file decodes
 successfully and `id` is a well-formed UUID; the launchd agent installs (i.e.
@@ -569,19 +308,16 @@ isn't SyncTray's own.
 | `synctray profile create --from <file>` / `... create -` | Create a profile from a `.profile.json` file (or stdin `-`). Validates by decoding (a bad file exits `65` with the decode error — the feedback an agent needs); refuses a colliding `id`/`shortId` (`1`); writes the authoritative file, then installs the launchd agent iff `isEnabled && isValid` — the SAME persist-then-install rule as the file-watcher create path (`applyExternalCreateIfNeeded`). |
 | `synctray profile enable <name\|shortId>` | Set `isEnabled=true`, rewrite the file, install the agent. |
 | `synctray profile disable <name\|shortId>` | Set `isEnabled=false`, rewrite the file, uninstall the agent. |
-| `synctray profile set <name\|shortId> <key> <value> [<key> <value> …]` | Edit fields on an existing profile from a BOUNDED key set (mirrors `SyncProfile.CodingKeys` minus `id`/`isEnabled`/`fallbackRequiresCacheRebuild`; positional `key value` pairs, comma-separated lists), rewrite the authoritative `.profile.json`, then drive the launchd delta `SyncManager.reconcileAction` dictates (reinstall/remount as needed). Validates ALL assignments against a copy first — an unknown key or invalid value exits `65` and writes nothing. Use `enable`/`disable` for `isEnabled`; a `vfsCachePath` change re-points only (`cache move` for a warm relocation). |
-| `synctray profile delete <name\|shortId>` | Uninstall the agent (detaching a mounted volume first) and remove the `.profile.json`. |
+| `synctray profile set <name\|shortId> <key> <value> [<key> <value> …]` | Edit fields on an existing profile from a BOUNDED key set (mirrors `SyncProfile.CodingKeys` minus `id`/`isEnabled`/`fallbackRequiresCacheRebuild`; positional `key value` pairs), rewrite the authoritative `.profile.json`, then drive the launchd delta `SyncManager.reconcileAction` dictates (reinstall as needed). Validates ALL assignments against a copy first — an unknown key or invalid value exits `65` and writes nothing. Use `enable`/`disable` for `isEnabled`. |
+| `synctray profile delete <name\|shortId>` | Uninstall the agent and remove the `.profile.json`. |
 | `synctray install <name\|shortId>` | Install an already-enabled profile's launchd agent (idempotent; runs `SyncSetupService.install`). Complements `profile enable`, which early-returns without installing when the profile is ALREADY enabled — so `install` re-creates an agent that went missing. Refuses a disabled or incomplete profile. Never flips `isEnabled`. |
-| `synctray reinstall <name\|shortId>` | Regenerate script+plist and reinstall the agent (uninstall → install), i.e. the settings-save reinstall path; for a mounted Stream profile this detaches then remounts. Works for any sync mode. Refuses a disabled profile. |
+| `synctray reinstall <name\|shortId>` | Regenerate script+plist and reinstall the agent (uninstall → install), i.e. the settings-save reinstall path. Works for any sync mode. Refuses a disabled profile. |
 
 **Operate:**
 
 | Command | Purpose |
 |---------|---------|
-| `synctray sync <name\|shortId>` | Run one sync now and BLOCK until it finishes, returning the script's exit code — exactly what the app's `triggerManualSync` runs (`bash <sharedScript> <configPath>`), lock-file-guarded against a concurrent scheduled run. Refuses a Stream (mount) profile (use `mount`). |
-| `synctray mount <name\|shortId>` | Mount a Stream (mount-mode) profile now — `loadAgent` + `startAgent` (`launchctl kickstart -k`, the same pair the app's `mountProfile` uses) — then BLOCK polling `isMounted` up to ~60s. Returns `nil`/exit 0 on a confirmed mount (or if already mounted), else exits non-zero with the tail of the sync log so the real reason (auth, unreachable remote) is visible. Refuses a non-mount profile. |
-| `synctray unmount <name\|shortId>` | Unmount a mounted Stream profile — graceful+forced `diskutil unmount` then unload the agent so `rclone nfsmount` actually exits (`SyncSetupService.unmount`). Refuses a non-mount profile. |
-| `synctray cache move <name\|shortId> --to <path> [--include-overlapping]` | Relocate a Stream profile's rclone VFS cache (both the `vfs` content tree and the `vfsMeta` byte-range-list tree) to `<path>` and BLOCK until it finishes, returning non-zero on rejection or failure. Detaches/reinstalls around the move like the app does. Refuses a non-mount profile, and refuses an overlapping sibling profile (same on-disk bytes) unless `--include-overlapping` is passed — there's nobody to prompt non-interactively. See "Cache Directory Migration" above. |
+| `synctray sync <name\|shortId>` | Run one sync now and BLOCK until it finishes, returning the script's exit code — exactly what the app's `triggerManualSync` runs (`bash <sharedScript> <configPath>`), lock-file-guarded against a concurrent scheduled run. |
 
 `<name|shortId>` resolution tries an exact `shortId` match first, then a
 case-insensitive `name` match; an unmatched (or ambiguous) target exits
@@ -681,15 +417,8 @@ MenuBarView shows transport icon (wifi=primary, antenna=fallback)
 
 **Primary recovery (fallback → primary switch-back).** The reachability check above runs
 once per *script execution*. Sync/bisync profiles re-run on their `StartInterval`, so they
-naturally return to the primary on the next scheduled sync once it's reachable. A **mount**
-is a long-lived `rclone nfsmount` that picks its remote once at mount time (its launchd
-agent is `RunAtLoad`+`KeepAlive`, no `StartInterval`), so it would otherwise stay on the
-fallback until the next relaunch/login/manual remount. `SyncManager.startPrimaryRecoveryMonitor`
-closes that gap: a 2-minute timer probes the primary (`isRemoteReachable`, hard-timeout —
-SMB can hang past its own timeouts) for any mounted mount-mode profile currently on the
-fallback (`ActiveTransport.fallback`), and when the primary is reachable again it remounts
-on the primary (`remountOnPrimary` = unmount → mount, so the script re-picks the remote).
-The switch causes a brief mount hiccup; `recoveringToPrimary` guards against stacking remounts.
+naturally return to the primary on the next scheduled sync once it's reachable — no
+separate recovery monitor is needed.
 
 **Bisync cache preservation:** When primary and fallback remotes share the same
 rclone wire type (e.g., WebDAV LAN → WebDAV QuickConnect, both `type = webdav`)
@@ -705,23 +434,6 @@ the first switch (~12s for 85K files, no data re-download) but avoids cache
 poisoning from byte-level filename encoding differences (macOS SMB normalises to
 NFD; SFTP passes NFC verbatim — same human-readable name, different byte
 sequence).
-
-**Mount mode is the exception: it ALWAYS keeps the primary remote name (env-var
-overrides), even across wire types.** The VFS cache is keyed by
-`{vfsCachePath}/vfs/{remote-name}/{remote-path}/…`, so a full remote swap would
-land the fallback's cache in a second `vfs/{fallback}/` tree and re-download every
-file (observed: `vfs/synology` 640K vs `vfs/synology-sftp` 6.7G for one profile).
-The full-swap branch exists only to protect bisync's *listing* cache from NFD/NFC
-divergence, which a live mount has no equivalent of. So the script and
-`SyncManager.resolveActiveRemote` both guard the full-swap branch with
-`syncMode != mount`; a mount failover overrides only the connection params and
-keeps the primary `remote:path` reference. Because the cache subtree also keys on
-the remote **path**, the fallback must resolve the *same* path as the primary — so
-the profile editor blocks saving a Stream profile whose `fallbackRemotePath`
-differs from `remotePath` (`mountFallbackCacheConflict` in `ProfileDetailView`),
-and a genuinely different path is a config error to fix on the fallback remote, not
-a supported layout. `fallbackRemotePath` therefore stays meaningful only for
-bisync/sync profiles.
 
 The branching condition is determined at profile install/save time by comparing
 `provider.rcloneType` for the primary and fallback remotes (read via
@@ -926,7 +638,7 @@ open ~/Library/Developer/Xcode/DerivedData/SyncTray-*/Build/Products/Debug/SyncT
 | `SettingsView.swift` | Main settings UI with profile editing |
 | `ProfileStore.swift` | File-backed profile persistence — authoritative `{shortId}.profile.json` per profile, write-only blob mirror (see "File-Backed Configuration") |
 | `ConfigFileWatcher.swift` | Live-apply watcher for `~/.config/synctray` (profiles + settings); routes an unknown-id `.profile.json` to create-via-file |
-| `SyncTrayCLI.swift` | Headless `synctray` CLI: inspect (`doctor`/`status`/`profiles`/`profile show`/`logs`/`test-remote`/`listremotes`), configure (`profile create`/`set`/`enable`/`disable`/`delete`, `install`/`reinstall`), operate (`sync`/`mount`/`unmount`/`cache move`); dispatched from `SyncTrayApp.init` (see "Agent-Editable Configuration & CLI") |
+| `SyncTrayCLI.swift` | Headless `synctray` CLI: inspect (`doctor`/`status`/`profiles`/`profile show`/`logs`/`test-remote`/`listremotes`), configure (`profile create`/`set`/`enable`/`disable`/`delete`, `install`/`reinstall`), operate (`sync`); dispatched from `SyncTrayApp.init` (see "Agent-Editable Configuration & CLI") |
 | `CLIShimInstaller.swift` | Installs the `~/.local/bin/synctray` shim (`~/.local/bin` must be on `PATH`) |
 | `SyncLogPatterns` | Centralized log message pattern matching (includes `isOutOfSyncError`) |
 | `TelemetryService.swift` | OTel singleton — traces, metrics, logs via OTLP/HTTP |
@@ -973,5 +685,3 @@ Priority: process env vars > `~/.config/synctray/.env` > Info.plist. Key vars: `
 | `~/Library/LaunchAgents/com.synctray.sync.{shortId}.plist` | launchd schedule |
 | `~/.local/log/synctray-sync-{shortId}.log` | Sync logs |
 | `/tmp/synctray-sync-{shortId}.lock` | Lock file (prevents concurrent syncs) |
-| `{vfsCachePath}/vfs/{remote}/{path}/…` | Mount mode only — VFS cached file **data** |
-| `{vfsCachePath}/vfsMeta/{remote}/{path}/…` | Mount mode only — VFS metadata sidecars, including the `--vfs-cache-mode full` downloaded byte-range list. Load-bearing for Cache Directory Migration: moving `vfs` without `vfsMeta` makes rclone re-download everything. |

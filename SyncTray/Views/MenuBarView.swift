@@ -60,14 +60,6 @@ struct MenuBarView: View {
                             .font(.system(size: 12))
                             .lineLimit(1)
                             .foregroundColor(syncManager.isPaused(for: profile.id) ? .secondary : .primary)
-
-                        // Show mount status for mount mode profiles
-                        if profile.isMountMode {
-                            let mountState = syncManager.mountState(for: profile.id)
-                            Text(mountState.statusText)
-                                .font(.system(size: 9))
-                                .foregroundColor(.secondary)
-                        }
                     }
 
                     // Transport indicator (only for profiles with fallback configured)
@@ -83,8 +75,8 @@ struct MenuBarView: View {
 
                     Spacer()
 
-                    // Sync progress indicator (for sync modes)
-                    if !profile.isMountMode && syncManager.state(for: profile.id) == .syncing {
+                    // Sync progress indicator
+                    if syncManager.state(for: profile.id) == .syncing {
                         if let progress = syncManager.profileProgress[profile.id],
                            progress.totalBytes > 0 {
                             Text("\(Int(progress.percentage))%")
@@ -92,16 +84,6 @@ struct MenuBarView: View {
                                 .foregroundColor(.secondary)
                                 .monospacedDigit()
                         } else {
-                            ProgressView()
-                                .scaleEffect(0.5)
-                                .frame(width: 12, height: 12)
-                        }
-                    }
-
-                    // Mount status indicator (for mount mode)
-                    if profile.isMountMode {
-                        let mountState = syncManager.mountState(for: profile.id)
-                        if mountState == .mounting {
                             ProgressView()
                                 .scaleEffect(0.5)
                                 .frame(width: 12, height: 12)
@@ -128,10 +110,10 @@ struct MenuBarView: View {
                         .buttonStyle(.plain)
                         .help(syncManager.isNotificationsMuted(for: profile.id) ? "Unmute profile notifications" : "Mute profile notifications")
 
-                        // Open in Finder button — opens the local sync folder
-                        // (or the mount point, for Stream profiles). Hidden when no
-                        // path is configured; openSyncDirectory no-ops safely if the
-                        // folder is missing (e.g. external drive unmounted).
+                        // Open in Finder button — opens the local sync folder.
+                        // Hidden when no path is configured; openSyncDirectory
+                        // no-ops safely if the folder is missing (e.g. external
+                        // drive disconnected).
                         if !profile.localSyncPath.isEmpty {
                             Button(action: { syncManager.openSyncDirectory(for: profile) }) {
                                 Image(systemName: "folder")
@@ -142,54 +124,25 @@ struct MenuBarView: View {
                             .help("Open in Finder")
                         }
 
-                        // Mount/Unmount button for mount mode, Sync now for sync modes
-                        if profile.isMountMode {
-                            let mountState = syncManager.mountState(for: profile.id)
-                            Button(action: {
-                                if mountState == .mounted {
-                                    syncManager.unmountProfile(profile)
-                                } else if mountState == .unmounted || mountState == .failed("") {
-                                    syncManager.mountProfile(profile)
-                                }
-                            }) {
-                                Image(systemName: mountState == .mounted ? "eject" : "arrow.down.circle")
-                                    .font(.system(size: 10))
-                                    .foregroundColor(.secondary)
-                            }
-                            .buttonStyle(.plain)
-                            .help(mountState == .mounted ? "Unmount" : "Mount")
-                            .disabled(mountState == .mounting)
-                        } else {
-                            // Sync now button for sync modes
-                            Button(action: { syncManager.triggerManualSync(for: profile) }) {
-                                Image(systemName: "arrow.triangle.2.circlepath")
-                                    .font(.system(size: 10))
-                                    .foregroundColor(.secondary)
-                            }
-                            .buttonStyle(.plain)
-                            .help("Sync this profile now")
-                            .disabled(syncManager.isPaused(for: profile.id) || syncManager.state(for: profile.id) == .syncing)
-
-                            // Pause/resume sync button (only for sync modes)
-                            Button(action: { syncManager.togglePause(for: profile.id) }) {
-                                Image(systemName: syncManager.isPaused(for: profile.id) ? "play.fill" : "pause.fill")
-                                    .font(.system(size: 10))
-                                    .foregroundColor(.secondary)
-                            }
-                            .buttonStyle(.plain)
-                            .help(syncManager.isPaused(for: profile.id) ? "Resume syncing" : "Pause syncing")
+                        // Sync now button
+                        Button(action: { syncManager.triggerManualSync(for: profile) }) {
+                            Image(systemName: "arrow.triangle.2.circlepath")
+                                .font(.system(size: 10))
+                                .foregroundColor(.secondary)
                         }
-                    }
-                }
+                        .buttonStyle(.plain)
+                        .help("Sync this profile now")
+                        .disabled(syncManager.isPaused(for: profile.id) || syncManager.state(for: profile.id) == .syncing)
 
-                // Live streaming download progress — the same transfer bar + per-file list
-                // sync modes show, driven by the mount's RC /core/stats poll. Only appears
-                // while a mounted Stream profile is actively downloading; hidden when idle.
-                if profile.isMountMode,
-                   syncManager.mountState(for: profile.id) == .mounted,
-                   let progress = syncManager.profileProgress[profile.id],
-                   !progress.transferringFiles.isEmpty {
-                    SyncProgressDetailView(progress: progress)
+                        // Pause/resume sync button
+                        Button(action: { syncManager.togglePause(for: profile.id) }) {
+                            Image(systemName: syncManager.isPaused(for: profile.id) ? "play.fill" : "pause.fill")
+                                .font(.system(size: 10))
+                                .foregroundColor(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                        .help(syncManager.isPaused(for: profile.id) ? "Resume syncing" : "Pause syncing")
+                    }
                 }
             }
         }
@@ -217,13 +170,6 @@ struct MenuBarView: View {
     }
 
     private func statusColor(for profile: SyncProfile) -> Color {
-        // For mount mode, use mount state color
-        if profile.isMountMode {
-            let mountState = syncManager.mountState(for: profile.id)
-            return mountState.iconColor
-        }
-
-        // For sync modes, use sync state color
         switch syncManager.state(for: profile.id) {
         case .idle:
             return .green

@@ -991,15 +991,6 @@ final class TelemetryService {
                 "config.is_enabled": .bool(profile.isEnabled),
                 "config.is_muted": .bool(profile.isMuted),
                 "config.has_additional_flags": .bool(!profile.additionalRcloneFlags.isEmpty),
-                // Mount-specific preferences
-                "config.mount_backend": .string(profile.isMountMode ? profile.mountBackend.rawValue : "n/a"),
-                "config.mount_at_startup": .string(profile.isMountMode ? String(profile.mountAtStartup) : "n/a"),
-                "config.offline_access": .string(profile.isMountMode ? String(profile.offlineAccessEnabled) : "n/a"),
-                "config.vfs_cache_mode": .string(profile.isMountMode ? profile.vfsCacheMode.rawValue : "n/a"),
-                "config.has_pinned_directories": .bool(!profile.pinnedDirectories.isEmpty),
-                "config.pinned_directory_count": .int(profile.pinnedDirectories.count),
-                "config.allow_non_empty_mount": .bool(profile.allowNonEmptyMount),
-                "config.download_connections": .int(profile.isMountMode ? profile.downloadConnections : 0),
             ]
         )
     }

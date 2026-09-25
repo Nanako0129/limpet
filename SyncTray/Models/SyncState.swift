@@ -186,53 +186,6 @@ enum SyncState: Equatable {
     }
 }
 
-/// Mount state for mount mode profiles
-enum MountState: Equatable {
-    case unmounted
-    case mounting
-    case mounted
-    case failed(String)
-
-    var iconName: String {
-        switch self {
-        case .unmounted:
-            return "externaldrive.badge.icloud"
-        case .mounting:
-            return "externaldrive.badge.icloud"
-        case .mounted:
-            return "externaldrive.fill.badge.checkmark"
-        case .failed:
-            return "externaldrive.badge.xmark"
-        }
-    }
-
-    var iconColor: Color {
-        switch self {
-        case .unmounted:
-            return .secondary
-        case .mounting:
-            return .blue
-        case .mounted:
-            return .green
-        case .failed:
-            return .red
-        }
-    }
-
-    var statusText: String {
-        switch self {
-        case .unmounted:
-            return "Not mounted"
-        case .mounting:
-            return "Mounting..."
-        case .mounted:
-            return "Mounted"
-        case .failed(let message):
-            return "Mount failed: \(message)"
-        }
-    }
-}
-
 /// Which transport is currently active for a profile's sync
 enum ActiveTransport: Equatable {
     case primary
@@ -410,10 +363,7 @@ enum SyncLogPatterns {
         message.contains("check file") ||
         message.contains("Access test failed") ||
         message.contains("Failed to initialise") ||
-        message.contains("malformed rule") ||
-        message.contains("not empty") ||
-        message.contains("FUSE") ||
-        message.contains("failed to mount")
+        message.contains("malformed rule")
     }
 
     // MARK: - Error Message Cleanup
@@ -426,30 +376,12 @@ enum SyncLogPatterns {
         let prefixes = [
             "Bisync critical error: ",
             "Bisync aborted. ",
-            "Fatal error: failed to mount FUSE fs: "
         ]
 
         for prefix in prefixes {
             if let range = cleaned.range(of: prefix) {
                 cleaned = String(cleaned[range.upperBound...])
                 break
-            }
-        }
-
-        // Provide user-friendly mount error messages
-        if cleaned.contains("is not empty") {
-            return "Mount point folder is not empty. Choose an empty folder or clear its contents first."
-        }
-        if cleaned.contains("not supported on MacOS when rclone is installed via Homebrew") {
-            return "The macFUSE backend requires the official rclone binary from rclone.org "
-                + "(Homebrew's rclone can't mount). Switch this profile's Mount Backend to "
-                + "NFS to stream without macFUSE."
-        }
-        if cleaned.contains("macfuse") || cleaned.contains("FUSE") || cleaned.contains("fuse") {
-            if cleaned.contains("not found") || cleaned.contains("not installed") {
-                return "macFUSE is required for the macFUSE backend. Install via "
-                    + "`brew install --cask macfuse`, or switch this profile's Mount Backend "
-                    + "to NFS to stream without it."
             }
         }
 
