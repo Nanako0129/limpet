@@ -1,5 +1,5 @@
 {
-  "$id": "https://raw.githubusercontent.com/mthines/sync-tray/main/limpet/Resources/Schemas/profile.schema.json",
+  "$id": "https://raw.githubusercontent.com/Nanako0129/limpet/main/limpet/Resources/Schemas/profile.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "limpet profile file",
   "description": "Authoritative per-profile file (~/.config/limpet/profiles/{shortId}.profile.json). Hand-editing this file and saving live-applies through limpet's reconcile path. Dropping a NEW file with an unknown, well-formed `id` CREATES that profile (persisted always; the launchd agent installs only when the new profile is `isEnabled` and has all required fields filled in) — creation-via-file is supported, not just editing an existing profile. Keep this file's `properties` in lockstep with SyncProfile.CodingKeys (limpet/Models/SyncProfile.swift) — verified by scripts/check-schema-in-sync.sh.",

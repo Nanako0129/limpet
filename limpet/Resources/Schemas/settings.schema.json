@@ -1,5 +1,5 @@
 {
-  "$id": "https://raw.githubusercontent.com/mthines/sync-tray/main/limpet/Resources/Schemas/settings.schema.json",
+  "$id": "https://raw.githubusercontent.com/Nanako0129/limpet/main/limpet/Resources/Schemas/settings.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "limpet global settings file",
   "description": "Global app settings (~/.config/limpet/settings.json). Mirrors ONLY the safe, enumerated subset of LimpetSettings — see AppSettingsFileStore.SafeKey.",

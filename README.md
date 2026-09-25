@@ -2,7 +2,7 @@
 
 limpet is a macOS menu bar app that mirrors a local folder to a remote
 target, one-way (local → remote), using [rclone](https://rclone.org/) as
-the sync engine. It runs a copy of every provider rclone supports.
+the sync engine. Any remote rclone supports can be the destination.
 
 ## What it does today
 
@@ -30,7 +30,7 @@ the sync engine. It runs a copy of every provider rclone supports.
 > launchd agent falls back to interval polling once the app is closed. A
 > planned change moves ownership of scheduling and watching into the
 > per-profile launchd agent itself, so real-time sync keeps working with
-> the app closed — see the project plan for the design.
+> the app closed.
 
 ## Requirements
 
@@ -43,22 +43,17 @@ common nix install locations.
 
 ## Building from source
 
-There is no signed or notarized release and no Homebrew cask — build it
-yourself:
+There is no signed release and no Homebrew cask yet, so build it yourself:
 
 ```bash
 git clone https://github.com/Nanako0129/limpet.git
 cd limpet
 xcodebuild -project limpet.xcodeproj -scheme limpet \
-  -configuration Debug CODE_SIGNING_ALLOWED=NO build
+  -configuration Debug CODE_SIGNING_ALLOWED=NO -derivedDataPath build build
+open build/Build/Products/Debug/limpet.app
 ```
 
-The built app is unsigned. On first launch you'll need to clear the
-quarantine attribute:
-
-```bash
-xattr -cr /Applications/limpet.app
-```
+The built app is unsigned.
 
 ## The `limpet` CLI
 
@@ -98,11 +93,9 @@ config the GUI reads and writes.
 
 ## What limpet deliberately doesn't do
 
-This is a personal, reduced fork of a larger upstream project. It has no
-two-way (bisync) sync, no fallback remote, no telemetry, no
-versioning/auto-update, no notarized release, no Homebrew cask, no VFS
-mount ("Stream") mode, and no Finder extension. See LICENSE for
-attribution to the project it was forked from.
+limpet mirrors in one direction and nothing else. There is no two-way
+sync, no version history or restore, no fallback remote, no mount mode,
+no Finder extension, no auto-update, and no telemetry.
 
 ## Development
 

@@ -12,7 +12,6 @@
     "install:full": "pnpm dlx nx run limpet:install:full",
     "install:full:launch": "pnpm dlx nx run limpet:install:full:launch",
     "dev": "pnpm dlx nx run limpet:dev",
-    "release": "pnpm dlx nx run limpet:release",
     "reset": "nx reset"
   },
   "devDependencies": {

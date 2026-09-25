@@ -1,7 +1,7 @@
 // limpet signing configuration (tracked — contains NO personal data).
 //
 // CI and the release build produce UNSIGNED apps (CODE_SIGNING_ALLOWED=NO is passed
-// on the xcodebuild command line by .github/workflows/ci.yml and scripts/release-ci.sh),
+// on the xcodebuild command line by .github/workflows/ci.yml),
 // so no Team is needed there.
 //
 // Your Apple Developer Team ID (needed for a locally SIGNED build) is read from an

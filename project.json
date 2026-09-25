@@ -10,7 +10,10 @@
         "command": "xcodebuild -scheme limpet -configuration Debug -derivedDataPath build DASH0_AUTH_TOKEN=\"${DASH0_AUTH_TOKEN:-}\" build 2>&1 | grep -E '(error:|warning:.*error|BUILD)' || true",
         "cwd": "{projectRoot}"
       },
-      "inputs": ["swift-sources", "project-config"],
+      "inputs": [
+        "swift-sources",
+        "project-config"
+      ],
       "outputs": [],
       "cache": true
     },
@@ -20,7 +23,10 @@
         "command": "xcodebuild -scheme limpet -configuration Release -derivedDataPath build clean build ONLY_ACTIVE_ARCH=NO DASH0_AUTH_TOKEN=\"${DASH0_AUTH_TOKEN:-}\" 2>&1 | tail -5",
         "cwd": "{projectRoot}"
       },
-      "inputs": ["swift-sources", "project-config"],
+      "inputs": [
+        "swift-sources",
+        "project-config"
+      ],
       "outputs": [],
       "cache": true
     },
@@ -65,7 +71,9 @@
         "cwd": "{projectRoot}",
         "parallel": false
       },
-      "dependsOn": ["build"],
+      "dependsOn": [
+        "build"
+      ],
       "cache": false
     },
     "install:launch": {
@@ -74,7 +82,9 @@
         "command": "open /Applications/limpet.app",
         "cwd": "{projectRoot}"
       },
-      "dependsOn": ["install"],
+      "dependsOn": [
+        "install"
+      ],
       "cache": false
     },
     "install:full": {
@@ -83,7 +93,11 @@
         "command": "sh ./scripts/install.sh",
         "cwd": "{projectRoot}"
       },
-      "inputs": ["swift-sources", "project-config", "scripts"],
+      "inputs": [
+        "swift-sources",
+        "project-config",
+        "scripts"
+      ],
       "outputs": [],
       "cache": true
     },
@@ -93,7 +107,9 @@
         "command": "sh ./scripts/install.sh --launch",
         "cwd": "{projectRoot}"
       },
-      "dependsOn": ["install:full"],
+      "dependsOn": [
+        "install:full"
+      ],
       "cache": false
     },
     "dev": {
@@ -102,23 +118,6 @@
         "command": "sh ./scripts/dev.sh",
         "cwd": "{projectRoot}"
       },
-      "cache": false
-    },
-    "release": {
-      "executor": "nx:run-commands",
-      "options": {
-        "command": "sh ./scripts/release.sh",
-        "cwd": "{projectRoot}"
-      },
-      "cache": false
-    },
-    "setup-tap": {
-      "executor": "nx:run-commands",
-      "options": {
-        "command": "sh ./scripts/setup-tap.sh",
-        "cwd": "{projectRoot}"
-      },
-      "inputs": ["cask"],
       "cache": false
     },
     "reset": {
