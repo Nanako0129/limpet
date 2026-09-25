@@ -95,7 +95,7 @@ running app applies the change live, without a restart.
 | Path | Contents | Notes |
 |------|----------|-------|
 | `profiles/{shortId}.profile.json` | Full `SyncProfile`, including `isEnabled`, `isMuted` | NEW authoritative file. Written by `ProfileStore.save()` (encodes the whole model, so any new `SyncProfile` field flows in automatically); read by `ProfileStore.load()` (file-authoritative). References `../schema/profile.schema.json` via `$schema`. |
-| `profiles/{shortId}.json` | Derived, script-only subset (frozen key set) | Unchanged, byte-for-byte — this is `SyncSetupService.generateProfileConfig`'s output, consumed only by the sync shell script. The app never reads it back. |
+| `profiles/{shortId}.json` | Derived, script-only subset | `SyncSetupService.generateProfileConfig`'s output, rewritten on every install and consumed by the sync shell script. Its key set changes only with the script: L4 added `maxDelete`, which is computed at install time from the remote's rclone.conf section. The app does not read it back; only `limpet doctor` reads it, to warn when `maxDelete` is stale. |
 | `settings.json` | Enumerated safe subset of `LimpetSettings` (`debugLoggingEnabled`, `launchAtLogin`) | Written by `AppSettingsFileStore`. |
 | `schema/profile.schema.json`, `schema/settings.schema.json` | Committed JSON Schemas | Copied out of the app bundle by `ConfigSchemaInstaller` at every launch. Kept in lockstep with `SyncProfile.CodingKeys` by the fail-closed `scripts/check-schema-in-sync.sh`, run locally and in CI. |
 
@@ -114,9 +114,12 @@ and why both paths share one decision function.
 `id` is UNKNOWN to `ProfileStore` creates that profile — this is no longer
 silently ignored. `applyExternalProfileEdit` routes an unknown-but-decodable id
 to `SyncManager.applyExternalCreateIfNeeded` (`ConfigReconciler.swift`): the
-profile is always persisted; the launchd agent is installed only when it's
-`isEnabled && isValid`, so an agent can stage a profile and flip it on in a
-second edit. A dropped file whose basename isn't the canonical
+profile is persisted unless it is refused (see **Refused values** below), and
+the launchd agent is installed only when it's `isEnabled && isValid`, so an
+agent can stage a profile and flip it on in a second edit. A drop refused for
+overlap is moved to `profiles/refused/<stem>.<UTC timestamp>.json`, where no
+`*.profile.json` scanner and no file watcher sees it; a drop that fails to
+decode (including an F4-refused value) stays where it is and is ignored. A dropped file whose basename isn't the canonical
 `{shortId}.profile.json` is rewritten to the canonical name and the original
 pruned (the canonical write notes its own hash in `ConfigSelfWriteRegistry`, so
 this can never loop). See `ConfigSelfTest`'s AC-C1–AC-C4 for the exact
@@ -151,12 +154,22 @@ with `:` (an on-the-fly backend) or contains `,` or `=` (a connection string)
 can carry a credential in plain text, so it is refused by the decoder, by every
 profile write (`ProfileStore.writeProfileFile`/`add`/`update`), by
 `SyncSetupService.install` and by the watcher before every run — a dropped
-file carrying one simply does not load. Two profiles whose remote paths on the
-same remote are equal or nested (`SyncProfile.overlapError`) are refused at
-`profile create`/`profile set` (exit 65), file-drop create
-(`applyExternalCreateIfNeeded` → `.refusedOverlap`), `install`, and by the
-watcher, which re-reads every profile file before each run and logs
-`Refusing to sync: …` into the profile log instead of running.
+file carrying one simply does not load. `transfers` outside 1–64 is refused
+the same way (and `profile set` refuses a leading zero). Two profiles whose
+remote paths on the same remote are equal or nested (`SyncProfile.overlapError`)
+may not both sync: a profile that is enabled (or being installed, or running)
+is compared only with profiles that are enabled AND have an installed agent,
+so a disabled profile never blocks, and the installed one wins over one that
+was never installed. The overlap is refused at `profile create`/`profile
+set`/`profile enable` (exit 65, nothing written), at file-drop create
+(`applyExternalCreateIfNeeded` → `.refusedOverlap`, file moved aside), by
+`install`, and by the watcher, which re-reads every profile file before each
+run and logs `Refusing to sync: …` into the profile log instead of running.
+The app's edit paths (Save, the wizard, enable/disable, an external edit)
+check F4 and the overlap BEFORE persisting (`SyncManager.profileChangeRefusal`
+/ `applyProfileChange`) and show refusals and install errors in the UI
+(`profileErrors`, the detail view's and wizard's error text) instead of only
+printing them.
 
 **Delete limit (limpet-plan.md L4 F6).** For remotes that keep no deleted
 versions — s3 `provider = Mega` (MEGA S4) and `Cloudflare` (R2) always, any
@@ -171,7 +184,20 @@ including after a respawn, login or reinstall — while staying alive and idle.
 `limpet profile clear-delete-limit <name|shortId>` or the menu's red octagon
 button removes the marker and sends the watcher SIGUSR1. B2 is not limited
 (it hides instead of deleting); `limpet doctor` warns when a B2 bucket has no
-`daysFromHidingToDeleting` lifecycle rule.
+`daysFromHidingToDeleting` lifecycle rule. `maxDelete` is decided when the
+profile is INSTALLED; after changing a remote's provider (or the profile's
+`remoteVersioning`) in rclone.conf directly, run `limpet reinstall
+<name|shortId>`. `limpet doctor` warns when the installed value differs from
+what the current rclone.conf section gives.
+
+**No unprompted keychain dialogs.** Before any `security` call,
+`KeychainSecretStore` asks a lock-status provider (production:
+`SecKeychainGetStatus`, unverified that it can never prompt). While the login
+keychain is locked nothing reads it: the watcher logs `Keychain locked — open
+limpet and click "Allow keychain access"`, starts no rclone and waits for its
+next trigger; the menu shows "Allow keychain access", the only action that
+may raise the system unlock dialog, which then sends the waiting watchers
+SIGUSR1.
 
 **Self-write suppression.** `ConfigSelfWriteRegistry` tracks the content hash
 of every file limpet itself writes; `ConfigFileWatcher.shouldReconcile`
@@ -230,8 +256,10 @@ creation behavior. Only FIVE keys are required — `id`, `name`, `rcloneRemote`,
 let every other field take its default (the decoder fills `syncDirection=localToRemote`,
 `syncIntervalMinutes=5`, `isEnabled=false`, …, all mirrored
 from the memberwise-init defaults; an app-written file that emits every key
-still round-trips unchanged). A profile is created whenever the file decodes
-successfully and `id` is a well-formed UUID; the launchd agent installs (i.e.
+still round-trips unchanged). A profile is created when the file decodes
+(which already refuses the F4 values and a `transfers` outside 1–64), `id` is
+a well-formed UUID, and it does not overlap an enabled, installed profile
+(then the file is moved to `profiles/refused/`); the launchd agent installs (i.e.
 the sync actually starts running) only when the profile is also `isEnabled`
 and `isValid` (non-empty `name`/`rcloneRemote`/`remotePath`/`localSyncPath`) —
 so an agent can stage a profile disabled, then flip `isEnabled` in a follow-up
@@ -252,7 +280,7 @@ isn't limpet's own.
 
 | Command | Purpose |
 |---------|---------|
-| `limpet doctor` | Health report: rclone found + version, config schemas installed, per-profile derived-config presence, launchd agent loaded (enabled profiles), stale lock files, remote reachability. Exits non-zero iff any check is `[fail]`; `[warn]` never fails the run. |
+| `limpet doctor` | Health report: rclone found + version, config schemas installed, per-profile derived-config presence, a stale installed `maxDelete` (warn), launchd agent loaded (enabled profiles), stale lock files, remote reachability (a keychain-backed remote reads its secret without ever prompting), B2 bucket without a `daysFromHidingToDeleting` rule (warn). Exits non-zero iff any check is `[fail]`; `[warn]` never fails the run. |
 | `limpet status [name\|shortId]` | One tab-separated line per profile (or a single one): `enabled=`, `agent=loaded\|unloaded\|n/a`, `running=` (lock present), `last=started\|completed\|failed\|none` (from the log tail via the shared `SyncLogPatterns`). |
 | `limpet profiles` | List every profile: name, shortId, mode, `enabled=`, `remote=` — no secrets. (`profile list` is an alias.) |
 | `limpet profile show <name\|shortId>` | Print one profile's FULL config as pretty, sorted-key JSON — the same shape as its `.profile.json`, so an agent can `show` → edit → `profile create`/`profile set` round-trip. No secrets (credentials live in `rclone.conf` or the login keychain). |
@@ -264,7 +292,7 @@ isn't limpet's own.
 
 | Command | Purpose |
 |---------|---------|
-| `limpet profile create --from <file>` / `... create -` | Create a profile from a `.profile.json` file (or stdin `-`). Validates by decoding (a bad file exits `65` with the decode error — the feedback an agent needs); refuses a colliding `id`/`shortId` (`1`); writes the authoritative file, then installs the launchd agent iff `isEnabled && isValid` — the SAME persist-then-install rule as the file-watcher create path (`applyExternalCreateIfNeeded`). |
+| `limpet profile create --from <file>` / `... create -` | Create a profile from a `.profile.json` file (or stdin `-`). Validates by decoding (a bad file — including an F4-refused remote or `transfers` outside 1–64 — exits `65` with the decode error, the feedback an agent needs); refuses a colliding `id`/`shortId` (`1`) and an overlap with an enabled, installed profile (`65`); writes the authoritative file, then installs the launchd agent iff `isEnabled && isValid` — the SAME persist-then-install rule as the file-watcher create path (`applyExternalCreateIfNeeded`). |
 | `limpet profile enable <name\|shortId>` | Set `isEnabled=true`, rewrite the file, install the agent. |
 | `limpet profile disable <name\|shortId>` | Set `isEnabled=false`, rewrite the file, uninstall the agent. |
 | `limpet profile set <name\|shortId> <key> <value> [<key> <value> …]` | Edit fields on an existing profile from a BOUNDED key set (mirrors `SyncProfile.CodingKeys` minus `id`/`isEnabled`; positional `key value` pairs), rewrite the authoritative `.profile.json`, then drive the launchd delta `SyncManager.reconcileAction` dictates (reinstall as needed). Validates ALL assignments against a copy first — an unknown key or invalid value exits `65` and writes nothing. Use `enable`/`disable` for `isEnabled`. |

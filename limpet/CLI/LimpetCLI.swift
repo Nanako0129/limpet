@@ -476,6 +476,21 @@ enum LimpetCLI {
                 : DoctorCheck(name: label, status: .fail, detail: "derived config missing")
         )
 
+        // maxDelete is decided at install time from the remote's rclone.conf
+        // section; a provider changed there since is not picked up until a
+        // reinstall. Warn (never fail) when they disagree.
+        let remoteName = String(profile.rcloneRemote.prefix { $0 != ":" })
+        if env.fileExists(profile.configPath), let derived = env.readFile(profile.configPath),
+           let config = (try? JSONSerialization.jsonObject(with: Data(derived.utf8))) as? [String: Any] {
+            let installed = config["maxDelete"] as? Int ?? 0
+            let current = SyncSetupService.maxDeleteArgument(for: profile, remoteSection: env.remoteSection(remoteName))
+            if installed != current {
+                checks.append(DoctorCheck(name: label, status: .warn,
+                    detail: "installed with maxDelete \(installed), but the remote's current rclone.conf section "
+                        + "gives \(current); run 'limpet reinstall \(profile.shortId)'"))
+            }
+        }
+
         if profile.isEnabled {
             let (_, launchctlOut) = env.runLaunchctl(["print", "gui/\(getuid())/\(profile.launchdLabel)"])
             checks.append(
@@ -503,7 +518,6 @@ enum LimpetCLI {
         // 1.75.1's own `rclone backend help b2` example (`[]` when there are no
         // rules, else objects with "daysFromHidingToDeleting": N); it was not
         // measured against a live bucket here.
-        let remoteName = String(profile.rcloneRemote.prefix { $0 != ":" })
         if env.remoteSection(remoteName)?["type"] == "b2" {
             let bucket = profile.remotePath.split(separator: "/").first.map(String.init) ?? ""
             let (code, rules, _) = env.runRclone(
@@ -796,7 +810,7 @@ enum LimpetCLI {
             return 1
         }
 
-        // Persist-always, install-iff-ready — the SAME rule the file-watcher
+        // Persist unless refused (above), install-iff-ready — the SAME rule the file-watcher
         // create path applies (`SyncManager.applyExternalCreateIfNeeded`).
         guard profile.isEnabled, profile.isValid else {
             env.stdout("created \(profile.name) (\(profile.shortId)) — not installed (disabled or incomplete)\n")

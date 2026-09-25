@@ -13,7 +13,7 @@ final class RcloneConfigService: Sendable {  // every stored property is an immu
     let keychain: KeychainSecretStore
 
     /// Everything is injectable so `ConfigSelfTest` works on a scratch
-    /// rclone.conf, a stub rclone and a stub/throwaway keychain — never the
+    /// rclone.conf, a stub rclone and a fake `security` — never the
     /// user's real ones.
     init(
         configPath: String = "\(NSHomeDirectory())/.config/rclone/rclone.conf",

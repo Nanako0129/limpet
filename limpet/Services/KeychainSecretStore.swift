@@ -14,16 +14,18 @@ import Security
 ///
 /// The add command reaches `security` on stdin via `security -i`, with the
 /// secret hex-encoded (`-X`), so the secret never appears in any argv.
-/// Measured 2026-09-26 against a throwaway keychain made with
-/// `security create-keychain` under the scratchpad (never the login keychain):
-/// `security -i` accepted that line on stdin and exited 0; `find-generic-password
-/// -w` read back a secret containing a space, `"`, `'` and `$` unchanged; a
+/// Measured once, 2026-09-26, against a throwaway keychain made with
+/// `security create-keychain` under the scratchpad (never the login keychain),
+/// before all keychain work on the development machine stopped: `security -i`
+/// accepted that line on stdin and exited 0; `find-generic-password -w` read
+/// back a secret containing a space, `"`, `'` and `$` unchanged; a
 /// double-quoted keychain path containing a space worked; `dump-keychain -a`
 /// listed `/usr/bin/security` as the ONLY application of the decrypt entry; a
 /// duplicate add exited 45; find and delete of a missing item exited 44.
+/// These are not re-checked by any test; the verifier checks them live.
 ///
-/// Injectable (`securityPath`, `keychainPath`, `timeout`) so `ConfigSelfTest`
-/// runs against a stub binary or a throwaway keychain, never the login one.
+/// Injectable (`securityPath`, `keychainPath`, `timeout`, `lockStatus`) so
+/// `ConfigSelfTest` runs only against a fake `security`, never a real keychain.
 struct KeychainSecretStore {
     static let service = "limpet"
     /// The only application trusted to read an item without a prompt.

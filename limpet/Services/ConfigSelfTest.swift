@@ -101,6 +101,7 @@ enum ConfigSelfTest {
             testProfileChangeRefusedBeforePersist,
             testKeychainRemoteEditDeleteConsistency,
             testKeychainLockedNoRead,
+            testDoctorWarnsStaleMaxDelete,
         ]
 
         for check in checks {
@@ -3363,6 +3364,32 @@ enum ConfigSelfTest {
             profile: profile, service: service, log: { _ in }, spawn: { childEnvironment = $0; return 0 })
         guard childEnvironment["RCLONE_CONFIG_KS3_SECRET_ACCESS_KEY"] == "SEKRET-locked-2b7" else {
             return report(id, slug, false, "(unlocked: the secret was not read)")
+        }
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L4-22 — doctor warns when the installed maxDelete is stale (review 2b, deferred)
+
+    private static func testDoctorWarnsStaleMaxDelete() -> Bool {
+        let id = "AC-L4-22", slug = "doctor-warns-stale-max-delete"
+        var profile = sampleProfile(isEnabled: false)
+        profile.rcloneRemote = "s4:"
+        func warnings(derivedMaxDelete: Int, provider: String) -> [DoctorCheck] {
+            let env = fakeCLIEnvironment(
+                runRclone: { args, _, _ in args.first == "version" ? (0, "rclone v1.75.1", "") : (0, "", "") },
+                readProfiles: { [profile] },
+                fileExists: { $0 == profile.configPath },
+                remoteSection: { $0 == "s4" ? ["type": "s3", "provider": provider] : nil },
+                readFile: { $0 == profile.configPath ? "{\"maxDelete\": \(derivedMaxDelete)}" : nil })
+            return LimpetCLI.doctorChecks(env: env).filter { $0.detail.contains("limpet reinstall") }
+        }
+        // Installed as Mega (100), now still Mega → quiet; changed to AWS with versioning
+        // → the current section gives 0 → warn; installed 0 while it is now Mega → warn.
+        profile.remoteVersioning = true
+        guard warnings(derivedMaxDelete: 100, provider: "Mega").isEmpty,
+              warnings(derivedMaxDelete: 100, provider: "AWS").first?.status == .warn,
+              warnings(derivedMaxDelete: 0, provider: "Mega").first?.status == .warn else {
+            return report(id, slug, false, "(stale maxDelete warning wrong)")
         }
         return report(id, slug, true)
     }
