@@ -96,6 +96,8 @@ enum ConfigSelfTest {
             testCLIClearDeleteLimit,
             testDoctorWarnsB2WithoutLifecycle,
             testTransfersRange,
+            testRefusedDropQuarantined,
+            testOverlapOnlyAmongEnabledInstalled,
         ]
 
         for check in checks {
@@ -588,8 +590,10 @@ enum ConfigSelfTest {
             decoded: profile,
             isKnownId: false,
             existing: [],
+            isInstalled: { _ in true },
             persist: { _ in persistCalls += 1 },
-            install: { _ in installCalls += 1 }
+            install: { _ in installCalls += 1 },
+            quarantine: { _ in }
         )
 
         guard outcome == .createdAndInstalled else {
@@ -611,8 +615,10 @@ enum ConfigSelfTest {
             let outcome = SyncManager.applyExternalCreateIfNeeded(
                 decoded: profile, isKnownId: false,
                 existing: [],
+                isInstalled: { _ in true },
                 persist: { _ in persistCalls += 1 },
-                install: { _ in installCalls += 1 }
+                install: { _ in installCalls += 1 },
+                quarantine: { _ in }
             )
             return (outcome, persistCalls, installCalls)
         }
@@ -645,8 +651,10 @@ enum ConfigSelfTest {
         let outcome = SyncManager.applyExternalCreateIfNeeded(
             decoded: nil, isKnownId: false,
             existing: [],
+            isInstalled: { _ in true },
             persist: { _ in persistCalls += 1 },
-            install: { _ in installCalls += 1 }
+            install: { _ in installCalls += 1 },
+            quarantine: { _ in }
         )
         guard outcome == .ignored, persistCalls == 0, installCalls == 0 else {
             return report(
@@ -690,6 +698,7 @@ enum ConfigSelfTest {
             decoded: profile,
             isKnownId: false,
             existing: [],
+            isInstalled: { _ in true },
             persist: { p in
                 let store = ProfileStore(
                     profilesDirectory: dir,
@@ -702,7 +711,8 @@ enum ConfigSelfTest {
                     try? FileManager.default.removeItem(atPath: sourcePath)
                 }
             },
-            install: { _ in }
+            install: { _ in },
+            quarantine: { _ in }
         )
         guard outcome == .createdOnly else {
             return report("AC-C4", "external-create-canonical-no-loop", false, "(expected .createdOnly, got \(outcome))")
@@ -2255,7 +2265,7 @@ enum ConfigSelfTest {
             do {
                 try SyncSetupService.shared.install(
                     profile: profile, loadAgent: false,
-                    executablePath: translocatedExecutable, otherProfiles: others)
+                    executablePath: translocatedExecutable, otherProfiles: others, isInstalled: { _ in true })
                 return nil
             } catch { return error }
         }
@@ -2305,7 +2315,7 @@ enum ConfigSelfTest {
             var other = sampleProfile(name: "Other")
             other.rcloneRemote = remote
             other.remotePath = path
-            return SyncProfile.overlapError(other, among: [first]) != nil
+            return SyncProfile.overlapError(other, among: [first], isInstalled: { _ in true }) != nil
         }
         let expectOverlap = [("selftest-fixture-remote:", "SelfTest"), ("selftest-fixture-remote", "SelfTest/"),
                              ("SELFTEST-fixture-remote:", "SelfTest//a"), ("selftest-fixture-remote:", "")]
@@ -2316,7 +2326,7 @@ enum ConfigSelfTest {
         where overlaps(remote: remote, path: path) {
             return report(id, slug, false, "(\(remote)\(path) was wrongly seen as overlapping)")
         }
-        guard SyncProfile.overlapError(first, among: [first]) == nil else {
+        guard SyncProfile.overlapError(first, among: [first], isInstalled: { _ in true }) == nil else {
             return report(id, slug, false, "(a profile overlapped with itself)")
         }
 
@@ -2329,6 +2339,7 @@ enum ConfigSelfTest {
         }
         let createEnv = fakeCLIEnvironment(
             readProfiles: { [first] },
+            fileExists: { $0 == first.plistPath },
             writeProfile: { _ in wrote = true; return true },
             installProfile: { _ in installed = true; return nil },
             readStdin: { String(decoding: nestedJSON, as: UTF8.self) }
@@ -2342,6 +2353,7 @@ enum ConfigSelfTest {
         disjoint.remotePath = "Elsewhere"
         let setEnv = fakeCLIEnvironment(
             readProfiles: { [first, disjoint] },
+            fileExists: { $0 == first.plistPath },
             writeProfile: { _ in wrote = true; return true },
             installProfile: { _ in installed = true; return nil },
             uninstallProfile: { _ in installed = true; return nil }
@@ -2352,11 +2364,12 @@ enum ConfigSelfTest {
         }
 
         // File drop.
-        var persisted = 0, dropInstalled = 0
+        var persisted = 0, dropInstalled = 0, quarantined = 0
         let outcome = SyncManager.applyExternalCreateIfNeeded(
-            decoded: nested, isKnownId: false, existing: [first],
-            persist: { _ in persisted += 1 }, install: { _ in dropInstalled += 1 })
-        guard outcome == .refusedOverlap, persisted == 0, dropInstalled == 0 else {
+            decoded: nested, isKnownId: false, existing: [first], isInstalled: { _ in true },
+            persist: { _ in persisted += 1 }, install: { _ in dropInstalled += 1 },
+            quarantine: { _ in quarantined += 1 })
+        guard outcome == .refusedOverlap, persisted == 0, dropInstalled == 0, quarantined == 1 else {
             return report(id, slug, false, "(file drop: \(outcome), persist=\(persisted) install=\(dropInstalled))")
         }
         return report(id, slug, true)
@@ -3006,6 +3019,112 @@ enum ConfigSelfTest {
         return report(id, slug, true)
     }
 
+    // MARK: - AC-L4-17 — a refused dropped file is moved out of the scanned set
+
+    /// Review finding 3: a dropped profile refused for overlap used to stay in
+    /// profiles/, where the running profile's watcher (which re-reads every
+    /// file) and the next app launch saw it again.
+    private static func testRefusedDropQuarantined() -> Bool {
+        let id = "AC-L4-17", slug = "refused-drop-quarantined"
+        let dir = "\(selfTestRoot)/ac-l4-17/profiles"
+        try? FileManager.default.removeItem(atPath: "\(selfTestRoot)/ac-l4-17")
+        let a = sampleProfile(name: "A")
+        var b = sampleProfile(name: "B")
+        b.remotePath = a.remotePath + "/inside"
+        let dropPath = "\(dir)/b-drop.profile.json"
+        guard ProfileStore.writeProfileFile(a, in: dir) != nil,
+              let bData = try? JSONEncoder().encode(b), (try? bData.write(to: URL(fileURLWithPath: dropPath))) != nil else {
+            return report(id, slug, false, "(fixture setup failed)")
+        }
+        let aInstalled: (SyncProfile) -> Bool = { $0.id == a.id }
+        var movedTo: String?
+        let outcome = SyncManager.applyExternalCreateIfNeeded(
+            decoded: b, isKnownId: false, existing: [a], isInstalled: aInstalled,
+            persist: { _ in }, install: { _ in },
+            quarantine: { _ in movedTo = SyncManager.quarantineRefusedDrop(at: dropPath) })
+        guard outcome == .refusedOverlap, let movedTo,
+              FileManager.default.fileExists(atPath: movedTo), !FileManager.default.fileExists(atPath: dropPath),
+              movedTo.hasPrefix("\(dir)/refused/b-drop."), !movedTo.hasSuffix(".profile.json") else {
+            return report(id, slug, false, "(dropped file not moved aside: \(String(describing: movedTo)))")
+        }
+        guard ProfileStore.profilesOnDisk(in: dir).map(\.id) == [a.id] else {
+            return report(id, slug, false, "(the refused profile is still loaded from profiles/)")
+        }
+        // A's watcher still runs.
+        var runs = 0
+        let clock = VirtualClock()
+        let scheduler = SyncWatchScheduler(runner: SchedulerRunner(
+            sourceExists: { true },
+            runChild: { completion in runs += 1; completion(0) },
+            now: { clock.now },
+            scheduleAfter: { s, act in clock.scheduleAfter(s, act) },
+            logSourceMissing: {},
+            refusalReason: { SyncWatchDaemon.refusalReason(for: a, profilesDirectory: dir, isInstalled: aInstalled) },
+            logRefusal: { _ in },
+            deleteLimitReached: { false },
+            recordDeleteLimit: { true }))
+        scheduler.trigger()
+        guard runs == 1 else {
+            return report(id, slug, false, "(A's watcher did not run after B was refused)")
+        }
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L4-18 — only enabled (and installed) profiles take part in the overlap rule
+
+    /// Review finding 4: a disabled profile must not block an enabled one, and
+    /// enabling an overlapping disabled profile must be refused.
+    private static func testOverlapOnlyAmongEnabledInstalled() -> Bool {
+        let id = "AC-L4-18", slug = "overlap-only-enabled-installed"
+        let running = sampleProfile(name: "Running")                 // enabled, installed
+        let disabled = sampleProfile(name: "Disabled", isEnabled: false)
+        var fresh = sampleProfile(name: "Fresh")                      // enabled, same path
+        fresh.remotePath = running.remotePath
+        let installed: (SyncProfile) -> Bool = { $0.id == running.id }
+
+        // Disabled / never-installed profiles do not block.
+        guard SyncProfile.overlapError(fresh, among: [disabled], isInstalled: { _ in true }) == nil,
+              SyncProfile.overlapError(fresh, among: [running], isInstalled: { _ in false }) == nil,
+              SyncProfile.overlapError(disabled, among: [running], isInstalled: installed) == nil else {
+            return report(id, slug, false, "(a disabled or not-installed profile took part)")
+        }
+        var wrote = false
+        guard let freshJSON = try? JSONEncoder().encode(fresh) else {
+            return report(id, slug, false, "(could not encode fixture)")
+        }
+        let createEnv = fakeCLIEnvironment(
+            readProfiles: { [disabled] }, fileExists: { _ in true },
+            writeProfile: { _ in wrote = true; return true },
+            readStdin: { String(decoding: freshJSON, as: UTF8.self) })
+        guard LimpetCLI.execute(["profile", "create", "-"], env: createEnv) == 0, wrote else {
+            return report(id, slug, false, "(a disabled overlapping profile blocked create)")
+        }
+
+        // Enabling the overlapping disabled profile is refused before anything is written.
+        var enableWrote = false, enableInstalled = false
+        let enableEnv = fakeCLIEnvironment(
+            readProfiles: { [running, disabled] }, fileExists: { $0 == running.plistPath },
+            writeProfile: { _ in enableWrote = true; return true },
+            installProfile: { _ in enableInstalled = true; return nil })
+        guard LimpetCLI.execute(["profile", "enable", disabled.shortId], env: enableEnv) == 65,
+              !enableWrote, !enableInstalled else {
+            return report(id, slug, false, "(enabling an overlapping profile was not refused before writing)")
+        }
+        // And install (reached by every other enable path) refuses it too.
+        var enabledNow = disabled
+        enabledNow.isEnabled = true
+        do {
+            try SyncSetupService.shared.install(
+                profile: enabledNow, loadAgent: false, executablePath: translocatedExecutable,
+                otherProfiles: [running], isInstalled: installed)
+            return report(id, slug, false, "(install did not throw)")
+        } catch SyncSetupService.SetupError.refusedProfile {
+        } catch {
+            return report(id, slug, false, "(install threw \(error), not refusedProfile)")
+        }
+        return report(id, slug, true)
+    }
+
     // MARK: - AC-L4-5 — the watcher refuses before every run (catch-up, trigger, SIGUSR1, retry)
 
     /// Drives `SyncWatchScheduler` with the PRODUCTION refusal closure
@@ -3027,7 +3146,7 @@ enum ConfigSelfTest {
             now: { clock.now },
             scheduleAfter: { s, a in clock.scheduleAfter(s, a) },
             logSourceMissing: {},
-            refusalReason: { SyncWatchDaemon.refusalReason(for: mine, profilesDirectory: dir) },
+            refusalReason: { SyncWatchDaemon.refusalReason(for: mine, profilesDirectory: dir, isInstalled: { _ in true }) },
             logRefusal: { _ in refusalLogs += 1 },
             deleteLimitReached: { false },
             recordDeleteLimit: { true }
@@ -3062,7 +3181,7 @@ enum ConfigSelfTest {
             now: { clock.now },
             scheduleAfter: { s, a in clock.scheduleAfter(s, a) },
             logSourceMissing: {},
-            refusalReason: { SyncWatchDaemon.refusalReason(for: bad, profilesDirectory: "\(dir)-empty") },
+            refusalReason: { SyncWatchDaemon.refusalReason(for: bad, profilesDirectory: "\(dir)-empty", isInstalled: { _ in true }) },
             logRefusal: { _ in },
             deleteLimitReached: { false },
             recordDeleteLimit: { true }

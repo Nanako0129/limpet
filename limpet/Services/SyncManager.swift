@@ -395,6 +395,7 @@ final class SyncManager: ObservableObject {
             decoded: decoded,
             isKnownId: false,
             existing: profileStore.profiles,
+            isInstalled: SyncProfile.agentInstalled,
             persist: { [weak self] profile in
                 self?.profileStore.add(profile)
                 self?.clearError(for: profile.id)
@@ -412,6 +413,13 @@ final class SyncManager: ObservableObject {
                 } catch {
                     print("Failed to install newly-created external profile: \(error)")
                 }
+            },
+            quarantine: { reason in
+                let moved = Self.quarantineRefusedDrop(at: sourcePath)
+                let message = "Refused dropped profile \(decoded.shortId): \(reason); "
+                    + (moved.map { "moved it to \($0)" } ?? "could not move \(sourcePath) aside")
+                print(message)
+                LimpetSettings.debugLog(message)
             }
         )
 

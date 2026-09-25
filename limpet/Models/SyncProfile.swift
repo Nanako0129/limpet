@@ -131,9 +131,19 @@ struct SyncProfile: Identifiable, Codable, Equatable {
     /// case-insensitively (a false match only refuses, it never deletes);
     /// paths compare by `/`-separated components, so `a/b`, `a/b/` and `a//b`
     /// are the same path and `a/bc` does not nest under `a/b`.
-    static func overlapError(_ profile: SyncProfile, among others: [SyncProfile]) -> String? {
+    ///
+    /// Only profiles that can sync take part: `profile` itself must be
+    /// enabled, and it is compared only with others that are enabled AND have
+    /// an installed agent (`isInstalled`). The installed one wins: a second,
+    /// overlapping profile that is enabled on disk but was never installed (a
+    /// refused create, or a file dropped while the app was closed) cannot
+    /// block the running one, and its own install is refused.
+    static func overlapError(
+        _ profile: SyncProfile, among others: [SyncProfile], isInstalled: (SyncProfile) -> Bool
+    ) -> String? {
+        guard profile.isEnabled else { return nil }
         let mine = profile.remoteLocation
-        for other in others where other.id != profile.id {
+        for other in others where other.id != profile.id && other.isEnabled && isInstalled(other) {
             let theirs = other.remoteLocation
             guard mine.remote == theirs.remote,
                   mine.components.starts(with: theirs.components)
@@ -142,6 +152,11 @@ struct SyncProfile: Identifiable, Codable, Equatable {
                 + "at \(other.fullRemotePath); two syncs on equal or nested remote paths delete each other's files"
         }
         return nil
+    }
+
+    /// Production `isInstalled` for `overlapError`: the agent's plist exists.
+    static func agentInstalled(_ profile: SyncProfile) -> Bool {
+        FileManager.default.fileExists(atPath: profile.plistPath)
     }
 
     private var remoteLocation: (remote: String, components: [Substring]) {

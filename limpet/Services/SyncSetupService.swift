@@ -113,14 +113,16 @@ final class SyncSetupService {
         profile: SyncProfile,
         loadAgent: Bool = true,
         executablePath: String = Bundle.main.executablePath ?? "",
-        otherProfiles: [SyncProfile] = ProfileStore.profilesOnDisk(in: SyncProfile.configDirectory)
+        otherProfiles: [SyncProfile] = ProfileStore.profilesOnDisk(in: SyncProfile.configDirectory),
+        isInstalled: (SyncProfile) -> Bool = SyncProfile.agentInstalled
     ) throws {
         // F4/F6 (limpet-plan.md L4) come FIRST, before anything is written. The
         // self-test relies on this order: it calls install with a refused profile
         // AND a translocated executable path, so if this check ever went missing
         // the translocation guard below still stops install before it touches a
         // real file, and the test sees the wrong error instead of side effects.
-        if let reason = profile.validationError ?? SyncProfile.overlapError(profile, among: otherProfiles) {
+        if let reason = profile.validationError
+            ?? SyncProfile.overlapError(profile, among: otherProfiles, isInstalled: isInstalled) {
             throw SetupError.refusedProfile(reason)
         }
 

@@ -43,18 +43,21 @@ extension SyncManager {
     ///   `install`, exactly once each → `.createdAndInstalled`.
     /// - decoded, unknown id, otherwise → `persist` only → `.createdOnly`.
     /// - decoded, unknown id, remote path equal to or nested with one of
-    ///   `existing` → neither → `.refusedOverlap` (F6).
+    ///   `existing` (enabled and installed) → neither; `quarantine` moves the
+    ///   dropped file out of the scanned set → `.refusedOverlap` (F6).
     static func applyExternalCreateIfNeeded(
         decoded: SyncProfile?,
         isKnownId: Bool,
         existing: [SyncProfile],
+        isInstalled: (SyncProfile) -> Bool,
         persist: (SyncProfile) -> Void,
-        install: (SyncProfile) -> Void
+        install: (SyncProfile) -> Void,
+        quarantine: (_ reason: String) -> Void
     ) -> ExternalCreateOutcome {
         guard let profile = decoded, !isKnownId else { return .ignored }
 
-        if let reason = SyncProfile.overlapError(profile, among: existing) {
-            print("Refusing to create profile \(profile.shortId) from a dropped file: \(reason)")
+        if let reason = SyncProfile.overlapError(profile, among: existing, isInstalled: isInstalled) {
+            quarantine(reason)
             return .refusedOverlap
         }
 
@@ -64,6 +67,33 @@ extension SyncManager {
 
         install(profile)
         return .createdAndInstalled
+    }
+
+    /// Move a refused dropped profile file to `<profiles>/refused/<stem>.<UTC
+    /// timestamp>.json`, so that neither `ProfileStore.load`, the watcher's
+    /// re-read (both list `*.profile.json` directly in `profiles/`) nor
+    /// `ConfigFileWatcher` (which reacts to a `.profile.json` suffix anywhere
+    /// below `~/.config/limpet`) ever sees it again. Returns the new path, or
+    /// `nil` if the move failed.
+    nonisolated static func quarantineRefusedDrop(at path: String, now: Date = Date()) -> String? {
+        let fm = FileManager.default
+        let refusedDir = ((path as NSString).deletingLastPathComponent as NSString).appendingPathComponent("refused")
+        var stem = (path as NSString).lastPathComponent
+        for suffix in [".profile.json", ".json"] where stem.hasSuffix(suffix) {
+            stem = String(stem.dropLast(suffix.count))
+            break
+        }
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyyMMdd'T'HHmmss'Z'"
+        formatter.timeZone = TimeZone(identifier: "UTC")
+        let destination = (refusedDir as NSString).appendingPathComponent("\(stem).\(formatter.string(from: now)).json")
+        do {
+            try fm.createDirectory(atPath: refusedDir, withIntermediateDirectories: true)
+            try fm.moveItem(atPath: path, toPath: destination)
+            return destination
+        } catch {
+            return nil
+        }
     }
 
     /// Decide what reconcile work a profile edit requires, given the

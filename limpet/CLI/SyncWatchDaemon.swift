@@ -119,9 +119,13 @@ enum SyncWatchDaemon {
     /// every profile file each time: a profile created or edited since this
     /// watcher started must be seen. Not private so `ConfigSelfTest` drives the
     /// exact production closure against a scratch profiles directory.
-    static func refusalReason(for profile: SyncProfile, profilesDirectory: String) -> String? {
+    static func refusalReason(
+        for profile: SyncProfile,
+        profilesDirectory: String,
+        isInstalled: (SyncProfile) -> Bool = SyncProfile.agentInstalled
+    ) -> String? {
         profile.validationError ?? SyncProfile.overlapError(
-            profile, among: ProfileStore.profilesOnDisk(in: profilesDirectory))
+            profile, among: ProfileStore.profilesOnDisk(in: profilesDirectory), isInstalled: isInstalled)
     }
 
     /// What `runSyncChild` returns when the remote's secret could not be read.

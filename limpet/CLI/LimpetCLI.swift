@@ -787,7 +787,8 @@ enum LimpetCLI {
             return 1
         }
         // F6: decode already refused F4 values; overlap needs the other profiles.
-        if let reason = SyncProfile.overlapError(profile, among: existing) {
+        if let reason = SyncProfile.overlapError(
+            profile, among: existing, isInstalled: { env.fileExists($0.plistPath) }) {
             env.stderr("error: \(reason)\n")
             return 65
         }
@@ -851,7 +852,8 @@ enum LimpetCLI {
     // MARK: - profile enable / disable
 
     private static func runProfileSetEnabled(_ target: String, enabled: Bool, env: CLIEnvironment) -> Int32 {
-        guard let profile = resolveProfile(target, in: env.readProfiles()) else {
+        let all = env.readProfiles()
+        guard let profile = resolveProfile(target, in: all) else {
             env.stderr("error: no profile matches \"\(target)\"\n")
             return 1
         }
@@ -862,6 +864,13 @@ enum LimpetCLI {
 
         var updated = profile
         updated.isEnabled = enabled
+        // F6: enabling makes the profile take part in the overlap rule; refuse
+        // BEFORE the enabled flag is persisted.
+        if let reason = SyncProfile.overlapError(
+            updated, among: all, isInstalled: { env.fileExists($0.plistPath) }) {
+            env.stderr("error: \(reason)\n")
+            return 65
+        }
         guard env.writeProfile(updated) else {
             env.stderr("error: failed to write profile file\n")
             return 1
@@ -927,7 +936,8 @@ enum LimpetCLI {
             }
         }
         // F4/F6 on the result as a whole: the overlap depends on remote and path together.
-        if let reason = updated.validationError ?? SyncProfile.overlapError(updated, among: all) {
+        if let reason = updated.validationError
+            ?? SyncProfile.overlapError(updated, among: all, isInstalled: { env.fileExists($0.plistPath) }) {
             env.stderr("error: \(reason)\n")
             return 65
         }
