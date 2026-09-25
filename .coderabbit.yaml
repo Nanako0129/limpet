@@ -1,0 +1,83 @@
+# CodeRabbit configuration.
+# Schema: https://storage.googleapis.com/coderabbit_public_assets/schema.v2.json
+#
+# Every instruction below restates a rule this repository already writes down
+# in CLAUDE.md. Nothing here is a new policy. The two settings that are choices
+# rather than restatements carry their reasoning at their own key.
+
+reviews:
+  auto_review:
+    # This repository is reviewed by CodeRabbit.
+    #
+    # It has no history with another reviewer: unlike the five repositories
+    # that moved across on 2026-09-25, limpet was never on Copilot and has no
+    # copilot-auto-review ruleset to disable. This file is its first review
+    # configuration, written the same day so it does not sit outside the set.
+    #
+    # HOW A REVIEW IS TRIGGERED HERE, which this flag alone does not say.
+    #
+    # Automatic review was observed on repositories at 0 to 5 stars on
+    # 2026-09-25, and this one is at 0. But every one of those observations was
+    # taken while the account sat inside a paid Advanced trial running to
+    # 2026-10-02, and a paid plan reviews automatically whatever the star
+    # count. Nothing observed separates "the OSS tier is automatic anyway" from
+    # "the paid trial is what made it automatic".
+    #
+    # coderabbit.ai/oss does say "every public repository gets CodeRabbit
+    # Review free the moment you install it", with no star threshold on the
+    # page. That points one way, but a vendor page is weaker evidence than a
+    # measurement and the measurement is the thing that is confounded.
+    #
+    # So post a top-level '@coderabbitai review' rather than relying on
+    # automatic review. On the first pull request after 2026-10-02, check
+    # whether CodeRabbit reviews it with no trigger -- that is the observation
+    # still missing, and reading the billing page does not answer it.
+    #
+    # If automatic review does stop, the failure is quiet: this flag says the
+    # repository is covered, and a poller waiting for a completion marker that
+    # never arrives reports a timeout rather than "not configured".
+    enabled: true
+    # 0 disables the pause entirely, which is the schema's documented sentinel
+    # ("Set to 0 to disable"), not a large number chosen by hand. At the
+    # default of 5, automatic review stops silently once a pull request has
+    # five reviewed commits, and a poller waiting on the verdict reads that
+    # pause as a timeout rather than as a stop.
+    auto_pause_after_reviewed_commits: 0
+
+  path_instructions:
+    - path: "**"
+      instructions: |
+        Public repository. Never put private paths, credentials, or
+        machine-specific tooling details in tracked files.
+
+    - path: "**/*.swift"
+      instructions: |
+        CLAUDE.md "Critical Rules" #1, threading, is the rule this codebase
+        breaks most expensively, so check it first and treat a violation as a
+        defect rather than a style note: never read or write @State, @Binding,
+        @Published or any UI-owned property from a background thread.
+
+        The required shape is capture-then-dispatch. Values come off the main
+        thread BEFORE the dispatch, the closure uses the captured locals, and
+        every state write goes back through DispatchQueue.main.async with an
+        explicit self. Reading a state property inside a background closure is
+        the violation even when it looks harmless, because the symptom is a
+        freeze or a crash at a distance rather than a wrong value here.
+
+        Process execution (#2): external processes -- rclone, shell -- run on
+        background threads, with pipes for stdout and stderr and a
+        readabilityHandler for streaming. Handlers are set to nil after the
+        process ends; leaving one attached is a leak the diff will not show.
+
+        Error handling and state consistency (#5, #6): when configuration
+        changes or a fix operation starts, cached error state for that profile
+        is cleared rather than left to age -- syncManager.clearError(for:) --
+        and path changes restart the watchers. A change that edits profile
+        configuration without doing both leaves the UI reporting a condition
+        that no longer exists. Log categorisation goes through SyncLogPatterns
+        rather than ad-hoc string matching.
+
+knowledge_base:
+  code_guidelines:
+    filePatterns:
+      - "CLAUDE.md"
