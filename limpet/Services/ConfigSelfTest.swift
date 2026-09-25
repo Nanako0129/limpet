@@ -107,6 +107,7 @@ enum ConfigSelfTest {
             testPruneKeepsUndecodableFile,
             testEditKeepsNonSecretRequiredErrors,
             testKeychainLockedLogThrottled,
+            testKeychainLargeOutputDrained,
         ]
 
         for check in checks {
@@ -3616,6 +3617,29 @@ enum ConfigSelfTest {
         guard lines.count == 2, spawned == 0, refusals == 0, scheduler.state == .idle,
               !FileManager.default.fileExists(atPath: "\(dir)/calls") else {
             return report(id, slug, false, "(after the window: lines=\(lines.count) spawned=\(spawned) state=\(scheduler.state))")
+        }
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L4-28 — output larger than the pipe buffer is drained, not timed out
+
+    /// CodeRabbit PR #6: stdout was read only after `security` exited, so an
+    /// output over the ~64 KB pipe buffer blocked the child until the timeout.
+    private static func testKeychainLargeOutputDrained() -> Bool {
+        let id = "AC-L4-28", slug = "keychain-large-output-drained"
+        let dir = "\(selfTestRoot)/ac-l4-28"
+        try? FileManager.default.removeItem(atPath: dir)
+        let big = String(repeating: "a", count: 200_000)
+        guard let stub = makeSecurityStub(in: dir, secret: big, mode: "found") else {
+            return report(id, slug, false, "(fixture setup failed)")
+        }
+        let store = KeychainSecretStore(
+            securityPath: stub, keychainPath: "\(dir)/fake.keychain-db", timeout: 3, lockStatus: { _ in .unlocked })
+        let result = store.read(account: "big")
+        guard result == .found(big) else {
+            let shape: String
+            if case .found(let s) = result { shape = "found(\(s.count) chars)" } else { shape = "\(result)" }
+            return report(id, slug, false, "(read returned \(shape))")
         }
         return report(id, slug, true)
     }

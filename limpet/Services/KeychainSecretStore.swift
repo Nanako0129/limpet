@@ -197,10 +197,19 @@ struct KeychainSecretStore {
         } catch {
             return .exited(-1, Data())
         }
+        // Drain stdout while waiting: output larger than the pipe buffer would
+        // otherwise block `security` on its write until the timeout.
+        var data = Data()
+        let drained = DispatchSemaphore(value: 0)
+        DispatchQueue.global(qos: .utility).async {
+            data = output.fileHandleForReading.readDataToEndOfFile()
+            drained.signal()
+        }
         guard finished.wait(timeout: .now() + timeout) == .success else {
             process.terminate()
             return .timedOut
         }
-        return .exited(process.terminationStatus, output.fileHandleForReading.readDataToEndOfFile())
+        drained.wait()
+        return .exited(process.terminationStatus, data)
     }
 }
