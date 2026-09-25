@@ -228,9 +228,11 @@ once per 30 s, the refusal and source-missing throttle), starts no rclone and
 waits for its next trigger; the menu shows "Allow keychain access", the only action that
 may raise the system unlock dialog, which then sends the waiting watchers
 SIGUSR1. Observed live 2026-09-26 with the login keychain locked: no limpet
-dialog appeared, the menu showed "Allow keychain access", and the sync
-resumed once the user unlocked the keychain — confirming this path end to
-end, not just `SecKeychainGetStatus`'s own no-prompt behavior in isolation.
+dialog appeared, the watcher logged the line above, the menu showed "Allow
+keychain access", and after the user unlocked it the pending file uploaded (19 s after the
+locked line; the unlock moment itself was not timed).
+That is one end-to-end observation of this path; that `SecKeychainGetStatus`
+can never prompt was not measured on its own.
 
 **Self-write suppression.** `ConfigSelfWriteRegistry` tracks the content hash
 of every file limpet itself writes; `ConfigFileWatcher.shouldReconcile`
@@ -339,7 +341,7 @@ isn't limpet's own.
 
 | Command | Purpose |
 |---------|---------|
-| `limpet sync <name\|shortId>` | Send the running watcher SIGUSR1 (`launchctl kill SIGUSR1 gui/$(id -u)/<launchdLabel>`) to ask it to sync now, and return immediately — it does NOT block until the sync finishes. Prints `sync requested` and exits 0 on success, or `no watcher running, it syncs when its agent next starts` if the agent isn't loaded. Use `limpet logs <name\|shortId> --follow` to watch the run it triggered. |
+| `limpet sync <name\|shortId>` | Send the running watcher SIGUSR1 (`launchctl kill SIGUSR1 gui/$(id -u)/<launchdLabel>`) to ask it to sync now, and return immediately — it does NOT block until the sync finishes. On success prints `sync requested for "<name>" (<shortId>) — see: limpet logs <shortId>` and exits 0; if the agent isn't loaded prints `error: no watcher running for "<name>" (<shortId>)` to stderr and exits 1. Use `limpet logs <name\|shortId> --follow` to watch the run it triggered. |
 
 `<name|shortId>` resolution tries an exact `shortId` match first, then a
 case-insensitive `name` match; an unmatched (or ambiguous) target exits
