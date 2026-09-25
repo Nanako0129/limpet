@@ -12,7 +12,6 @@ struct SyncProfile: Identifiable, Codable, Equatable {
     var additionalRcloneFlags: String   // optional extra flags
     var isEnabled: Bool                 // whether scheduled sync is active
     var isMuted: Bool                   // whether notifications are muted for this profile
-    var syncMode: SyncMode              // bisync (two-way) or sync (one-way)
     var syncDirection: SyncDirection    // direction for one-way sync
 
     // Fallback remote (used when primary remote is unreachable)
@@ -20,7 +19,7 @@ struct SyncProfile: Identifiable, Codable, Equatable {
     var fallbackRemotePath: String      // e.g., "/volume1/Kaiju" (empty = same as primary remotePath)
     /// True when primary and fallback remotes use different rclone wire types (e.g. smb vs sftp).
     /// When true, the sync script swaps the full REMOTE reference on fallback activation instead of
-    /// using env-var overrides — bisync cache is intentionally rebuilt to avoid NFD/NFC divergence.
+    /// using env-var overrides, to avoid NFD/NFC filename-encoding divergence between wire types.
     /// Populated at install/save time. Defaults to false for profiles created before this field existed.
     var fallbackRequiresCacheRebuild: Bool
 
@@ -146,7 +145,6 @@ struct SyncProfile: Identifiable, Codable, Equatable {
         additionalRcloneFlags: String = "",
         isEnabled: Bool = false,
         isMuted: Bool = false,
-        syncMode: SyncMode = .bisync,
         syncDirection: SyncDirection = .localToRemote,
         fallbackRemote: String = "",
         fallbackRemotePath: String = "",
@@ -162,7 +160,6 @@ struct SyncProfile: Identifiable, Codable, Equatable {
         self.additionalRcloneFlags = additionalRcloneFlags
         self.isEnabled = isEnabled
         self.isMuted = isMuted
-        self.syncMode = syncMode
         self.syncDirection = syncDirection
         self.fallbackRemote = fallbackRemote
         self.fallbackRemotePath = fallbackRemotePath
@@ -181,7 +178,7 @@ extension SyncProfile {
     enum CodingKeys: String, CodingKey {
         case id, name, rcloneRemote, remotePath, localSyncPath
         case drivePathToMonitor, syncIntervalMinutes, additionalRcloneFlags
-        case isEnabled, isMuted, syncMode, syncDirection
+        case isEnabled, isMuted, syncDirection
         case fallbackRemote, fallbackRemotePath, fallbackRequiresCacheRebuild
     }
 
@@ -202,18 +199,6 @@ extension SyncProfile {
         isEnabled = try container.decodeIfPresent(Bool.self, forKey: .isEnabled) ?? false
         // Backwards compatibility: default to false if not present
         isMuted = try container.decodeIfPresent(Bool.self, forKey: .isMuted) ?? false
-        // Backwards compatibility: a profile written before this field existed
-        // (key absent) defaults to bisync, matching the memberwise-init default.
-        // A profile carrying a mode this build no longer supports (e.g. the
-        // removed "mount" stream mode) decodes as one-way sync rather than
-        // throwing — `SyncMode(rawValue:)` returns nil for any unrecognised raw
-        // string, so a PRESENT-but-unknown value falls back to `.sync` instead
-        // of propagating a decode failure.
-        if let syncModeRaw = try container.decodeIfPresent(String.self, forKey: .syncMode) {
-            syncMode = SyncMode(rawValue: syncModeRaw) ?? .sync
-        } else {
-            syncMode = .bisync
-        }
         // Backwards compatibility: default to localToRemote if not present
         syncDirection = try container.decodeIfPresent(SyncDirection.self, forKey: .syncDirection) ?? .localToRemote
         // Backwards compatibility: fallback remote defaults to empty (disabled)

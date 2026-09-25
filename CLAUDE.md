@@ -2,24 +2,22 @@
 
 ## Project Overview
 
-SyncTray is a macOS menu bar application that provides Google Drive-style background folder sync using rclone's bisync feature. It enables seamless two-way synchronization between local folders and any of rclone's 70+ supported cloud providers (Dropbox, OneDrive, Google Drive, S3, SFTP, etc.).
+SyncTray is a macOS menu bar application that provides Google Drive-style background folder sync using rclone. It syncs a local folder one-way with any of rclone's 70+ supported cloud providers (Dropbox, OneDrive, Google Drive, S3, SFTP, etc.).
 
 ### Key Features
 - **Multi-profile support**: Configure multiple sync pairs (local folder ↔ cloud remote)
-- **Two sync modes**: Two-way sync (bisync) and one-way sync (upload/download)
+- **One-way sync**: Upload (local → remote) or download (remote → local), your choice per profile
 - **Background sync via launchd**: Scheduled syncs run automatically at configurable intervals
 - **Real-time file monitoring**: FSEvents-based directory watching triggers syncs on local changes
 - **External drive support**: Auto-detects when external drives are mounted/unmounted
 - **Live progress tracking**: Parses rclone JSON logs for real-time transfer progress
 - **macOS notifications**: Batch notifications for file changes with "Open Directory" action
 - **Fallback remote**: Automatic failover to an alternative remote when the primary is unreachable
-- **Auto-fix sync issues**: Automatically runs `--resync` recovery when bisync detects an out-of-sync state (app-wide setting, default ON). Skipped when the profile's external drive is unmounted — a `--resync` against a missing/empty local path can't safely fix anything, so the profile is left in `.driveNotMounted` and resumes normally once the drive reconnects.
 
 ### Sync Modes
 
 | Mode | rclone Command | Description |
 |------|----------------|-------------|
-| Two-Way Sync | `rclone bisync` | Bidirectional sync - changes on either side sync to the other |
 | One-Way Upload | `rclone sync local remote` | Local is authoritative, uploads to remote |
 | One-Way Download | `rclone sync remote local` | Remote is authoritative, downloads to local |
 
@@ -48,7 +46,7 @@ SyncTray/
 | `SyncProfile.swift` | Profile model with sync paths, remote config, fallback remote config, computed file paths |
 | `SyncState.swift` | Sync state enum, progress struct, file change model, `ActiveTransport`, `SyncLogPatterns` for log parsing |
 | `RcloneLogEntry.swift` | JSON models for parsing rclone `--use-json-log` output |
-| `Settings.swift` | Global app settings (debug logging toggle, auto-fix sync issues toggle) |
+| `Settings.swift` | Global app settings (debug logging toggle) |
 
 ### Services/
 
@@ -85,7 +83,7 @@ running app applies the change live, without a restart.
 |------|----------|-------|
 | `profiles/{shortId}.profile.json` | Full `SyncProfile`, including `isEnabled`, `isMuted` | NEW authoritative file. Written by `ProfileStore.save()` (encodes the whole model, so any new `SyncProfile` field flows in automatically); read by `ProfileStore.load()` (file-authoritative). References `../schema/profile.schema.json` via `$schema`. |
 | `profiles/{shortId}.json` | Derived, script-only subset (frozen key set) | Unchanged, byte-for-byte — this is `SyncSetupService.generateProfileConfig`'s output, consumed only by the sync shell script. The app never reads it back. |
-| `settings.json` | Enumerated safe subset of `SyncTraySettings` (`debugLoggingEnabled`, `autoFixSyncIssues`, `telemetryEnabled`, `launchAtLogin`) | Written by `AppSettingsFileStore`. Never contains secrets or telemetry identifiers (`installationId`, `anonymousUserId`). |
+| `settings.json` | Enumerated safe subset of `SyncTraySettings` (`debugLoggingEnabled`, `telemetryEnabled`, `launchAtLogin`) | Written by `AppSettingsFileStore`. Never contains secrets or telemetry identifiers (`installationId`, `anonymousUserId`). |
 | `schema/profile.schema.json`, `schema/settings.schema.json` | Committed JSON Schemas | Copied out of the app bundle by `ConfigSchemaInstaller` at every launch. Kept in lockstep with `SyncProfile.CodingKeys` by the fail-closed `scripts/check-schema-in-sync.sh`, run locally and in CI. |
 
 **Live apply, not a struct swap.** A single `ConfigFileWatcher` (FSEvents,
@@ -177,7 +175,7 @@ sync. Validate the file against `~/.config/synctray/schema/profile.schema.json`
 before writing it; the schema's top-level `description` documents the
 creation behavior. Only FIVE keys are required — `id`, `name`, `rcloneRemote`,
 `remotePath`, `localSyncPath` — so an agent can author a minimal profile and
-let every other field take its default (the decoder fills `syncMode=bisync`,
+let every other field take its default (the decoder fills `syncDirection=localToRemote`,
 `syncIntervalMinutes=5`, `isEnabled=false`, …, all mirrored
 from the memberwise-init defaults; an app-written file that emits every key
 still round-trips unchanged). A profile is created whenever the file decodes
@@ -313,9 +311,9 @@ If set: rclone lsd primary remote (3s connect timeout)
         ↓
 Unreachable? → Log "using fallback: X"
     ├─ Same wire type + no path change (fallbackRequiresCacheRebuild=false):
-    │   env var overrides swap transport (preserves bisync cache)
+    │   env var overrides swap transport
     └─ Different wire type OR explicit path (fallbackRequiresCacheRebuild=true):
-        swap entire REMOTE reference (bisync rebuilds listings, ~12s)
+        swap entire REMOTE reference
         ↓
 Reachable? → Log "Using primary remote: X"
         ↓
@@ -325,24 +323,21 @@ MenuBarView shows transport icon (wifi=primary, antenna=fallback)
 ```
 
 **Primary recovery (fallback → primary switch-back).** The reachability check above runs
-once per *script execution*. Sync/bisync profiles re-run on their `StartInterval`, so they
+once per *script execution*, and profiles re-run on their `StartInterval`, so they
 naturally return to the primary on the next scheduled sync once it's reachable — no
 separate recovery monitor is needed.
 
-**Bisync cache preservation:** When primary and fallback remotes share the same
+**Transport env-var override:** When primary and fallback remotes share the same
 rclone wire type (e.g., WebDAV LAN → WebDAV QuickConnect, both `type = webdav`)
 and `fallbackRemotePath` is empty, the sync script uses `RCLONE_CONFIG_*`
 environment variable overrides to change the transport while keeping the rclone
-remote name unchanged. This means bisync's listing cache (keyed by remote name +
-path) remains valid across failover events.
+remote name unchanged.
 
 When primary and fallback have **different** wire types (e.g., SMB → SFTP), the
 script swaps the full remote reference to `<fallbackRemote>:<path>` regardless of
-whether `fallbackRemotePath` is set. This forces bisync to rebuild listings on
-the first switch (~12s for 85K files, no data re-download) but avoids cache
-poisoning from byte-level filename encoding differences (macOS SMB normalises to
-NFD; SFTP passes NFC verbatim — same human-readable name, different byte
-sequence).
+whether `fallbackRemotePath` is set. This avoids cache poisoning from byte-level
+filename encoding differences (macOS SMB normalises to NFD; SFTP passes NFC
+verbatim — same human-readable name, different byte sequence).
 
 The branching condition is determined at profile install/save time by comparing
 `provider.rcloneType` for the primary and fallback remotes (read via
@@ -364,9 +359,6 @@ SyncManager maintains parallel dictionaries keyed by profile UUID:
 @Published private(set) var profileTransports: [UUID: ActiveTransport] = [:]
 private var logWatchers: [UUID: LogWatcher] = [:]
 private var directoryWatchers: [UUID: DirectoryWatcher] = [:]
-// Auto-fix backoff (in-memory, not persisted):
-private var autoFixAttempts: [UUID: [Date]] = [:]     // timestamps of recent fix attempts
-private var autoFixSuppressed: Set<UUID> = []          // profiles where auto-fix is paused
 ```
 
 This allows independent state tracking per profile while maintaining a single source of truth.
@@ -466,7 +458,7 @@ func doBackgroundWork() {
 ### 5. Error Handling
 - Provide actionable error messages to users
 - Log detailed errors for debugging
-- Offer recovery actions when possible (e.g., "Fix Sync Issues" button)
+- Offer recovery actions when possible (e.g., "Retry Sync" button)
 - **Clear cached errors** when config changes or fix operations start:
   ```swift
   syncManager.clearError(for: profile.id)
@@ -508,14 +500,6 @@ tail -f ~/.local/log/synctray-sync-{shortId}.log
 cat ~/.config/synctray/profiles/{shortId}.json
 ```
 
-### rclone bisync Cache
-rclone bisync maintains state in:
-```
-~/.cache/rclone/bisync/
-```
-
-To force a fresh sync, use "Fix Sync Issues" in the app (runs `--resync`).
-
 ### Lock Files
 If sync appears stuck, check for stale lock files:
 ```bash
@@ -552,7 +536,7 @@ open ~/Library/Developer/Xcode/DerivedData/SyncTray-*/Build/Products/Debug/SyncT
 | `SyncLogPatterns` | Centralized log message pattern matching (includes `isOutOfSyncError`) |
 | `TelemetryService.swift` | OTel singleton — traces, metrics, logs via OTLP/HTTP |
 | `TelemetryDetailsSheet.swift` | Shared privacy disclosure sheet for wizard, banner, and settings |
-| `Settings.swift` | Global settings including `installationId`, `anonymousUserId`, and `autoFixSyncIssues` |
+| `Settings.swift` | Global settings including `installationId` and `anonymousUserId` |
 
 ## Telemetry
 

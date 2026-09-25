@@ -76,7 +76,6 @@ extension SyncManager {
             current.localSyncPath != updated.localSyncPath ||
             current.syncIntervalMinutes != updated.syncIntervalMinutes ||
             current.additionalRcloneFlags != updated.additionalRcloneFlags ||
-            current.syncMode != updated.syncMode ||
             current.syncDirection != updated.syncDirection ||
             current.fallbackRemote != updated.fallbackRemote ||
             current.fallbackRemotePath != updated.fallbackRemotePath

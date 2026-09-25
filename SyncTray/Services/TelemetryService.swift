@@ -502,17 +502,17 @@ final class TelemetryService {
     private func profileAttributes(
         profileId: UUID,
         profileName: String,
-        syncMode: SyncMode,
+        syncMode: String,
         syncDirection: SyncDirection? = nil,
         hasFallback: Bool = false
     ) -> [String: AttributeValue] {
         var attrs: [String: AttributeValue] = [
             "synctray.profile.id": .string(profileId.uuidString),
             "synctray.profile.name": .string(profileName),
-            "sync.mode": .string(syncMode.rawValue),
+            "sync.mode": .string(syncMode),
             "sync.has_fallback": .bool(hasFallback),
         ]
-        if let direction = syncDirection, syncMode == .sync {
+        if let direction = syncDirection {
             attrs["sync.direction"] = .string(direction.rawValue)
         }
         return attrs
@@ -524,7 +524,7 @@ final class TelemetryService {
     func recordSyncStarted(
         profileId: UUID,
         profileName: String,
-        syncMode: SyncMode,
+        syncMode: String,
         syncDirection: SyncDirection? = nil,
         hasFallback: Bool = false,
         trigger: String = "scheduled"  // manual | directory_watch | scheduled | startup
@@ -573,7 +573,7 @@ final class TelemetryService {
     func recordSyncCompleted(
         profileId: UUID,
         profileName: String,
-        mode: SyncMode,
+        mode: String,
         duration: TimeInterval,
         filesChanged: Int
     ) {
@@ -581,7 +581,7 @@ final class TelemetryService {
         ensureSetup()
 
         let labels: [String: AttributeValue] = [
-            "sync.mode": .string(mode.rawValue),
+            "sync.mode": .string(mode),
             "sync.result": .string("success"),
             "synctray.profile.name": .string(profileName),
         ]
@@ -593,7 +593,7 @@ final class TelemetryService {
             syncFilesChangedCounter?.add(
                 value: filesChanged,
                 attribute: [
-                    "sync.mode": .string(mode.rawValue),
+                    "sync.mode": .string(mode),
                     "synctray.profile.name": .string(profileName),
                 ]
             )
@@ -613,7 +613,7 @@ final class TelemetryService {
                 attributes: [
                     "synctray.profile.id": .string(profileId.uuidString),
                     "synctray.profile.name": .string(profileName),
-                    "sync.mode": .string(mode.rawValue),
+                    "sync.mode": .string(mode),
                     "sync.result": .string("success"),
                     "sync.files_changed": .int(filesChanged),
                     "sync.duration_s": .double(duration),
@@ -627,7 +627,7 @@ final class TelemetryService {
     func recordSyncFailed(
         profileId: UUID,
         profileName: String,
-        mode: SyncMode,
+        mode: String,
         duration: TimeInterval,
         filesChanged: Int,
         exitCode: Int,
@@ -637,7 +637,7 @@ final class TelemetryService {
         ensureSetup()
 
         let labels: [String: AttributeValue] = [
-            "sync.mode": .string(mode.rawValue),
+            "sync.mode": .string(mode),
             "sync.result": .string("failure"),
             "synctray.profile.name": .string(profileName),
         ]
@@ -649,7 +649,7 @@ final class TelemetryService {
             syncFilesChangedCounter?.add(
                 value: filesChanged,
                 attribute: [
-                    "sync.mode": .string(mode.rawValue),
+                    "sync.mode": .string(mode),
                     "synctray.profile.name": .string(profileName),
                 ]
             )
@@ -658,7 +658,7 @@ final class TelemetryService {
         // Categorize error for the error counter
         let errorType = categorizeError(errorMessage)
         syncErrorCounter?.add(value: 1, attribute: [
-            "sync.mode": .string(mode.rawValue),
+            "sync.mode": .string(mode),
             "synctray.profile.name": .string(profileName),
             "error.type": .string(errorType),
         ])
@@ -679,7 +679,7 @@ final class TelemetryService {
                 attributes: [
                     "synctray.profile.id": .string(profileId.uuidString),
                     "synctray.profile.name": .string(profileName),
-                    "sync.mode": .string(mode.rawValue),
+                    "sync.mode": .string(mode),
                     "sync.result": .string("failure"),
                     "sync.exit_code": .int(exitCode),
                     "sync.duration_s": .double(duration),
@@ -983,7 +983,7 @@ final class TelemetryService {
             attributes: [
                 "synctray.profile.id": .string(profile.id.uuidString),
                 "synctray.profile.name": .string(profile.name),
-                "config.sync_mode": .string(profile.syncMode.rawValue),
+                "config.sync_mode": .string("sync"),
                 "config.sync_direction": .string(profile.syncDirection.rawValue),
                 "config.sync_interval_bucket": .string(intervalBucket),
                 "config.has_fallback": .bool(profile.hasFallback),
@@ -1001,7 +1001,7 @@ final class TelemetryService {
         ensureSetup()
 
         // Summary log: how many profiles of each type
-        let modeBreakdown = Dictionary(grouping: profiles, by: { $0.syncMode.rawValue })
+        let modeBreakdown = Dictionary(grouping: profiles, by: { _ in "sync" })
             .mapValues { $0.count }
         let enabledCount = profiles.filter { $0.isEnabled }.count
         let fallbackCount = profiles.filter { $0.hasFallback }.count
@@ -1034,8 +1034,8 @@ final class TelemetryService {
     func recordProfileLifecycleOperation(
         profileId: UUID,
         profileName: String,
-        operation: String,          // "install", "reinstall", "uninstall", "sync_now", "resync", "force_sync"
-        syncMode: String,           // bisync, sync, mount
+        operation: String,          // "install", "reinstall", "uninstall", "sync_now"
+        syncMode: String,           // "sync"
         result: String,             // "success", "failure", "started"
         errorMessage: String? = nil
     ) {

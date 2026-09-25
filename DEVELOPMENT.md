@@ -217,10 +217,6 @@ cat ~/Library/LaunchAgents/com.synctray.sync.*.plist
 tail -f ~/.local/log/synctray-sync-{shortId}.log
 ```
 
-### rclone bisync Cache
-
-Located at `~/.cache/rclone/bisync/`. Use "Fix Sync Issues" in the app to force a `--resync`.
-
 ### Lock Files
 
 ```bash

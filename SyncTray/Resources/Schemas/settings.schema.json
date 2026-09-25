@@ -13,10 +13,6 @@
       "type": "boolean",
       "description": "Verbose debug logging for file watchers and sync triggers."
     },
-    "autoFixSyncIssues": {
-      "type": "boolean",
-      "description": "Automatically run --resync when bisync detects an out-of-sync state."
-    },
     "telemetryEnabled": {
       "type": "boolean",
       "description": "Opt-in anonymous OpenTelemetry usage reporting."

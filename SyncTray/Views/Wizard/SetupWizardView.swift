@@ -21,7 +21,6 @@ struct SetupWizardView: View {
     @State private var remotePath: String = ""
     @State private var localPath: String = ""
     @State private var profileName: String = ""
-    @State private var syncMode: SyncMode = .bisync
     @State private var syncDirection: SyncDirection = .localToRemote
     @State private var syncInterval: Int = 5
     @State private var isExternalDrive: Bool = false
@@ -169,7 +168,6 @@ struct SetupWizardView: View {
         selectedRemote = profile.rcloneRemote.hasSuffix(":") ? profile.rcloneRemote : "\(profile.rcloneRemote):"
         remotePath = profile.remotePath
         localPath = profile.localSyncPath
-        syncMode = profile.syncMode
         syncDirection = profile.syncDirection
         syncInterval = profile.syncIntervalMinutes
         isExternalDrive = !profile.drivePathToMonitor.isEmpty
@@ -428,61 +426,35 @@ struct SetupWizardView: View {
                 .font(.title2)
                 .fontWeight(.semibold)
 
-            // Sync mode
+            // Direction
             VStack(alignment: .leading, spacing: 8) {
-                Text("Sync Mode")
+                Text("Sync Direction")
                     .font(.subheadline)
                     .foregroundColor(.secondary)
 
-                Picker("Mode", selection: $syncMode) {
-                    ForEach(SyncMode.allCases) { mode in
+                Picker("Direction", selection: $syncDirection) {
+                    ForEach(SyncDirection.allCases) { direction in
                         HStack {
-                            Image(systemName: mode.iconName)
-                            Text(mode.displayName)
+                            Image(systemName: direction.iconName)
+                            Text(direction.displayName)
                         }
-                        .tag(mode)
+                        .tag(direction)
                     }
                 }
                 .pickerStyle(.radioGroup)
 
-                Text(syncMode.description)
+                Text(syncDirection.description)
                     .font(.caption)
                     .foregroundColor(.secondary)
-            }
 
-            // Direction (only for one-way sync)
-            if syncMode == .sync {
-                Divider()
-
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("Sync Direction")
-                        .font(.subheadline)
-                        .foregroundColor(.secondary)
-
-                    Picker("Direction", selection: $syncDirection) {
-                        ForEach(SyncDirection.allCases) { direction in
-                            HStack {
-                                Image(systemName: direction.iconName)
-                                Text(direction.displayName)
-                            }
-                            .tag(direction)
-                        }
-                    }
-                    .pickerStyle(.radioGroup)
-
-                    Text(syncDirection.description)
+                if syncDirection == .localToRemote {
+                    Label("Remote files not in local will be deleted", systemImage: "exclamationmark.triangle")
                         .font(.caption)
-                        .foregroundColor(.secondary)
-
-                    if syncDirection == .localToRemote {
-                        Label("Remote files not in local will be deleted", systemImage: "exclamationmark.triangle")
-                            .font(.caption)
-                            .foregroundColor(.orange)
-                    } else {
-                        Label("Local files not in remote will be deleted", systemImage: "exclamationmark.triangle")
-                            .font(.caption)
-                            .foregroundColor(.orange)
-                    }
+                        .foregroundColor(.orange)
+                } else {
+                    Label("Local files not in remote will be deleted", systemImage: "exclamationmark.triangle")
+                        .font(.caption)
+                        .foregroundColor(.orange)
                 }
             }
 
@@ -520,10 +492,7 @@ struct SetupWizardView: View {
             GroupBox("Profile") {
                 VStack(alignment: .leading, spacing: 8) {
                     LabeledContent("Name", value: profileName.isEmpty ? "New Profile" : profileName)
-                    LabeledContent("Sync Mode", value: syncMode.displayName)
-                    if syncMode == .sync {
-                        LabeledContent("Direction", value: syncDirection.displayName)
-                    }
+                    LabeledContent("Direction", value: syncDirection.displayName)
                     LabeledContent("Interval", value: "\(syncInterval) minutes")
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -933,7 +902,6 @@ struct SetupWizardView: View {
             updatedProfile.localSyncPath = localPath
             updatedProfile.drivePathToMonitor = drivePath
             updatedProfile.syncIntervalMinutes = syncInterval
-            updatedProfile.syncMode = syncMode
             updatedProfile.syncDirection = syncDirection
 
             profileStore.update(updatedProfile)
@@ -947,7 +915,6 @@ struct SetupWizardView: View {
                 localSyncPath: localPath,
                 drivePathToMonitor: drivePath,
                 syncIntervalMinutes: syncInterval,
-                syncMode: syncMode,
                 syncDirection: syncDirection
             )
 

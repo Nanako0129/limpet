@@ -155,7 +155,6 @@ struct MigrationV1LegacyToMultiProfile: ProfileMigration {
             "additionalRcloneFlags": defaults.string(forKey: "additionalRcloneFlags") ?? "",
             "isEnabled": true,
             "isMuted": false,
-            "syncMode": "bisync",
             "syncDirection": "localToRemote",
         ]
 

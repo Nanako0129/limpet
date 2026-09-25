@@ -174,10 +174,10 @@ enum ConfigSelfTest {
             return report("AC-3", "reconcile-delta", false, "(syncIntervalMinutes change expected .reinstall)")
         }
 
-        var syncModeChanged = base
-        syncModeChanged.syncMode = base.syncMode == .sync ? .bisync : .sync
-        guard SyncManager.reconcileAction(from: base, to: syncModeChanged) == .reinstall else {
-            return report("AC-3", "reconcile-delta", false, "(syncMode change expected .reinstall)")
+        var directionChanged = base
+        directionChanged.syncDirection = base.syncDirection == .localToRemote ? .remoteToLocal : .localToRemote
+        guard SyncManager.reconcileAction(from: base, to: directionChanged) == .reinstall else {
+            return report("AC-3", "reconcile-delta", false, "(syncDirection change expected .reinstall)")
         }
 
         var nameChanged = base
@@ -213,7 +213,6 @@ enum ConfigSelfTest {
         }
 
         let defaultsApplied = decoded.isMuted == false
-            && decoded.syncMode == .bisync
             // Newly-optional keys fall back to their memberwise-init defaults.
             && decoded.drivePathToMonitor == ""
             && decoded.syncIntervalMinutes == 5
@@ -224,15 +223,16 @@ enum ConfigSelfTest {
             return report("AC-4", "partial-decode", false, "(defaults not applied correctly)")
         }
 
-        // A profile carrying the removed "mount" stream mode (or any other
-        // unrecognised syncMode string) must decode to one-way sync rather
-        // than throwing — see SyncProfile.init(from:).
-        var legacyMount = requiredOnly
-        legacyMount["syncMode"] = "mount"
-        guard let legacyData = try? JSONSerialization.data(withJSONObject: legacyMount),
-              let legacyDecoded = try? JSONDecoder().decode(SyncProfile.self, from: legacyData),
-              legacyDecoded.syncMode == .sync else {
-            return report("AC-4", "partial-decode", false, "(legacy \"mount\" syncMode did not decode to .sync)")
+        // A profile.json carrying keys this build no longer has (the removed
+        // "syncMode" field, and legacy mount-mode fields) must decode without
+        // throwing — unknown keys are simply ignored by Codable's keyed
+        // container, never crashing on an old file.
+        var legacyFields = requiredOnly
+        legacyFields["syncMode"] = "bisync"
+        legacyFields["mountBackend"] = "nfs"
+        guard let legacyData = try? JSONSerialization.data(withJSONObject: legacyFields),
+              (try? JSONDecoder().decode(SyncProfile.self, from: legacyData)) != nil else {
+            return report("AC-4", "partial-decode", false, "(legacy syncMode/mountBackend keys were not ignored safely)")
         }
 
         return report("AC-4", "partial-decode", true)
@@ -430,7 +430,7 @@ enum ConfigSelfTest {
         SettingsReconciler.apply(
             safeSettings: [
                 .debugLoggingEnabled: true,
-                .autoFixSyncIssues: false,
+                .telemetryEnabled: false,
                 .launchAtLogin: true,
             ],
             applySafeKey: { key, value in
@@ -448,7 +448,7 @@ enum ConfigSelfTest {
             return report("AC-12", "isolated-launch-at-login", false, "(profile state was touched despite the isolation boundary)")
         }
 
-        guard appliedSafeKeys[.debugLoggingEnabled] == true, appliedSafeKeys[.autoFixSyncIssues] == false else {
+        guard appliedSafeKeys[.debugLoggingEnabled] == true, appliedSafeKeys[.telemetryEnabled] == false else {
             return report("AC-12", "isolated-launch-at-login", false, "(other safe keys were not applied despite the login-item failure)")
         }
 
@@ -902,27 +902,27 @@ enum ConfigSelfTest {
             return report("AC-CLI7", "cli-lifecycle-commands", false, "(lifecycle commands did not parse)")
         }
 
-        let bisync = sampleProfile(id: UUID(), name: "Bisync", isEnabled: true)
+        let testProfile = sampleProfile(id: UUID(), name: "TestProfile", isEnabled: true)
 
         // reinstall (enabled) → uninstall THEN install both fire.
         var reUninstalled = false, reInstalled = false
         let reinstallEnv = fakeCLIEnvironment(
-            readProfiles: { [bisync] },
+            readProfiles: { [testProfile] },
             installProfile: { _ in reInstalled = true; return nil },
             uninstallProfile: { _ in reUninstalled = true; return nil }
         )
-        guard SyncTrayCLI.execute(["reinstall", bisync.shortId], env: reinstallEnv) == 0, reUninstalled, reInstalled else {
+        guard SyncTrayCLI.execute(["reinstall", testProfile.shortId], env: reinstallEnv) == 0, reUninstalled, reInstalled else {
             return report("AC-CLI7", "cli-lifecycle-commands", false, "(reinstall did not uninstall+install)")
         }
 
         // install (enabled) → installProfile fires, uninstall does NOT.
         var installFired = false
         let installEnv = fakeCLIEnvironment(
-            readProfiles: { [bisync] },
+            readProfiles: { [testProfile] },
             installProfile: { _ in installFired = true; return nil },
             uninstallProfile: { _ in "should-not-be-called" }
         )
-        guard SyncTrayCLI.execute(["install", bisync.shortId], env: installEnv) == 0, installFired else {
+        guard SyncTrayCLI.execute(["install", testProfile.shortId], env: installEnv) == 0, installFired else {
             return report("AC-CLI7", "cli-lifecycle-commands", false, "(install did not run installProfile)")
         }
 
@@ -962,8 +962,8 @@ enum ConfigSelfTest {
     private static func testCLIProfileSetAndShow() -> Bool {
         // Parse: positional key/value pairs; odd count fails.
         guard case .success(.profileSet(target: "work", assignments: let a)) = SyncTrayCLI.parse(
-            ["profile", "set", "work", "isMuted", "true", "syncMode", "sync"]
-        ), a == [ProfileAssignment(key: "isMuted", value: "true"), ProfileAssignment(key: "syncMode", value: "sync")] else {
+            ["profile", "set", "work", "isMuted", "true", "syncDirection", "remoteToLocal"]
+        ), a == [ProfileAssignment(key: "isMuted", value: "true"), ProfileAssignment(key: "syncDirection", value: "remoteToLocal")] else {
             return report("AC-CLI8", "cli-profile-set-and-show", false, "(profile set did not parse into pairs)")
         }
         guard case .failure = SyncTrayCLI.parse(["profile", "set", "work", "isMuted"]) else {
@@ -972,8 +972,9 @@ enum ConfigSelfTest {
 
         // applyProfileAssignment matrix.
         var p = sampleProfile(id: UUID(), name: "Base", isEnabled: true)
-        guard SyncTrayCLI.applyProfileAssignment(&p, key: "syncMode", value: "sync") == nil, p.syncMode == .sync else {
-            return report("AC-CLI8", "cli-profile-set-and-show", false, "(valid syncMode assignment failed)")
+        guard SyncTrayCLI.applyProfileAssignment(&p, key: "syncDirection", value: "remoteToLocal") == nil,
+              p.syncDirection == .remoteToLocal else {
+            return report("AC-CLI8", "cli-profile-set-and-show", false, "(valid syncDirection assignment failed)")
         }
         guard SyncTrayCLI.applyProfileAssignment(&p, key: "syncIntervalMinutes", value: "8") == nil, p.syncIntervalMinutes == 8 else {
             return report("AC-CLI8", "cli-profile-set-and-show", false, "(valid syncIntervalMinutes assignment failed)")
@@ -985,15 +986,15 @@ enum ConfigSelfTest {
         guard SyncTrayCLI.applyProfileAssignment(&p, key: "syncIntervalMinutes", value: "0") != nil else {
             return report("AC-CLI8", "cli-profile-set-and-show", false, "(out-of-range syncIntervalMinutes was accepted)")
         }
-        guard SyncTrayCLI.applyProfileAssignment(&p, key: "syncMode", value: "bogus") != nil else {
+        guard SyncTrayCLI.applyProfileAssignment(&p, key: "syncDirection", value: "bogus") != nil else {
             return report("AC-CLI8", "cli-profile-set-and-show", false, "(invalid enum value was accepted)")
-        }
-        // The removed "mount" stream mode is no longer a valid syncMode value.
-        guard SyncTrayCLI.applyProfileAssignment(&p, key: "syncMode", value: "mount") != nil else {
-            return report("AC-CLI8", "cli-profile-set-and-show", false, "(removed \"mount\" syncMode was accepted)")
         }
         guard SyncTrayCLI.applyProfileAssignment(&p, key: "name", value: "") != nil else {
             return report("AC-CLI8", "cli-profile-set-and-show", false, "(empty required string was accepted)")
+        }
+        // The removed "syncMode" key (bisync/mount) is no longer a valid `profile set` key.
+        guard SyncTrayCLI.applyProfileAssignment(&p, key: "syncMode", value: "sync") != nil else {
+            return report("AC-CLI8", "cli-profile-set-and-show", false, "(removed \"syncMode\" key was accepted)")
         }
         // Unknown + excluded keys.
         for badKey in ["totallyBogus", "id", "isEnabled", "fallbackRequiresCacheRebuild"] {
@@ -1019,7 +1020,7 @@ enum ConfigSelfTest {
         // execute: an invalid value writes NOTHING and exits non-zero.
         var wroteOnInvalid = false
         let invalidEnv = fakeCLIEnvironment(readProfiles: { [enabled] }, writeProfile: { _ in wroteOnInvalid = true; return true })
-        guard SyncTrayCLI.execute(["profile", "set", enabled.shortId, "syncMode", "bogus"], env: invalidEnv) != 0, !wroteOnInvalid else {
+        guard SyncTrayCLI.execute(["profile", "set", enabled.shortId, "syncDirection", "bogus"], env: invalidEnv) != 0, !wroteOnInvalid else {
             return report("AC-CLI8", "cli-profile-set-and-show", false, "(invalid profile set value still wrote the file)")
         }
 
@@ -1202,7 +1203,7 @@ enum ConfigSelfTest {
         var stdoutOutput = ""
         let profilesEnv = fakeCLIEnvironment(readProfiles: { all }, stdout: { stdoutOutput += $0 })
         _ = SyncTrayCLI.run(.profiles, env: profilesEnv)
-        for expected in [workProfile.name, workProfile.shortId, workProfile.syncMode.rawValue, "enabled=true", workProfile.rcloneRemote] {
+        for expected in [workProfile.name, workProfile.shortId, "enabled=true", workProfile.rcloneRemote] {
             guard stdoutOutput.contains(expected) else {
                 return report("AC-CLI3", "cli-resolve-and-list", false, "(profiles output missing \"\(expected)\")")
             }

@@ -287,24 +287,19 @@ enum SyncLogPatterns {
 
     /// Patterns indicating sync has started
     static func isSyncStarted(_ message: String) -> Bool {
-        let lower = message.lowercased()
-        return lower.contains("starting bisync") || lower.contains("starting sync")
+        message.lowercased().contains("starting sync")
     }
 
     /// Patterns indicating sync completed successfully
     static func isSyncCompleted(_ message: String) -> Bool {
         let lower = message.lowercased()
-        return lower.contains("bisync successful") ||
-               lower.contains("completed successfully") ||
+        return lower.contains("completed successfully") ||
                lower.contains("sync complete")
     }
 
     /// Patterns indicating sync failed
     static func isSyncFailed(_ message: String) -> Bool {
-        let lower = message.lowercased()
-        return lower.contains("bisync failed") ||
-               lower.contains("failed with exit code") ||
-               lower.contains("failed to bisync")
+        message.lowercased().contains("failed with exit code")
     }
 
     /// Patterns indicating drive not mounted
@@ -328,40 +323,20 @@ enum SyncLogPatterns {
         message.lowercased().contains("unreachable, skipping")
     }
 
-    /// Error pattern that triggers automatic recovery via --resync.
-    /// Matches the canonical bisync "out of sync" messages that require --resync.
-    /// NOTE: Do NOT match bare "--resync" as a substring — rclone error output from a
-    /// *failed* resync can itself contain "--resync" at critical level, which would
-    /// re-trigger auto-fix and create a feedback loop.
-    /// NOTE: "cannot find prior listing" is the full rclone phrase; matching only the
-    /// "cannot find prior" prefix would also catch unrelated rclone warnings.
-    static func isOutOfSyncError(_ message: String) -> Bool {
-        message.contains("out of sync") ||
-        message.contains("resync to recover") ||
-        message.contains("cannot find prior listing")
-    }
-
     // MARK: - Error Categorization
 
-    /// Transient "all files changed" error that should be ignored.
-    /// This is expected after a `--resync` and resolves on the next sync.
+    /// Transient "all files changed" safety-abort error that should be ignored.
+    /// rclone aborts a sync that looks like it would change every file (e.g. a
+    /// clock/timezone shift making every mtime appear different) rather than
+    /// risk a mass unwanted overwrite; this resolves on the next sync.
     static func isTransientAllFilesChangedError(_ message: String) -> Bool {
         message.contains("all files were changed") || message.contains("Safety abort")
     }
 
-    /// Generic messages that don't provide useful error info
-    static func isGenericAbortMessage(_ message: String) -> Bool {
-        message.contains("Bisync aborted") || message.contains("Failed to bisync")
-    }
-
     /// Critical/actionable errors that tell the user what to do
     static func isCriticalError(_ message: String) -> Bool {
-        message.contains("out of sync") ||
-        message.contains("resync") ||
         message.contains("critical") ||
         message.contains("lock file") ||
-        message.contains("check file") ||
-        message.contains("Access test failed") ||
         message.contains("Failed to initialise") ||
         message.contains("malformed rule")
     }
@@ -370,22 +345,7 @@ enum SyncLogPatterns {
 
     /// Prefixes to strip from error messages for cleaner display
     static func cleanErrorMessage(_ message: String) -> String {
-        var cleaned = message
-
-        // Strip common prefixes
-        let prefixes = [
-            "Bisync critical error: ",
-            "Bisync aborted. ",
-        ]
-
-        for prefix in prefixes {
-            if let range = cleaned.range(of: prefix) {
-                cleaned = String(cleaned[range.upperBound...])
-                break
-            }
-        }
-
-        return cleaned
+        message
     }
 
     // MARK: - Transport Detection
@@ -409,7 +369,7 @@ enum SyncLogPatterns {
 
     // MARK: - Exit Code Extraction
 
-    /// Extract exit code from a failure message like "Bisync failed with exit code 1"
+    /// Extract exit code from a failure message like "Sync failed with exit code 1"
     static func extractExitCode(from message: String) -> Int? {
         let pattern = #"exit code (\d+)"#
         guard let regex = try? NSRegularExpression(pattern: pattern),

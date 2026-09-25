@@ -174,7 +174,7 @@ final class LogParser {
 
         // A scheduled run that exited early after failing the pre-flight
         // reachability check. This closes the sync span/state that
-        // `syncStarted` ("Starting bisync") opened moments earlier; without it
+        // `syncStarted` ("Starting sync") opened moments earlier; without it
         // the profile stays stuck in `.syncing` until the next run.
         if SyncLogPatterns.isSyncSkipped(message) {
             return .syncSkipped(reason: "remote_unreachable")

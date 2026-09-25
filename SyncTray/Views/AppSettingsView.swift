@@ -5,7 +5,6 @@ struct AppSettingsView: View {
 
     @State private var debugLogging = SyncTraySettings.debugLoggingEnabled
     @State private var telemetryEnabled = SyncTraySettings.telemetryEnabled
-    @State private var autoFixSyncIssues = SyncTraySettings.autoFixSyncIssues
     @State private var showingTelemetryDetails: Bool = false
     @State private var rcloneVersion: String?
 
@@ -25,14 +24,6 @@ struct AppSettingsView: View {
                 GroupBox("Privacy") {
                     VStack(alignment: .leading, spacing: 12) {
                         telemetryToggle
-                    }
-                    .padding(4)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                }
-
-                GroupBox("Sync") {
-                    VStack(alignment: .leading, spacing: 12) {
-                        autoFixToggle
                     }
                     .padding(4)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -133,24 +124,6 @@ struct AppSettingsView: View {
         }
         .sheet(isPresented: $showingTelemetryDetails) {
             TelemetryDetailsSheet()
-        }
-    }
-
-    // MARK: - Sync
-
-    private var autoFixToggle: some View {
-        Toggle(isOn: $autoFixSyncIssues) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text("Automatically recover from sync conflicts")
-                Text("Runs --resync when bisync detects out-of-sync state. Recommended.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-        }
-        .onChange(of: autoFixSyncIssues) { newValue in
-            SyncTraySettings.autoFixSyncIssues = newValue
-            TelemetryService.shared.recordSettingChanged(name: "auto_fix", enabled: newValue)
-            syncManager.refreshSettingsFile()
         }
     }
 

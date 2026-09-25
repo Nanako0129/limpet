@@ -144,8 +144,8 @@ enum RemoteProvider: String, Codable, CaseIterable, Identifiable {
                 // Disable remote shell hash verification by default.
                 // rclone otherwise runs `md5sum <path>` via SSH; on Synology and similar systems
                 // SFTP exposes shares via bind-mount paths (e.g., /Kaiju) but the real filesystem
-                // requires /volume1/Kaiju, so md5sum fails and bisync aborts with "corrupted on transfer".
-                // Falling back to size+modtime comparison is sufficient for bisync.
+                // requires /volume1/Kaiju, so md5sum fails and sync aborts with "corrupted on transfer".
+                // Falling back to size+modtime comparison is sufficient.
                 ProviderField(key: "disable_hashcheck", label: "Disable Hash Check",
                               type: .hidden, defaultValue: "true")
             ]

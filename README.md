@@ -6,7 +6,7 @@
 
 <p align="center">
   <strong>Google Drive-style folder sync for any cloud</strong><br>
-  A native macOS menu bar app with two sync modes: two-way sync and one-way backup.
+  A native macOS menu bar app for one-way background folder sync.
 </p>
 
 <p align="center">
@@ -32,33 +32,20 @@ SyncTray brings the convenience of Google Drive or Dropbox sync to **any cloud s
 Instead of running complex terminal commands, SyncTray gives you:
 
 - A **menu bar icon** showing sync status at a glance
-- **Two sync modes** to match your workflow
+- **One-way sync**, upload or download, to match your workflow
 - **Automatic scheduled syncing** that runs in the background
 - **Real-time notifications** when files change
 - **Multiple sync profiles** for different folders/remotes
 
 ---
 
-## Sync Modes
+## Sync Mode
 
-SyncTray offers two ways to connect your files to the cloud:
+SyncTray syncs one-way. Choose your direction:
 
 | Mode              | Best For              | How It Works                             |
 | ----------------- | ---------------------- | ----------------------------------------- |
-| **Two-Way Sync**  | Active working files  | Changes on either side sync to the other  |
 | **One-Way Sync**  | Backups & mirrors     | Source overwrites destination             |
-
-<p align="center">
-  <img src="/docs/assets/profile-two-way.png" alt="Two-Way Sync Configuration" height="600">
-</p>
-
-### Two-Way Sync (Bisync)
-
-Perfect for files you actively edit on multiple devices. Uses rclone's bisync to keep both sides synchronized.
-
-- Edit a file locally → syncs to cloud
-- Edit on another device → syncs back down
-- Conflicts are resolved automatically (newer wins, old version backed up)
 
 ### One-Way Sync
 
@@ -127,7 +114,7 @@ Configure an alternative remote that activates automatically when the primary is
 
 - **Automatic failover**: Each sync checks if the primary remote is reachable (3-second timeout)
 - **Transparent switching**: Menu bar shows which transport is active (wifi icon = primary, antenna icon = fallback)
-- **Bisync cache preservation**: When the fallback uses the same directory structure, env var overrides swap the transport without invalidating rclone's bisync cache
+- **Transport-preserving switch**: When the fallback uses the same directory structure, env var overrides swap the transport in place, without a full remote reconfiguration
 - **Flexible path mapping**: Supports fallback remotes with different path structures (e.g., SMB share root vs SFTP filesystem path)
 
 ### One-Click Actions
@@ -260,14 +247,6 @@ When syncing to an external drive:
 3. Syncs pause when the drive is unmounted
 4. Resume automatically when reconnected
 
-### Resync (Reset Sync State)
-
-If sync gets out of sync or shows persistent errors:
-
-1. Open Settings → Select the profile
-2. Click **Resync**
-3. This resets rclone's bisync cache and performs a fresh comparison
-
 ### Fallback Remote Setup
 
 If your primary remote is only accessible on a local network (e.g., Synology NAS via SMB or WebDAV), you can configure a fallback that kicks in when you're away:
@@ -294,22 +273,14 @@ Or with different path structures:
 
 The sync script automatically tries the primary first. If unreachable within 3 seconds, it falls back transparently. The menu bar shows which transport was used (wifi = primary, antenna = fallback).
 
-### Conflict Resolution
-
-SyncTray uses rclone bisync with smart conflict handling:
-
-- Newer file wins by default
-- Conflicts create backup copies with `-sync-conflict-` suffix
-- Check the log file for conflict details
-
 ### File-Backed Configuration
 
 `~/.config/synctray/` is the editable, authoritative home for SyncTray's config. A human or a script can hand-edit these files and the running app applies the change live, no restart needed.
 
 | Path | Contents |
 | ---- | -------- |
-| `profiles/{id}.profile.json` | The full profile: paths, remote, sync mode, offline folders, enable/mute state |
-| `settings.json` | App settings: launch at login, telemetry, debug logging, auto-fix |
+| `profiles/{id}.profile.json` | The full profile: paths, remote, sync direction, enable/mute state |
+| `settings.json` | App settings: launch at login, telemetry, debug logging |
 | `schema/*.schema.json` | JSON Schemas for validating the files above |
 
 - **Live apply**: a file watcher (~1s debounce) reconciles every external edit through the same path as the app's Save button — an enabled/disabled toggle installs or removes the launchd agent, a warm-field edit re-warms offline folders.
@@ -326,7 +297,7 @@ SyncTray installs a `synctray` shim at `~/.local/bin/synctray` on every launch. 
 | ------- | ------- |
 | `synctray doctor` | Health report: rclone version, schemas installed, per-profile agent state, stale locks, remote reachability. Exits non-zero on any failure. |
 | `synctray status [name\|id]` | One line per profile: enabled, agent loaded, running, last result. |
-| `synctray profiles` | List every profile with mode, enabled state, and remote (no secrets). |
+| `synctray profiles` | List every profile with enabled state and remote (no secrets). |
 | `synctray logs <name\|id> [--follow]` | Print or tail a profile's sync log. |
 | `synctray test-remote <name\|id>` | Probe a profile's remote with a hard timeout. |
 | `synctray listremotes` | Passthrough to `rclone listremotes`. |
@@ -379,8 +350,7 @@ xattr -cr /Applications/SyncTray.app
 1. Click **View Log** in the menu to see detailed error messages
 2. Common issues:
    - Remote not accessible (check network/credentials)
-   - Too many deletes detected — a safety limit that blocks accidental mass deletion (use **Fix Sync Issues**, or **Force Sync** if the deletion is intentional)
-   - Conflicting changes detected (check log for details)
+   - Transient network/timeout error (use **Retry Sync**)
 
 ### Sync not running on schedule
 

@@ -130,7 +130,7 @@ enum SyncTrayCLI {
       sync <name|id>                          Run a sync now and wait for it to finish
 
     profile set keys: name, rcloneRemote, remotePath, localSyncPath,
-      drivePathToMonitor, additionalRcloneFlags, syncMode (bisync|sync),
+      drivePathToMonitor, additionalRcloneFlags,
       syncDirection (localToRemote|remoteToLocal), syncIntervalMinutes,
       fallbackRemote, fallbackRemotePath, isMuted. Use enable/disable for isEnabled.
 
@@ -525,7 +525,7 @@ enum SyncTrayCLI {
         }
         for profile in profiles {
             env.stdout(
-                "\(profile.name)\t\(profile.shortId)\t\(profile.syncMode.rawValue)"
+                "\(profile.name)\t\(profile.shortId)"
                     + "\tenabled=\(profile.isEnabled)\tremote=\(profile.rcloneRemote)\n"
             )
         }
@@ -900,11 +900,6 @@ enum SyncTrayCLI {
             profile.isMuted = b
 
         // Enums.
-        case "syncMode":
-            guard let m = SyncMode(rawValue: value) else {
-                return "syncMode must be one of: \(SyncMode.allCases.map(\.rawValue).joined(separator: "|"))"
-            }
-            profile.syncMode = m
         case "syncDirection":
             guard let d = SyncDirection(rawValue: value) else {
                 return "syncDirection must be one of: \(SyncDirection.allCases.map(\.rawValue).joined(separator: "|"))"
@@ -964,7 +959,7 @@ extension CLIEnvironment {
                 let (exit, _) = CLIEnvironment.runProcess(
                     launchPath: "/bin/bash",
                     args: [SyncProfile.sharedScriptPath, configPath],
-                    timeout: 3600  // a large repo's first bisync can run for minutes
+                    timeout: 3600  // a large repo's first sync can run for minutes
                 )
                 return exit
             },

@@ -10,7 +10,7 @@ final class SyncSetupService {
 
     /// Legacy access-check file name.
     ///
-    /// SyncTray no longer uses rclone bisync's `--check-access` (which required a
+    /// SyncTray no longer uses rclone's `--check-access` (which required a
     /// sentinel file to be uploaded to the remote). Access is now verified by a
     /// read-only pre-flight in the sync script that mutates nothing. This constant
     /// is retained only so leftover files from older versions can be cleaned up.
@@ -185,41 +185,8 @@ final class SyncSetupService {
             try? fm.removeItem(atPath: profile.lockFilePath)
         }
 
-        // Clean up rclone bisync cache files (listings, locks)
-        cleanupBisyncCache(for: profile)
-
         // Note: We don't remove the shared script as other profiles may use it
         // Note: We don't remove log files to preserve history
-    }
-
-    /// Remove rclone bisync cache files for a profile (listing files, lock files)
-    private func cleanupBisyncCache(for profile: SyncProfile) {
-        let cacheDir = (("~/Library/Caches/rclone/bisync" as NSString).expandingTildeInPath)
-        let fm = FileManager.default
-
-        guard fm.fileExists(atPath: cacheDir) else { return }
-
-        // Build the base name that rclone uses for cache files
-        // Format: {remote}_{remotePath}..{localPath}
-        let remote = "\(profile.rcloneRemote)_\(profile.remotePath)"
-            .replacingOccurrences(of: ":", with: "_")
-            .replacingOccurrences(of: "/", with: "_")
-
-        var localPath = profile.localSyncPath
-        if localPath.hasPrefix("/") {
-            localPath = String(localPath.dropFirst())
-        }
-        let local = localPath.replacingOccurrences(of: "/", with: "_")
-
-        let baseName = "\(remote)..\(local)"
-
-        // Find and remove all files matching this profile's base name
-        if let files = try? fm.contentsOfDirectory(atPath: cacheDir) {
-            for file in files where file.hasPrefix(baseName) {
-                let fullPath = (cacheDir as NSString).appendingPathComponent(file)
-                try? fm.removeItem(atPath: fullPath)
-            }
-        }
     }
 
     /// Reload the launchd agent for a profile
@@ -261,7 +228,7 @@ final class SyncSetupService {
     /// Best-effort, recursive removal of the legacy `.synctray-check` access-check file
     /// from the local and remote trees (root and all nested directories).
     ///
-    /// SyncTray previously uploaded this sentinel so rclone bisync's `--check-access`
+    /// SyncTray previously uploaded this sentinel so rclone's `--check-access`
     /// could verify both sides were mounted. That mechanism has been replaced by a
     /// read-only pre-flight in the sync script, so the file is now obsolete. SyncTray
     /// only ever wrote one at each root, but we scan the whole tree to also catch any
@@ -316,35 +283,6 @@ final class SyncSetupService {
         }
     }
 
-    /// Checks if listing files exist for this profile's path combination
-    func hasExistingListings(for profile: SyncProfile) -> Bool {
-        let cacheDir = (("~/Library/Caches/rclone/bisync" as NSString).expandingTildeInPath)
-
-        // Build the path hash that rclone uses for listing filenames
-        // rclone format: {remote}_{remotePath}..{localPath} with / replaced by _ and leading _ removed
-        let remote = "\(profile.rcloneRemote)_\(profile.remotePath)"
-            .replacingOccurrences(of: ":", with: "_")
-            .replacingOccurrences(of: "/", with: "_")
-
-        // Remove leading slash before replacing to match rclone's format
-        var localPath = profile.localSyncPath
-        if localPath.hasPrefix("/") {
-            localPath = String(localPath.dropFirst())
-        }
-        let local = localPath.replacingOccurrences(of: "/", with: "_")
-
-        let baseName = "\(remote)..\(local)"
-
-        // Only check for .lst files (not .lst-new which are incomplete/partial)
-        // The .lst files are only created after a successful bisync completes
-        let listingPath1 = (cacheDir as NSString).appendingPathComponent("\(baseName).path1.lst")
-        let listingPath2 = (cacheDir as NSString).appendingPathComponent("\(baseName).path2.lst")
-
-        let fm = FileManager.default
-        // Both listing files must exist for sync to work without --resync
-        return fm.fileExists(atPath: listingPath1) && fm.fileExists(atPath: listingPath2)
-    }
-
     // MARK: - Legacy Methods (for backward compatibility during migration)
 
     /// Check if the legacy single-profile scheduled sync is installed
@@ -379,13 +317,11 @@ final class SyncSetupService {
     // MARK: - Script Generation
 
     /// Generate the shared sync script that reads config from JSON
-    /// Supports bisync (two-way) and sync (one-way) modes
     private func generateSyncScript() -> String {
         return """
             #!/bin/bash
             # SyncTray Sync Script
             # This script reads profile configuration from a JSON file
-            # Supports bisync (two-way) and sync (one-way) modes
             # DO NOT EDIT - This file is managed by SyncTray
 
             export PATH="/usr/sbin:/usr/bin:/bin:$PATH"
@@ -409,7 +345,6 @@ final class SyncSetupService {
             DRIVE_PATH=$(parse_json "drivePath" "")
             ADDITIONAL_FLAGS=$(parse_json "additionalFlags" "")
             FILTER_FILE=$(parse_json "filterPath" "")
-            SYNC_MODE=$(parse_json "syncMode" "bisync")
             SYNC_DIRECTION=$(parse_json "syncDirection" "localToRemote")
             FALLBACK_REMOTE=$(parse_json "fallbackRemote" "")
             FALLBACK_PATH=$(parse_json "fallbackRemotePath" "")
@@ -538,7 +473,6 @@ final class SyncSetupService {
 
                     if [[ -z "$FALLBACK_PATH" && "$FALLBACK_REQUIRES_CACHE_REBUILD" != "true" && "$FALLBACK_REQUIRES_CACHE_REBUILD" != "True" ]]; then
                         # Same remote name preserved: use env var overrides to swap transport.
-                        # This preserves bisync's listing cache since the remote name stays the same.
                         UPPER_NAME=$(echo "$REMOTE_NAME" | tr '[:lower:]' '[:upper:]' | tr '-' '_')
                         eval "$($RCLONE_BIN config dump 2>/dev/null | python3 -c "
             import json, sys
@@ -550,7 +484,6 @@ final class SyncSetupService {
             ")"
                     else
                         # Different wire type OR explicit path change: swap entire REMOTE reference.
-                        # bisync will rebuild listings on first switch (~12s for 85K files).
                         REMOTE="${FALLBACK_REMOTE}:${FALLBACK_PATH:-$REMOTE_PATH}"
                     fi
                 else
@@ -558,75 +491,15 @@ final class SyncSetupService {
                 fi
             fi
 
-            # Build rclone command based on sync mode
-            if [[ "$SYNC_MODE" == "bisync" ]]; then
-                # Two-way bidirectional sync
-                echo "$(date '+%Y-%m-%d %H:%M:%S') - Starting bisync" >> "$LOG_FILE"
-
-                # Read-only pre-flight reachability check. This replaces the old
-                # --check-access mechanism, which required uploading a .synctray-check
-                # sentinel to the remote. We now verify the remote is reachable WITHOUT
-                # writing anything: if it is offline we skip this run (exit 0) rather than
-                # risk bisync acting on a phantom-empty listing, and retry next interval.
-                #
-                # We probe the remote ROOT (not the sync subpath) so a not-yet-created
-                # path on a freshly configured profile does not cause a false skip — the
-                # first run still reaches bisync and self-bootstraps via --resync.
-                #
-                # Catastrophic mass-deletion (a reachable-but-wiped side) remains guarded
-                # by bisync's own --max-delete (default 50%), which aborts with a "too
-                # many deletes" error instead of propagating the deletion.
-                PREFLIGHT_REMOTE_NAME="${REMOTE%%:*}"
-                if ! run_with_timeout 45 $RCLONE_BIN lsd "${PREFLIGHT_REMOTE_NAME}:" --max-depth 0 --contimeout 10s --timeout 30s --retries 1 --low-level-retries 1 $NO_CHECK_CERT &>/dev/null; then
-                    echo "$(date '+%Y-%m-%d %H:%M:%S') - Remote unreachable, skipping sync (will retry next interval)" >> "$LOG_FILE"
-                    exit 0
-                fi
-
-                # Self-bootstrap: if this (remote, local) pair has no prior bisync
-                # listings, bisync would abort with "cannot find prior Path1/Path2
-                # listings". That happens on the FIRST run against a new transport
-                # pair (e.g. first fallback activation after a REMOTE swap, or a
-                # brand-new profile). Run that first sync as --resync with
-                # newer-wins so failover works unattended (no app required) and a
-                # stale remote copy can never overwrite newer local edits.
-                #
-                # Session name mirrors rclone's bilib.SessionName/CanonicalPath:
-                # trim leading/trailing slashes, replace whitespace and /:?* with
-                # "_", join path1..path2. (Backslashes, which rclone also replaces,
-                # cannot occur in macOS paths or these remote names.)
-                # A pair counts as having state when a .lst OR .lst-new listing
-                # exists for BOTH sides — bisync --recover resumes from .lst-new.
-                BISYNC_WORKDIR="$HOME/Library/Caches/rclone/bisync"
-                SESSION_NAME=$(python3 -c "
-            import sys
-            def canon(p):
-                p = p.strip('/')
-                return ''.join('_' if (ch.isspace() or ch in '/:?*') else ch for ch in p)
-            print(canon(sys.argv[1]) + '..' + canon(sys.argv[2]))
-            " "$REMOTE" "$LOCAL_PATH")
-                BOOTSTRAP_FLAGS=""
-                if [[ ! -e "$BISYNC_WORKDIR/$SESSION_NAME.path1.lst" && ! -e "$BISYNC_WORKDIR/$SESSION_NAME.path1.lst-new" ]] \\
-                    || [[ ! -e "$BISYNC_WORKDIR/$SESSION_NAME.path2.lst" && ! -e "$BISYNC_WORKDIR/$SESSION_NAME.path2.lst-new" ]]; then
-                    echo "$(date '+%Y-%m-%d %H:%M:%S') - Bootstrapping sync state (--resync, newer wins): first run for this transport pair" >> "$LOG_FILE"
-                    BOOTSTRAP_FLAGS="--resync --resync-mode newer"
-                fi
-
-                RCLONE_CMD="$RCLONE_BIN bisync \\"$REMOTE\\" \\"$LOCAL_PATH\\" --verbose --use-json-log --stats 2s --filter-from \\"$FILTER_FILE\\" --resilient --recover --conflict-resolve newer --conflict-loser num --conflict-suffix sync-conflict-{DateOnly}-"
-
-                if [[ -n "$BOOTSTRAP_FLAGS" ]]; then
-                    RCLONE_CMD="$RCLONE_CMD $BOOTSTRAP_FLAGS"
-                fi
+            # One-way sync
+            if [[ "$SYNC_DIRECTION" == "localToRemote" ]]; then
+                # Local is source, remote is destination (backup/upload)
+                echo "$(date '+%Y-%m-%d %H:%M:%S') - Starting sync (local → remote)" >> "$LOG_FILE"
+                RCLONE_CMD="$RCLONE_BIN sync \\"$LOCAL_PATH\\" \\"$REMOTE\\" --verbose --use-json-log --stats 2s --filter-from \\"$FILTER_FILE\\""
             else
-                # One-way sync
-                if [[ "$SYNC_DIRECTION" == "localToRemote" ]]; then
-                    # Local is source, remote is destination (backup/upload)
-                    echo "$(date '+%Y-%m-%d %H:%M:%S') - Starting sync (local → remote)" >> "$LOG_FILE"
-                    RCLONE_CMD="$RCLONE_BIN sync \\"$LOCAL_PATH\\" \\"$REMOTE\\" --verbose --use-json-log --stats 2s --filter-from \\"$FILTER_FILE\\""
-                else
-                    # Remote is source, local is destination (download/mirror)
-                    echo "$(date '+%Y-%m-%d %H:%M:%S') - Starting sync (remote → local)" >> "$LOG_FILE"
-                    RCLONE_CMD="$RCLONE_BIN sync \\"$REMOTE\\" \\"$LOCAL_PATH\\" --verbose --use-json-log --stats 2s --filter-from \\"$FILTER_FILE\\""
-                fi
+                # Remote is source, local is destination (download/mirror)
+                echo "$(date '+%Y-%m-%d %H:%M:%S') - Starting sync (remote → local)" >> "$LOG_FILE"
+                RCLONE_CMD="$RCLONE_BIN sync \\"$REMOTE\\" \\"$LOCAL_PATH\\" --verbose --use-json-log --stats 2s --filter-from \\"$FILTER_FILE\\""
             fi
 
             if [[ -n "$NO_CHECK_CERT" ]]; then
@@ -643,17 +516,9 @@ final class SyncSetupService {
             EXIT_CODE=${PIPESTATUS[0]}
 
             if [[ $EXIT_CODE -eq 0 ]]; then
-                if [[ "$SYNC_MODE" == "bisync" ]]; then
-                    echo "$(date '+%Y-%m-%d %H:%M:%S') - Bisync completed successfully" >> "$LOG_FILE"
-                else
-                    echo "$(date '+%Y-%m-%d %H:%M:%S') - Sync completed successfully" >> "$LOG_FILE"
-                fi
+                echo "$(date '+%Y-%m-%d %H:%M:%S') - Sync completed successfully" >> "$LOG_FILE"
             else
-                if [[ "$SYNC_MODE" == "bisync" ]]; then
-                    echo "$(date '+%Y-%m-%d %H:%M:%S') - Bisync failed with exit code $EXIT_CODE" >> "$LOG_FILE"
-                else
-                    echo "$(date '+%Y-%m-%d %H:%M:%S') - Sync failed with exit code $EXIT_CODE" >> "$LOG_FILE"
-                fi
+                echo "$(date '+%Y-%m-%d %H:%M:%S') - Sync failed with exit code $EXIT_CODE" >> "$LOG_FILE"
             fi
 
             echo "" >> "$LOG_FILE"
@@ -661,7 +526,7 @@ final class SyncSetupService {
     }
 
     /// Returns true when primary and fallback remotes have different rclone wire types,
-    /// meaning the bisync cache must be rebuilt on fallback activation.
+    /// meaning the sync script must swap the full remote reference on fallback activation.
     /// Uses rcloneType (e.g. "webdav", "smb", "sftp") so that .synology and .webdav
     /// (both wire type "webdav") are treated as compatible.
     ///
@@ -704,7 +569,6 @@ final class SyncSetupService {
             "additionalFlags": profile.additionalRcloneFlags,
             "filterPath": profile.filterFilePath,
             "syncIntervalMinutes": profile.syncIntervalMinutes,
-            "syncMode": profile.syncMode.rawValue,
             "syncDirection": profile.syncDirection.rawValue,
             "fallbackRemote": profile.fallbackRemote,
             "fallbackRemotePath": profile.fallbackRemotePath,

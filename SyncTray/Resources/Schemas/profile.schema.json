@@ -37,7 +37,7 @@
     "syncIntervalMinutes": {
       "type": "integer",
       "minimum": 1,
-      "description": "Minutes between scheduled syncs (sync/bisync modes)."
+      "description": "Minutes between scheduled syncs."
     },
     "additionalRcloneFlags": {
       "type": "string",
@@ -51,15 +51,10 @@
       "type": "boolean",
       "description": "Whether file-change notifications are muted for this profile."
     },
-    "syncMode": {
-      "type": "string",
-      "enum": ["bisync", "sync"],
-      "description": "Two-way sync or one-way sync."
-    },
     "syncDirection": {
       "type": "string",
       "enum": ["localToRemote", "remoteToLocal"],
-      "description": "Direction for one-way sync mode."
+      "description": "Direction for one-way sync."
     },
     "fallbackRemote": {
       "type": "string",

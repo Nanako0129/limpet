@@ -5,7 +5,7 @@ import Foundation
 /// external agent or human, the same way `{shortId}.profile.json` mirrors a
 /// profile.
 ///
-/// Only the four keys in `SafeKey` are ever written. Adding a new key is an
+/// Only the three keys in `SafeKey` are ever written. Adding a new key is an
 /// explicit, reviewable opt-in — never derived automatically from
 /// `SyncTraySettings`' full key set — so secrets (`installationId`,
 /// `anonymousUserId`) and any other sensitive key can never leak into the file
@@ -14,7 +14,6 @@ enum AppSettingsFileStore {
     /// Enumerated safe-key allowlist. Each case is a key this file may mirror.
     enum SafeKey: String, CaseIterable {
         case debugLoggingEnabled
-        case autoFixSyncIssues
         case telemetryEnabled
         case launchAtLogin
     }
@@ -37,7 +36,6 @@ enum AppSettingsFileStore {
     static func currentSafeSettings(isLoginItemEnabled: Bool) -> [SafeKey: Bool] {
         [
             .debugLoggingEnabled: SyncTraySettings.debugLoggingEnabled,
-            .autoFixSyncIssues: SyncTraySettings.autoFixSyncIssues,
             .telemetryEnabled: SyncTraySettings.telemetryEnabled,
             .launchAtLogin: isLoginItemEnabled,
         ]
