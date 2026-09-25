@@ -245,7 +245,7 @@ When syncing to an external drive:
 | Path | Contents |
 | ---- | -------- |
 | `profiles/{id}.profile.json` | The full profile: paths, remote, sync direction, enable/mute state |
-| `settings.json` | App settings: launch at login, telemetry, debug logging |
+| `settings.json` | App settings: launch at login, debug logging |
 | `schema/*.schema.json` | JSON Schemas for validating the files above |
 
 - **Live apply**: a file watcher (~1s debounce) reconciles every external edit through the same path as the app's Save button — an enabled/disabled toggle installs or removes the launchd agent, a warm-field edit re-warms offline folders.

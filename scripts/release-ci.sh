@@ -11,7 +11,6 @@
 #   IS_BETA             - "true" | "false"
 #   GITHUB_TOKEN        - For `gh release create`
 #   HOMEBREW_TAP_TOKEN  - PAT with repo scope on mthines/homebrew-synctray
-#   DASH0_AUTH_TOKEN    - Embedded into the Release build (optional but warns if missing)
 #
 # Optional env:
 #   PR_NUMBER           - Required when IS_BETA=true
@@ -47,10 +46,6 @@ cd "$PROJECT_DIR"
 
 log_info "CI release ${TAG} (beta=${IS_BETA})"
 
-if [ -z "${DASH0_AUTH_TOKEN:-}" ]; then
-  log_warning "DASH0_AUTH_TOKEN not set — telemetry token will not be embedded"
-fi
-
 # =============================================================================
 # Build Release .app
 # =============================================================================
@@ -64,7 +59,6 @@ xcodebuild -project "$XCODEPROJ" \
   clean build \
   ONLY_ACTIVE_ARCH=NO \
   CODE_SIGNING_ALLOWED=NO \
-  DASH0_AUTH_TOKEN="${DASH0_AUTH_TOKEN:-}" \
   | tail -20
 
 APP_PATH="$BUILD_DIR/DerivedData/Build/Products/Release/${PROJECT_NAME}.app"

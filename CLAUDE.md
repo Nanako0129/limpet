@@ -59,17 +59,16 @@ SyncTray/
 | `DirectoryWatcher.swift` | FSEvents-based directory monitoring with debouncing |
 | `ConfigFileWatcher.swift` | FSEvents watcher on `~/.config/synctray` for external profile/settings edits; self-write suppression via `ConfigSelfWriteRegistry` |
 | `ConfigReconciler.swift` | `SyncManager.reconcileAction` (shared launchd install/uninstall/reinstall delta logic) and `SyncManager.applyExternalCreateIfNeeded`/`ExternalCreateOutcome` (create-from-file decision) |
-| `AppSettingsFileStore.swift` | Reads/writes `~/.config/synctray/settings.json` — an enumerated safe-key mirror of `SyncTraySettings` (no secrets, no telemetry IDs) |
+| `AppSettingsFileStore.swift` | Reads/writes `~/.config/synctray/settings.json` — an enumerated safe-key mirror of `SyncTraySettings` |
 | `ConfigSchemaInstaller.swift` | Copies the committed JSON Schemas into `~/.config/synctray/schema/` at launch |
 | `ConfigSelfTest.swift` | `#if DEBUG` host self-test suite (`SyncTray --self-test`) — round-trip, migration + migration-integrity, reconcile-delta, self-write, isolated-login, external-create, and CLI assertions |
 | `NotificationService.swift` | Batched macOS notifications with action support |
-| `TelemetryService.swift` | Opt-in OTel telemetry (traces, metrics, logs) via OTLP/HTTP |
 
 ### CLI/
 
 | File | Purpose |
 |------|---------|
-| `SyncTrayCLI.swift` | Headless `synctray` CLI — `CLICommand`, `parse`/`execute`/`run` (pure over `CLIEnvironment`), `doctorChecks`, `resolveProfile`, `applyProfileAssignment` (bounded `profile set` key set); mutating commands (`profile create`/`show`/`set`/`enable`/`disable`/`delete`, `sync`, `install`/`reinstall`) drive `ProfileStore.writeProfileFile` + `SyncSetupService`; `runMeasured` records one `synctray.cli.invoked` event + flushes; dispatched from `SyncTrayApp.init` before SwiftUI/`SyncManager` |
+| `SyncTrayCLI.swift` | Headless `synctray` CLI — `CLICommand`, `parse`/`execute`/`run` (pure over `CLIEnvironment`), `doctorChecks`, `resolveProfile`, `applyProfileAssignment` (bounded `profile set` key set); mutating commands (`profile create`/`show`/`set`/`enable`/`disable`/`delete`, `sync`, `install`/`reinstall`) drive `ProfileStore.writeProfileFile` + `SyncSetupService`; dispatched from `SyncTrayApp.init` before SwiftUI/`SyncManager` |
 | `CLIShimInstaller.swift` | Writes/refreshes the `~/.local/bin/synctray` shim on every launch; marker-guarded so it never clobbers a non-SyncTray file |
 
 ### File-Backed Configuration
@@ -82,7 +81,7 @@ running app applies the change live, without a restart.
 |------|----------|-------|
 | `profiles/{shortId}.profile.json` | Full `SyncProfile`, including `isEnabled`, `isMuted` | NEW authoritative file. Written by `ProfileStore.save()` (encodes the whole model, so any new `SyncProfile` field flows in automatically); read by `ProfileStore.load()` (file-authoritative). References `../schema/profile.schema.json` via `$schema`. |
 | `profiles/{shortId}.json` | Derived, script-only subset (frozen key set) | Unchanged, byte-for-byte — this is `SyncSetupService.generateProfileConfig`'s output, consumed only by the sync shell script. The app never reads it back. |
-| `settings.json` | Enumerated safe subset of `SyncTraySettings` (`debugLoggingEnabled`, `telemetryEnabled`, `launchAtLogin`) | Written by `AppSettingsFileStore`. Never contains secrets or telemetry identifiers (`installationId`, `anonymousUserId`). |
+| `settings.json` | Enumerated safe subset of `SyncTraySettings` (`debugLoggingEnabled`, `launchAtLogin`) | Written by `AppSettingsFileStore`. |
 | `schema/profile.schema.json`, `schema/settings.schema.json` | Committed JSON Schemas | Copied out of the app bundle by `ConfigSchemaInstaller` at every launch. Kept in lockstep with `SyncProfile.CodingKeys` by the fail-closed `scripts/check-schema-in-sync.sh`, run locally and in CI. |
 
 **Live apply, not a struct swap.** A single `ConfigFileWatcher` (FSEvents,
@@ -105,8 +104,8 @@ profile is always persisted; the launchd agent is installed only when it's
 second edit. A dropped file whose basename isn't the canonical
 `{shortId}.profile.json` is rewritten to the canonical name and the original
 pruned (the canonical write notes its own hash in `ConfigSelfWriteRegistry`, so
-this can never loop). See `ConfigSelfTest`'s AC-C1–AC-C5 for the exact
-enabled/disabled/garbage/canonicalize/telemetry matrix.
+this can never loop). See `ConfigSelfTest`'s AC-C1–AC-C4 for the exact
+enabled/disabled/garbage/canonicalize matrix.
 
 **Threat model — this is a conscious acceptance, not an oversight.** Creating and
 installing a launchd agent from a dropped file is the deliberate goal: an agent or
@@ -149,14 +148,12 @@ is the separate, fail-closed schema-drift gate.
 |------|---------|
 | `MenuBarView.swift` | Menu bar dropdown with profile status, recent changes, quick actions |
 | `SettingsView.swift` | Settings window with profile list and detail editor |
-| `AppSettingsView.swift` | Global app settings — launch at login, telemetry toggle, debug logging |
+| `AppSettingsView.swift` | Global app settings — launch at login, debug logging |
 | `ProfileListView.swift` | Sidebar list of profiles with add/delete controls |
 | `StatusHeaderView.swift` | Header showing current sync state and progress |
 | `SyncProgressDetailView.swift` | Detailed per-file transfer progress during sync |
 | `RecentChangesView.swift` | List of recently synced files |
-| `TelemetryOptInBanner.swift` | Dismissable banner prompting telemetry opt-in (consent-versioned) |
-| `TelemetryDetailsSheet.swift` | Full privacy disclosure sheet — reachable from wizard, banner, and settings |
-| `SetupWizardView.swift` | New-profile creation wizard, including optional `.helpImprove` epilogue step |
+| `SetupWizardView.swift` | New-profile creation wizard |
 
 ## Agent-Editable Configuration & CLI
 
@@ -240,19 +237,11 @@ not conflicting. Profile files stay credential-free (rclone secrets live in
 
 **Dispatch and safety.** `SyncTrayCLI.dispatch` is checked at the very top of
 `SyncTrayApp.init` — before `--self-test`, before `MigrationRunner`,
-`TelemetryService.configure()`, or `SyncManager()` — and `exit()`s the process
+or `SyncManager()` — and `exit()`s the process
 before any of that runs. A CLI invocation NEVER opens a window and NEVER
 starts a background watcher or timer; `dispatch` returns `nil` (falling
 through to the normal app launch) for a bare launch and for `-`-prefixed args
 (`--self-test`, macOS's `-psn_…`), except `-h`/`--help`.
-
-**Measurable.** Every real invocation records exactly one `synctray.cli.invoked`
-counter + `CLI invoked` structured log (bounded command verb + `ok`/`error` +
-exit code + duration — never args, paths, profile names, or remotes) and flushes
-before exit (`runMeasured` → `TelemetryService.recordCLIInvocation` +
-`flushForExit`). It is gated on the user's telemetry opt-in, so a disabled CLI
-does no setup, no network, and prints nothing extra. The self-test path
-(`execute` with a fake `CLIEnvironment`) never touches telemetry.
 
 **Pure core / impure shell.** `SyncTrayCLI.parse`/`execute`/`run`/`doctorChecks`
 are pure over an injected `CLIEnvironment` (rclone invocation, profile reads +
@@ -263,10 +252,9 @@ process/filesystem/launchd touched. Every real `rclone` invocation runs through 
 hard-timeout watchdog (mirrors `RcloneLocator`'s login-shell probe), since
 SMB/WebDAV remotes can hang past their own timeouts.
 
-**Privacy.** The CLI's output goes to the invoking terminal, not telemetry —
-`test-remote`/`profiles` printing a remote name to stdout is fine; CLI mode
-never calls `TelemetryService.configure()`, so nothing from a CLI invocation
-is ever sent anywhere.
+**Privacy.** The CLI's output goes to the invoking terminal only —
+`test-remote`/`profiles` printing a remote name to stdout is fine, and nothing
+from a CLI invocation is ever sent anywhere else.
 
 ## Data Flow
 
@@ -487,39 +475,7 @@ open ~/Library/Developer/Xcode/DerivedData/SyncTray-*/Build/Products/Debug/SyncT
 | `SyncTrayCLI.swift` | Headless `synctray` CLI: inspect (`doctor`/`status`/`profiles`/`profile show`/`logs`/`test-remote`/`listremotes`), configure (`profile create`/`set`/`enable`/`disable`/`delete`, `install`/`reinstall`), operate (`sync`); dispatched from `SyncTrayApp.init` (see "Agent-Editable Configuration & CLI") |
 | `CLIShimInstaller.swift` | Installs the `~/.local/bin/synctray` shim (`~/.local/bin` must be on `PATH`) |
 | `SyncLogPatterns` | Centralized log message pattern matching (includes `isOutOfSyncError`) |
-| `TelemetryService.swift` | OTel singleton — traces, metrics, logs via OTLP/HTTP |
-| `TelemetryDetailsSheet.swift` | Shared privacy disclosure sheet for wizard, banner, and settings |
-| `Settings.swift` | Global settings including `installationId` and `anonymousUserId` |
-
-## Telemetry
-
-Anonymous, opt-in telemetry using OpenTelemetry (opentelemetry-swift 1.17.1). All methods are no-ops unless `SyncTraySettings.telemetryEnabled` is true. See `.claude/rules/telemetry.md` for the full instrumentation guide and how to add new telemetry.
-
-### Three signals
-- **Traces**: Sync lifecycle spans with real duration (start→complete/fail), mount/unmount spans
-- **Metrics**: 20 instruments — sync duration + check phase histograms, operation counters (sync, mount, file ops, contention, recovery, volume events, filter stats, offline pin/unpin), profile gauge (delta temporality, 30s export interval)
-- **Logs**: Structured log records for all key events (sync lifecycle, mount, errors, config snapshots, session heartbeat, stale lock cleanup, precondition failures)
-
-### User correlation
-- `service.instance.id` — random UUID per install (changes on reinstall)
-- `enduser.id` — HMAC-SHA256 of hardware UUID (stable across reinstalls, not reversible)
-
-### Deployment correlation
-- `service.version` — `<marketing>+<build>.g<gitSHA>` (e.g. `0.34.0+1.gabc1234`); the git SHA is injected by the `Embed Git Metadata` Xcode build phase. Primary key Dash0 uses to correlate telemetry to a release.
-- `deployment.environment.name` — `development` (DEBUG) / `production` (Release), overridable via `OTEL_RESOURCE_ATTRIBUTES`.
-- `App upgraded` log on version change between launches → Dash0 dashboard annotations.
-
-### Source correlation
-- `vcs.repository.url.full` — canonical https URL of the `origin` remote, normalised at build time (scp-style SSH converted, embedded credentials stripped, trailing `.git` dropped).
-- `vcs.ref.head.revision` — full commit SHA the binary was built from.
-- Both are injected into `Info.plist` by the `Embed Git Metadata` build phase alongside `GitCommitSHA`, and are simply absent when building from a non-git source tree. Together they let a backend resolve any signal to the exact source revision that produced it — the attribute Dash0 and agentic tooling look for to jump from a log line to the code.
-- `host.arch` — `arm64` / `amd64`, resolved at compile time so a universal binary reports the executing slice; omitted entirely on any other architecture rather than sending an undocumented value.
-
-### Privacy
-No file paths, sync remote names, or credentials in telemetry. File operations tracked by normalized extension only. Error messages categorized into low-cardinality types. Profile names are user-chosen display names, not paths. Carve-out: `vcs.repository.url.full` (the source repo's origin URL, credentials stripped at build time) is exempt — it identifies the codebase, not a user's sync destination.
-
-### Configuration
-Priority: process env vars > `~/.config/synctray/.env` > Info.plist. Key vars: `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_HEADERS`, `DASH0_AUTH_TOKEN`.
+| `Settings.swift` | Global settings (debug logging toggle) |
 
 ## Generated Files (per profile)
 

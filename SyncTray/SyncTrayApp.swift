@@ -11,7 +11,7 @@ struct SyncTrayApp: App {
         // Headless `synctray` CLI subcommands (doctor, test-remote, logs,
         // listremotes, profiles) are dispatched and exited BEFORE anything
         // else — never launches the SwiftUI app, never starts watchers/
-        // timers/telemetry. `dispatch` returns nil for `--self-test` and a
+        // timers. `dispatch` returns nil for `--self-test` and a
         // normal (no-argument) launch, so both fall through unaffected.
         if let exitCode = SyncTrayCLI.dispatch(arguments: CommandLine.arguments) {
             exit(exitCode)
@@ -31,9 +31,6 @@ struct SyncTrayApp: App {
 
         // Run any pending data migrations before loading profiles
         MigrationRunner.runPendingMigrations()
-
-        // Initialize telemetry (no-op if disabled)
-        TelemetryService.shared.configure()
 
         // Ship the committed JSON Schemas into ~/.config/synctray/schema/ so
         // ~/.config/synctray is a valid, agent-editable surface from the very
@@ -178,9 +175,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUserNoti
             CLIShimInstaller.install()
         }
 
-        // Record app launch telemetry
-        TelemetryService.shared.recordAppLaunch()
-
         // Open Settings window on launch
         if AppDelegate.shouldOpenSettingsOnLaunch {
             AppDelegate.shouldOpenSettingsOnLaunch = false
@@ -191,7 +185,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUserNoti
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        TelemetryService.shared.shutdown()
     }
 
     /// Called when the user clicks the Dock icon. While Settings is open the app is in
@@ -210,8 +203,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUserNoti
 
     func openSettingsWindow() {
         SyncTraySettings.debugLog("[SyncTray] openSettingsWindow called, shared=\(AppDelegate.shared != nil), manager=\(AppDelegate.sharedSyncManager != nil)")
-
-        TelemetryService.shared.recordSettingsOpened()
 
         // Switch to regular activation policy so the window appears in cmd+tab and the Dock.
         // This is reverted to .accessory when the settings window closes (see windowWillClose).

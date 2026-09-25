@@ -166,9 +166,6 @@ struct ProfileDetailView: View {
         VStack(spacing: 0) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
-                    // Telemetry opt-in banner
-                    TelemetryOptInBanner()
-
                     // Profile Name
                     profileNameSection
 
@@ -869,10 +866,6 @@ struct ProfileDetailView: View {
                         if FileManager.default.fileExists(atPath: lockPath) {
                             try? FileManager.default.removeItem(atPath: lockPath)
                         }
-                        TelemetryService.shared.recordProfileLifecycleOperation(
-                            profileId: profile.id, profileName: profile.name,
-                            operation: "sync_now", syncMode: "sync", result: "started"
-                        )
                         syncManager.triggerManualSync(for: profile)
                     }) {
                         Label("Sync Now", systemImage: "arrow.triangle.2.circlepath")
@@ -1083,16 +1076,10 @@ struct ProfileDetailView: View {
         DispatchQueue.global(qos: .userInitiated).async {
             do {
                 let nameWithoutColon = name.hasSuffix(":") ? String(name.dropLast()) : name
-                let providerType = RcloneConfigService.shared.readRemoteConfig(name: nameWithoutColon)?.provider.rcloneType ?? "unknown"
                 try RcloneConfigService.shared.deleteRemote(name)
                 let clearRclone = capturedRcloneRemote == nameWithoutColon || capturedRcloneRemote == "\(nameWithoutColon):"
 
                 DispatchQueue.main.async {
-                    TelemetryService.shared.recordRemoteConfigOperation(
-                        operation: "delete",
-                        providerType: providerType,
-                        result: "success"
-                    )
                     // Clear selection if the deleted remote was selected
                     if clearRclone {
                         rcloneRemote = ""
@@ -1103,12 +1090,6 @@ struct ProfileDetailView: View {
             } catch {
                 DispatchQueue.main.async {
                     installError = "Failed to delete remote: \(error.localizedDescription)"
-                    TelemetryService.shared.recordRemoteConfigOperation(
-                        operation: "delete",
-                        providerType: "unknown",
-                        result: "failure",
-                        errorMessage: error.localizedDescription
-                    )
                 }
             }
         }
@@ -1267,11 +1248,6 @@ struct ProfileDetailView: View {
         // unless an explicit override was supplied.
         let currentProfile = overrideProfile ?? buildProfileFromForm()
 
-        TelemetryService.shared.recordProfileLifecycleOperation(
-            profileId: currentProfile.id, profileName: currentProfile.name,
-            operation: "install", syncMode: "sync", result: "started"
-        )
-
         DispatchQueue.global(qos: .userInitiated).async {
             do {
                 // 1. Install script, config, and launchd plist (DO NOT load agent yet)
@@ -1283,11 +1259,6 @@ struct ProfileDetailView: View {
                     DispatchQueue.main.async {
                         isInstalling = false
                         installError = error
-                        TelemetryService.shared.recordProfileLifecycleOperation(
-                            profileId: currentProfile.id, profileName: currentProfile.name,
-                            operation: "install", syncMode: "sync",
-                            result: "failure", errorMessage: error
-                        )
                     }
                     return
                 }
@@ -1309,11 +1280,6 @@ struct ProfileDetailView: View {
                 DispatchQueue.main.async {
                     isInstalling = false
                     installError = error.localizedDescription
-                    TelemetryService.shared.recordProfileLifecycleOperation(
-                        profileId: currentProfile.id, profileName: currentProfile.name,
-                        operation: "install", syncMode: "sync",
-                        result: "failure", errorMessage: error.localizedDescription
-                    )
                 }
             }
         }
@@ -1330,17 +1296,8 @@ struct ProfileDetailView: View {
             disabledProfile.isEnabled = false
             profileStore.update(disabledProfile)
             syncManager.refreshSettings()
-            TelemetryService.shared.recordProfileLifecycleOperation(
-                profileId: currentProfile.id, profileName: currentProfile.name,
-                operation: "uninstall", syncMode: "sync", result: "success"
-            )
         } catch {
             installError = error.localizedDescription
-            TelemetryService.shared.recordProfileLifecycleOperation(
-                profileId: currentProfile.id, profileName: currentProfile.name,
-                operation: "uninstall", syncMode: "sync",
-                result: "failure", errorMessage: error.localizedDescription
-            )
         }
     }
 
@@ -1355,11 +1312,6 @@ struct ProfileDetailView: View {
     ///   install half needed a form-bypass.
     private func reinstallSync(using overrideProfile: SyncProfile? = nil) {
         guard let currentProfile = profileStore.profile(for: profile.id) else { return }
-
-        TelemetryService.shared.recordProfileLifecycleOperation(
-            profileId: currentProfile.id, profileName: currentProfile.name,
-            operation: "reinstall", syncMode: "sync", result: "started"
-        )
 
         do {
             try setupService.uninstall(profile: currentProfile)
@@ -1765,13 +1717,6 @@ struct ProfileDetailView: View {
     enum ErrorAction {
         case retrySync
 
-        /// Bounded, low-cardinality id for telemetry (`recovery.action`).
-        var telemetryName: String {
-            switch self {
-            case .retrySync: return "retry"
-            }
-        }
-
         var buttonText: String {
             switch self {
             case .retrySync:
@@ -1811,11 +1756,6 @@ struct ProfileDetailView: View {
     }
 
     private func handleErrorAction(_ action: ErrorAction) {
-        TelemetryService.shared.recordUserRecoveryAction(
-            profileId: profile.id,
-            profileName: profile.name,
-            action: action.telemetryName
-        )
         switch action {
         case .retrySync:
             syncManager.triggerManualSync(for: profile)

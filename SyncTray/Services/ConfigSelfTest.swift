@@ -54,7 +54,6 @@ enum ConfigSelfTest {
             testExternalCreateDisabledNoInstall,
             testExternalCreateGarbageIgnored,
             testExternalCreateCanonicalNoLoop,
-            testExternalCreateTelemetryAction,
             testCLIArgParsing,
             testCLIDispatchGate,
             testCLIWriteCommands,
@@ -430,7 +429,6 @@ enum ConfigSelfTest {
         SettingsReconciler.apply(
             safeSettings: [
                 .debugLoggingEnabled: true,
-                .telemetryEnabled: false,
                 .launchAtLogin: true,
             ],
             applySafeKey: { key, value in
@@ -448,7 +446,7 @@ enum ConfigSelfTest {
             return report("AC-12", "isolated-launch-at-login", false, "(profile state was touched despite the isolation boundary)")
         }
 
-        guard appliedSafeKeys[.debugLoggingEnabled] == true, appliedSafeKeys[.telemetryEnabled] == false else {
+        guard appliedSafeKeys[.debugLoggingEnabled] == true else {
             return report("AC-12", "isolated-launch-at-login", false, "(other safe keys were not applied despite the login-item failure)")
         }
 
@@ -691,35 +689,6 @@ enum ConfigSelfTest {
         return report("AC-C4", "external-create-canonical-no-loop", true)
     }
 
-    // MARK: - AC-C5 — external create emits telemetry with action = "create"
-
-    private static func testExternalCreateTelemetryAction() -> Bool {
-        // Signature/behavior check: both the pre-existing default ("edit") and the
-        // new "create" action compile and run without crashing. Telemetry itself is
-        // disabled in this environment (SyncTraySettings.telemetryEnabled == false),
-        // so these calls are no-ops — this only proves the signature accepts both shapes.
-        TelemetryService.shared.recordExternalConfigEdit(kind: "profile")
-        TelemetryService.shared.recordExternalConfigEdit(kind: "profile", action: "create")
-
-        // Call-site assertion: the create path in SyncManager.swift must actually
-        // PASS action: "create" (not merely have the capability to). Verified by
-        // reading this run's own source, next to this file in Services/.
-        let selfTestFile = URL(fileURLWithPath: #filePath)
-        let syncManagerPath = selfTestFile.deletingLastPathComponent().appendingPathComponent("SyncManager.swift").path
-        guard let source = try? String(contentsOfFile: syncManagerPath, encoding: .utf8) else {
-            return report(
-                "AC-C5", "external-create-telemetry-action", false,
-                "(could not read SyncManager.swift source to verify call site)")
-        }
-        guard source.contains("recordExternalConfigEdit(kind: \"profile\", action: \"create\")") else {
-            return report(
-                "AC-C5", "external-create-telemetry-action", false,
-                "(create path does not call recordExternalConfigEdit with action: \"create\")")
-        }
-
-        return report("AC-C5", "external-create-telemetry-action", true)
-    }
-
     // MARK: - CLI self-test helpers
 
     /// Build a `CLIEnvironment` with inert defaults, overridable per test —
@@ -754,8 +723,7 @@ enum ConfigSelfTest {
             readStdin: readStdin,
             readFile: readFile,
             stdout: stdout,
-            stderr: stderr,
-            now: { Date() }
+            stderr: stderr
         )
     }
 
@@ -793,8 +761,7 @@ enum ConfigSelfTest {
     /// installs an enabled profile, an id collision refuses without writing,
     /// enable/disable route via the shared `reconcileAction` to install vs.
     /// uninstall, delete uninstalls + removes the file, and `sync` runs the
-    /// script for a sync profile. Also locks the bounded telemetry-verb
-    /// mapping (never a raw arg).
+    /// script for a sync profile.
     private static func testCLIWriteCommands() -> Bool {
         let id = UUID()
         let enabled = sampleProfile(id: id, name: "CLIWrite", isEnabled: true)
@@ -872,19 +839,6 @@ enum ConfigSelfTest {
             return report("AC-CLI6", "cli-write-commands", false, "(sync did not run the script)")
         }
 
-        // Bounded telemetry verb — never a raw arg or profile name.
-        let verbCases: [([String], String)] = [
-            (["doctor"], "doctor"),
-            (["profile", "create", "-"], "profile-create"),
-            (["profile", "enable", "SECRET-NAME"], "profile-enable"),
-            (["sync", "SECRET-NAME"], "sync"),
-            (["totally-bogus"], "(other)"),
-            (["profile", "frobnicate"], "(other)"),
-        ]
-        for (argv, expected) in verbCases where SyncTrayCLI.telemetryVerb(for: argv) != expected {
-            return report("AC-CLI6", "cli-write-commands", false, "(telemetryVerb\(argv) != \(expected))")
-        }
-
         return report("AC-CLI6", "cli-write-commands", true)
     }
 
@@ -893,8 +847,7 @@ enum ConfigSelfTest {
     /// Drives the agent-first lifecycle commands through parse + `execute` with
     /// spied closures: reinstall does uninstall→install for an enabled profile
     /// and refuses a disabled one; install runs installProfile for an enabled
-    /// profile and refuses a disabled one. Also locks their bounded telemetry
-    /// verbs.
+    /// profile and refuses a disabled one.
     private static func testCLILifecycleCommands() -> Bool {
         // Parse.
         guard case .success(.reinstall("s")) = SyncTrayCLI.parse(["reinstall", "s"]),
@@ -937,15 +890,6 @@ enum ConfigSelfTest {
               SyncTrayCLI.execute(["reinstall", disabled.shortId], env: disabledEnv) != 0,
               !disabledInstallFired else {
             return report("AC-CLI7", "cli-lifecycle-commands", false, "(install/reinstall did not refuse a disabled profile)")
-        }
-
-        // Bounded telemetry verbs.
-        let verbCases: [([String], String)] = [
-            (["reinstall", "SECRET"], "reinstall"),
-            (["install", "SECRET"], "install"),
-        ]
-        for (argv, expected) in verbCases where SyncTrayCLI.telemetryVerb(for: argv) != expected {
-            return report("AC-CLI7", "cli-lifecycle-commands", false, "(telemetryVerb\(argv) != \(expected))")
         }
 
         return report("AC-CLI7", "cli-lifecycle-commands", true)

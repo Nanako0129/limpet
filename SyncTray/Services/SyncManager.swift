@@ -47,37 +47,16 @@ final class SyncManager: ObservableObject {
     /// Watches ~/.config/synctray for external edits to *.profile.json and
     /// settings.json and routes them through the reconcile path below.
     private var configFileWatcher: ConfigFileWatcher?
-    // What last kicked off a sync per profile (manual | directory_watch | startup), consumed
-    // and cleared by the `.syncStarted` handler to attribute `sync.trigger`. Absent = scheduled.
-    private var pendingSyncTrigger: [UUID: String] = [:]
     private let logParser = LogParser()
     private let notificationService = NotificationService.shared
     private let setupService = SyncSetupService.shared
 
-    private var heartbeatTimer: DispatchSourceTimer?
-    private var primaryRecoveryTimer: DispatchSourceTimer?
-    // Profiles with an in-flight primary-recovery remount, so we don't stack remounts.
-    private var recoveringToPrimary: Set<UUID> = []
-    // Consecutive successful primary probes per profile. We only remount back onto the
-    // primary after the primary has been reachable for several probes in a row, so a
-    // flapping primary can't trigger a remount storm (every remount is an unmount+mount,
-    // which surfaces a macOS "Server connections interrupted" dialog for a Stream mount).
-    private var primaryRecoveryStreak: [UUID: Int] = [:]
-    // Probes are 120s apart, so 3 in a row means ~6 minutes of stable primary.
-    private let primaryRecoveryRequiredStreak = 3
     private var workspaceObserver: NSObjectProtocol?
     private var currentSyncChanges: [UUID: [FileChange]] = [:]
     private var cancellables = Set<AnyCancellable>()
 
     /// Track the last error message per profile (for correlating with syncFailed events)
     private var lastSeenErrorMessage: [UUID: String] = [:]
-
-    /// Track sync start times per profile for duration measurement
-    private var syncStartTimes: [UUID: Date] = [:]
-
-    /// Track check phase: once totalChecks > 0 and checksDone < totalChecks, phase is active
-    private var checkPhaseStartTimes: [UUID: Date] = [:]
-    private var checkPhaseReported: Set<UUID> = []
 
     /// Profiles where we're monitoring an externally-started sync
     private var monitoringExternalSyncs: Set<UUID> = []
@@ -96,10 +75,6 @@ final class SyncManager: ObservableObject {
         detectAndResumeRunningSyncs()  // After cleanup, detect external syncs
         checkInitialState()
         startWatchingAllProfiles()
-        // Report active profile count and configuration snapshot for telemetry
-        TelemetryService.shared.recordProfileCount(self.profileStore.enabledProfiles.count)
-        TelemetryService.shared.recordAllProfileConfigurations(self.profileStore.profiles)
-        startSessionHeartbeat()
         refreshSettingsFile()
         startConfigWatcher()
     }
@@ -107,14 +82,6 @@ final class SyncManager: ObservableObject {
     deinit {
         configFileWatcher?.stop()
         configFileWatcher = nil
-
-        // Cancel heartbeat timer
-        heartbeatTimer?.cancel()
-        heartbeatTimer = nil
-
-        // Cancel primary-recovery monitor
-        primaryRecoveryTimer?.cancel()
-        primaryRecoveryTimer = nil
 
         // Cancel all sync completion pollers
         for timer in syncCompletionPollers.values {
@@ -386,7 +353,6 @@ final class SyncManager: ObservableObject {
         }
 
         updateAggregateState()
-        TelemetryService.shared.recordExternalConfigEdit(kind: "profile")
     }
 
     /// Wires `applyExternalCreateIfNeeded`'s persist/install closures to the
@@ -428,7 +394,6 @@ final class SyncManager: ObservableObject {
         guard outcome != .ignored else { return }
 
         updateAggregateState()
-        TelemetryService.shared.recordExternalConfigEdit(kind: "profile", action: "create")
     }
 
     /// Apply an external edit to `settings.json`. Safe keys apply directly;
@@ -443,8 +408,6 @@ final class SyncManager: ObservableObject {
                 switch key {
                 case .debugLoggingEnabled:
                     SyncTraySettings.debugLoggingEnabled = value
-                case .telemetryEnabled:
-                    SyncTraySettings.telemetryEnabled = value
                 case .launchAtLogin:
                     break  // handled by the isolated path below
                 }
@@ -462,8 +425,6 @@ final class SyncManager: ObservableObject {
                 self.objectWillChange.send()
             }
         )
-
-        TelemetryService.shared.recordExternalConfigEdit(kind: "settings")
     }
 
     /// Get state for a specific profile
@@ -556,13 +517,6 @@ final class SyncManager: ObservableObject {
         // hung/slow sync can't keep holding the lock and block a later resume.
         terminateRunningSync(for: profile)
 
-        // Close any open telemetry span so it isn't later reported as abandoned.
-        TelemetryService.shared.recordSyncSkipped(
-            profileId: profileId,
-            profileName: profile.name,
-            reason: "paused"
-        )
-
         // Update profile state to paused
         profileStates[profileId] = .paused
         profileProgress[profileId] = nil
@@ -571,11 +525,6 @@ final class SyncManager: ObservableObject {
         updateAggregateState()
 
         SyncTraySettings.debugLog("Paused profile: \(profile.name)")
-        TelemetryService.shared.recordProfileStateChange(
-            profileId: profileId,
-            profileName: profile.name,
-            action: "paused"
-        )
     }
 
     /// Terminate any running sync process for `profile` (identified via its lock
@@ -624,11 +573,6 @@ final class SyncManager: ObservableObject {
         updateAggregateState()
 
         SyncTraySettings.debugLog("Resumed profile: \(profile.name)")
-        TelemetryService.shared.recordProfileStateChange(
-            profileId: profileId,
-            profileName: profile.name,
-            action: "resumed"
-        )
     }
 
     /// Pause all enabled profiles
@@ -760,21 +704,12 @@ final class SyncManager: ObservableObject {
 
     /// Detect running syncs at startup and start monitoring them
     private func detectAndResumeRunningSyncs() {
-        var resumedCount = 0
         for profile in profileStore.enabledProfiles {
             if let pid = detectRunningSyncPID(for: profile) {
                 profileStates[profile.id] = .syncing
                 monitoringExternalSyncs.insert(profile.id)
                 startPollingForSyncCompletion(profile: profile, pid: pid)
-                resumedCount += 1
             }
-        }
-        if resumedCount > 0 {
-            TelemetryService.shared.recordResumedExternalSync(
-                profileId: UUID(), // aggregate event
-                profileName: "all",
-                count: resumedCount
-            )
         }
         updateAggregateState()
     }
@@ -824,7 +759,6 @@ final class SyncManager: ObservableObject {
     /// Removes /tmp lock files where the PID is no longer running
     private func cleanupStaleLockFiles() {
         let fm = FileManager.default
-        var staleLockCount = 0
 
         // Clean up SyncTray's /tmp lock files
         for profile in profileStore.profiles {
@@ -839,18 +773,13 @@ final class SyncManager: ObservableObject {
                 if kill(pid, 0) != 0 {
                     // Process not running - remove stale lock
                     try? fm.removeItem(atPath: lockPath)
-                    staleLockCount += 1
                 }
             } else {
                 // Could not read/parse PID - remove the lock file
                 try? fm.removeItem(atPath: lockPath)
-                staleLockCount += 1
             }
         }
 
-        if staleLockCount > 0 {
-            TelemetryService.shared.recordStaleLockCleanup(count: staleLockCount, lockType: "synctray")
-        }
     }
 
     private func setupProfileObserver() {
@@ -889,7 +818,6 @@ final class SyncManager: ObservableObject {
 
     private func startWatching(profile: SyncProfile) {
         let watcher = LogWatcher(logPath: profile.logPath)
-        watcher.profileName = profile.name
         watcher.delegate = self
         watcher.startWatching()
         logWatchers[profile.id] = watcher
@@ -923,7 +851,6 @@ final class SyncManager: ObservableObject {
                 self?.handleDirectoryChange(for: profileId)
             }
         }
-        watcher.profileName = profileName
         watcher.start()
         directoryWatchers[profile.id] = watcher
     }
@@ -957,15 +884,10 @@ final class SyncManager: ObservableObject {
 
         SyncTraySettings.debugLog("DirectoryWatcher: Triggering sync for '\(profile.name)' (path: \(profile.localSyncPath))")
 
-        TelemetryService.shared.recordDirectoryWatchTrigger(
-            profileId: profileId,
-            profileName: profile.name
-        )
-
         // Trigger sync for this specific profile
         // Note: Lock file in sync script handles concurrent sync prevention
         Task {
-            await runSyncScript(for: profile, trigger: "directory_watch")
+            await runSyncScript(for: profile)
         }
     }
 
@@ -1079,13 +1001,11 @@ final class SyncManager: ObservableObject {
             return
         }
 
-        var affectedCount = 0
         for profile in profileStore.enabledProfiles {
             let drivePath = profile.drivePathToMonitor
             guard !drivePath.isEmpty else { continue }
 
             if drivePath.hasPrefix(volumePath) || volumePath == drivePath {
-                affectedCount += 1
                 notificationService.resetDriveNotMountedState(for: profile.id)
                 if profileStates[profile.id] == .driveNotMounted {
                     profileStates[profile.id] = .idle
@@ -1098,10 +1018,6 @@ final class SyncManager: ObservableObject {
             }
         }
 
-        if affectedCount > 0 {
-            TelemetryService.shared.recordVolumeEvent(event: "mounted", affectedProfiles: affectedCount)
-        }
-
         updateAggregateState()
     }
 
@@ -1110,13 +1026,11 @@ final class SyncManager: ObservableObject {
             return
         }
 
-        var affectedCount = 0
         for profile in profileStore.enabledProfiles {
             let drivePath = profile.drivePathToMonitor
             guard !drivePath.isEmpty else { continue }
 
             if drivePath.hasPrefix(volumePath) || volumePath == drivePath {
-                affectedCount += 1
                 profileStates[profile.id] = .driveNotMounted
                 if !isNotificationsMuted(for: profile.id) {
                     notificationService.notifyDriveNotMounted(profileId: profile.id, profileName: profile.name)
@@ -1124,19 +1038,10 @@ final class SyncManager: ObservableObject {
             }
         }
 
-        if affectedCount > 0 {
-            TelemetryService.shared.recordVolumeEvent(event: "unmounted", affectedProfiles: affectedCount)
-        }
-
         updateAggregateState()
     }
 
-    private func runSyncScript(for profile: SyncProfile, trigger: String = "manual") async {
-        // Remember what kicked this off so the `.syncStarted` log event (parsed from the
-        // sync log, decoupled from here) can attribute `sync.trigger`. A launchd/scheduled
-        // run never calls this method, so an absent entry means "scheduled".
-        pendingSyncTrigger[profile.id] = trigger
-
+    private func runSyncScript(for profile: SyncProfile) async {
         // Check if profile is paused
         if isPaused(for: profile.id) {
             SyncTraySettings.debugLog("Skipping sync script for paused profile: \(profile.name)")
@@ -1159,11 +1064,6 @@ final class SyncManager: ObservableObject {
         guard FileManager.default.fileExists(atPath: SyncProfile.sharedScriptPath) else {
             await MainActor.run {
                 profileStates[profile.id] = .error("Script not found")
-                TelemetryService.shared.recordSyncPreconditionFailure(
-                    profileId: profile.id,
-                    profileName: profile.name,
-                    reason: "script_not_found"
-                )
                 updateAggregateState()
             }
             return
@@ -1172,11 +1072,6 @@ final class SyncManager: ObservableObject {
         guard FileManager.default.fileExists(atPath: profile.configPath) else {
             await MainActor.run {
                 profileStates[profile.id] = .error("Config not found")
-                TelemetryService.shared.recordSyncPreconditionFailure(
-                    profileId: profile.id,
-                    profileName: profile.name,
-                    reason: "config_not_found"
-                )
                 updateAggregateState()
             }
             return
@@ -1214,21 +1109,9 @@ final class SyncManager: ObservableObject {
             lastSeenErrorMessage[profileId] = nil  // Clear last seen error
             profileProgress[profileId] = nil  // Reset progress for new sync
             currentSyncChanges[profileId] = []
-            syncStartTimes[profileId] = Date()  // Record start time for duration tracking
-            checkPhaseStartTimes.removeValue(forKey: profileId)  // Reset check phase tracking
-            checkPhaseReported.remove(profileId)
             logWatchers[profileId]?.setActivelySyncing(true)  // Increase polling frequency
             // Don't send notification - the menu bar icon updates to show syncing state
             notificationService.clearPendingChanges(for: profileId)
-            TelemetryService.shared.recordSyncStarted(
-                profileId: profileId,
-                profileName: profileName,
-                syncMode: "sync",
-                syncDirection: profile?.syncDirection,
-                // An app-initiated run recorded its cause in runSyncScript; a bare
-                // launchd/scheduled run left none, so default to "scheduled".
-                trigger: pendingSyncTrigger.removeValue(forKey: profileId) ?? "scheduled"
-            )
 
         case .syncCompleted:
             profileStates[profileId] = .idle
@@ -1238,16 +1121,6 @@ final class SyncManager: ObservableObject {
             logWatchers[profileId]?.setActivelySyncing(false)  // Reduce polling frequency
             lastSyncTime = event.timestamp
             let changesCount = currentSyncChanges[profileId]?.count ?? 0
-            // Report telemetry for successful sync
-            let completedDuration = syncStartTimes[profileId].map { Date().timeIntervalSince($0) } ?? 0
-            syncStartTimes[profileId] = nil
-            TelemetryService.shared.recordSyncCompleted(
-                profileId: profileId,
-                profileName: profileName,
-                mode: "sync",
-                duration: completedDuration,
-                filesChanged: changesCount
-            )
             if !isNotificationsMuted(for: profileId) {
                 notificationService.notifySyncCompleted(
                     changesCount: changesCount,
@@ -1268,7 +1141,6 @@ final class SyncManager: ObservableObject {
                 // Transient "all files were changed" - just clear state, don't show error
                 profileProgress[profileId] = nil
                 lastSeenErrorMessage[profileId] = nil
-                syncStartTimes[profileId] = nil
                 logWatchers[profileId]?.setActivelySyncing(false)  // Reduce polling frequency
                 currentSyncChanges[profileId] = nil  // Only clear this profile's changes
                 // Reset to idle since this isn't a real error
@@ -1280,18 +1152,6 @@ final class SyncManager: ObservableObject {
             profileProgress[profileId] = nil  // Clear progress on failure
             lastSeenErrorMessage[profileId] = nil
             logWatchers[profileId]?.setActivelySyncing(false)  // Reduce polling frequency
-            // Report telemetry for failed sync
-            let failedDuration = syncStartTimes[profileId].map { Date().timeIntervalSince($0) } ?? 0
-            syncStartTimes[profileId] = nil
-            TelemetryService.shared.recordSyncFailed(
-                profileId: profileId,
-                profileName: profileName,
-                mode: "sync",
-                duration: failedDuration,
-                filesChanged: currentSyncChanges[profileId]?.count ?? 0,
-                exitCode: exitCode,
-                errorMessage: message ?? profileErrors[profileId]
-            )
             // Only use the syncFailed message if we don't already have a more specific error
             if profileErrors[profileId] == nil, let msg = message {
                 profileErrors[profileId] = msg
@@ -1315,12 +1175,6 @@ final class SyncManager: ObservableObject {
                 break
             }
 
-            TelemetryService.shared.recordSyncError(
-                profileId: profileId,
-                profileName: profileName,
-                errorMessage: message
-            )
-
             // Prefer critical/actionable errors over file-level errors
             // Critical errors tell us what to do (e.g., "out of sync", "resync")
             // File-level errors (e.g., "Path1 file not found") are less actionable
@@ -1337,44 +1191,28 @@ final class SyncManager: ObservableObject {
         case .driveNotMounted:
             let previousState = profileStates[profileId]
             profileStates[profileId] = .driveNotMounted
-            // Only emit telemetry/notification on state transition, not every poll
+            // Only notify on state transition, not every poll
             if previousState != .driveNotMounted {
-                TelemetryService.shared.recordDriveNotMounted(
-                    profileId: profileId,
-                    profileName: profileName
-                )
                 if !isNotificationsMuted(for: profileId) {
                     notificationService.notifyDriveNotMounted(profileId: profileId, profileName: profileName)
                 }
             }
 
-        case .syncSkipped(let reason):
+        case .syncSkipped:
             // A scheduled run exited early without syncing (remote failed the
             // pre-flight reachability check). "Starting sync" already set the
-            // profile to `.syncing` and opened a telemetry span; close both here
-            // so the profile returns to rest instead of appearing to sync for
-            // 11–37 min until the next run abandons the stale span.
+            // profile to `.syncing`; reset it here so the profile returns to
+            // rest instead of appearing to sync until the next run.
             logWatchers[profileId]?.setActivelySyncing(false)
             profileProgress[profileId] = nil
-            syncStartTimes[profileId] = nil
-            checkPhaseStartTimes.removeValue(forKey: profileId)
-            checkPhaseReported.remove(profileId)
             // Only downgrade from `.syncing`; never clobber a real error,
             // paused, or driveNotMounted state.
             if profileStates[profileId] == .syncing {
                 profileStates[profileId] = .idle
             }
-            TelemetryService.shared.recordSyncSkipped(
-                profileId: profileId,
-                profileName: profileName,
-                reason: reason
-            )
 
         case .syncAlreadyRunning:
-            TelemetryService.shared.recordSyncContention(
-                profileId: profileId,
-                profileName: profileName
-            )
+            break
 
         case .fileChange(var change):
             change.profileName = profileName
@@ -1383,11 +1221,6 @@ final class SyncManager: ObservableObject {
             }
             currentSyncChanges[profileId]?.append(change)
             addRecentChange(change)
-            TelemetryService.shared.recordFileOperation(
-                profileName: profileName,
-                operation: change.operation.rawValue,
-                filePath: change.path
-            )
             // Only send notification if not muted
             if !isNotificationsMuted(for: profileId) {
                 notificationService.notifyFileChange(change, profileId: profileId, syncDirectoryPath: syncDirectoryPath)
@@ -1397,25 +1230,6 @@ final class SyncManager: ObservableObject {
             if let bytes = stats.bytes, let totalBytes = stats.totalBytes, totalBytes > 0 {
                 let checksDone = stats.checks ?? 0
                 let totalChecks = stats.totalChecks ?? 0
-
-                // Track check phase duration (listing/comparison phase)
-                if totalChecks > 0 && checksDone < totalChecks && checkPhaseStartTimes[profileId] == nil {
-                    checkPhaseStartTimes[profileId] = Date()
-                    checkPhaseReported.remove(profileId)
-                }
-                if totalChecks > 0 && checksDone >= totalChecks && !checkPhaseReported.contains(profileId),
-                   let checkStart = checkPhaseStartTimes[profileId] {
-                    let checkDuration = Date().timeIntervalSince(checkStart)
-                    TelemetryService.shared.recordCheckPhaseDuration(
-                        profileName: profileName,
-                        syncMode: "sync",
-                        durationSeconds: checkDuration,
-                        checksCompleted: checksDone,
-                        totalChecks: totalChecks
-                    )
-                    checkPhaseReported.insert(profileId)
-                    checkPhaseStartTimes.removeValue(forKey: profileId)
-                }
 
                 profileProgress[profileId] = SyncProgress(
                     bytesTransferred: Int64(bytes),
@@ -1447,32 +1261,6 @@ final class SyncManager: ObservableObject {
         }
     }
 
-
-    /// Start a 5-minute session heartbeat for availability monitoring
-    private func startSessionHeartbeat() {
-        heartbeatTimer?.cancel()
-        let timer = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
-        timer.schedule(deadline: .now() + 300, repeating: 300)  // every 5 minutes
-        timer.setEventHandler { [weak self] in
-            DispatchQueue.main.async {
-                guard let self = self else { return }
-                let enabled = self.profileStore.enabledProfiles.count
-                let syncing = self.profileStates.values.filter { $0 == .syncing }.count
-                let paused = self.pausedProfiles.count
-                let errors = self.profileStates.values.filter {
-                    if case .error = $0 { return true }; return false
-                }.count
-                TelemetryService.shared.recordSessionHeartbeat(
-                    enabledProfiles: enabled,
-                    syncingProfiles: syncing,
-                    pausedProfiles: paused,
-                    errorProfiles: errors
-                )
-            }
-        }
-        heartbeatTimer = timer
-        timer.resume()
-    }
 
     /// Find which profile a log watcher belongs to
     private func profileId(for watcher: LogWatcher) -> UUID? {

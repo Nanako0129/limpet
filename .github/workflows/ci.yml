@@ -423,7 +423,6 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-          DASH0_AUTH_TOKEN: ${{ secrets.DASH0_AUTH_TOKEN }}
           RELEASE_VERSION: ${{ needs.version.outputs.tag }}
           PR_NUMBER: ${{ needs.detect-changes.outputs.pr_number }}
           IS_BETA: ${{ needs.detect-changes.outputs.is_beta }}

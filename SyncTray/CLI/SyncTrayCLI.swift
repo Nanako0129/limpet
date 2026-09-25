@@ -86,22 +86,18 @@ struct CLIEnvironment {
     var readFile: (String) -> String?
     var stdout: (String) -> Void
     var stderr: (String) -> Void
-    var now: () -> Date
 }
 
 /// Headless `synctray` CLI, dispatched from `SyncTrayApp.init` exactly like
 /// the existing `--self-test` intercept: parsed early, run, and `exit()`ed
 /// before the SwiftUI app, `SyncManager`, watchers, or timers ever start. It
 /// NEVER opens a window and NEVER launches background work — see `dispatch`.
-/// It DOES record exactly one telemetry event per run (the bounded command
-/// verb + result, gated on the user's opt-in) and flush before exit, so agent
-/// operation of SyncTray is itself measurable — see `runMeasured`.
 ///
 /// Pure core / impure shell: `parse`, `execute`, `run`, `doctorChecks`, and
 /// `resolveProfile` operate entirely over their arguments/injected `env`, so
 /// `ConfigSelfTest` drives the full dispatch + doctor-aggregation logic with
-/// fakes. Only `CLIEnvironment.production()`, `dispatch`, and `runMeasured`
-/// touch real process/filesystem/telemetry state.
+/// fakes. Only `CLIEnvironment.production()` and `dispatch` touch real
+/// process/filesystem state.
 enum SyncTrayCLI {
     static let usage = """
     usage: synctray <command> [args]
@@ -155,43 +151,7 @@ enum SyncTrayCLI {
             return nil                                          // other flags → GUI/self-test path
         }
         // `-`-prefixed `-h`/`--help`, or any bare token, IS a subcommand.
-        return runMeasured(argv, env: .production())
-    }
-
-    /// Real-entry wrapper that times `execute`, records ONE
-    /// `synctray.cli.invoked` telemetry event, flushes, and returns the code.
-    /// Lives here (not in `execute`) so the fake-`env` self-test path never
-    /// touches `TelemetryService`. Telemetry is gated on the user's opt-in, so
-    /// this is a no-op — no setup, no network, no stdout — when disabled.
-    private static func runMeasured(_ argv: [String], env: CLIEnvironment) -> Int32 {
-        let start = env.now()
-        let code = execute(argv, env: env)
-        let elapsed = env.now().timeIntervalSince(start)
-        TelemetryService.shared.recordCLIInvocation(
-            command: telemetryVerb(for: argv),
-            exitCode: code,
-            durationSeconds: elapsed
-        )
-        TelemetryService.shared.flushForExit()
-        return code
-    }
-
-    /// Map an argv to a BOUNDED command verb for telemetry — never args, paths,
-    /// profile names, or remotes. An unrecognised first token (or a bad
-    /// `profile <sub>`) collapses to `(other)` so cardinality stays fixed.
-    static func telemetryVerb(for argv: [String]) -> String {
-        guard let first = argv.first else { return "(none)" }
-        let known: Set<String> = [
-            "doctor", "status", "profiles", "logs", "test-remote",
-            "listremotes", "sync", "reinstall", "install",
-            "help", "-h", "--help",
-        ]
-        if first == "profile" {
-            let sub = argv.dropFirst().first(where: { !$0.hasPrefix("-") }) ?? ""
-            let knownSubs: Set<String> = ["create", "show", "delete", "enable", "disable", "list", "set"]
-            return knownSubs.contains(sub) ? "profile-\(sub)" : "(other)"
-        }
-        return known.contains(first) ? first : "(other)"
+        return execute(argv, env: .production())
     }
 
     // MARK: - Pure core
@@ -459,9 +419,7 @@ enum SyncTrayCLI {
             return 1
         }
 
-        // Prints the remote name to the user's own terminal — fine. It is NEVER
-        // a telemetry attribute: the CLI records only the bounded command verb
-        // (see `runMeasured`), never a remote name, path, or profile name.
+        // Prints the remote name to the user's own terminal — fine.
         let (exit, _, err) = env.runRclone(["lsd", profile.fullRemotePath], 10)
         if exit == 0 {
             env.stdout("reachable: \(profile.fullRemotePath)\n")
@@ -964,8 +922,7 @@ extension CLIEnvironment {
             },
             readFile: { try? String(contentsOfFile: $0, encoding: .utf8) },
             stdout: { FileHandle.standardOutput.write(Data($0.utf8)) },
-            stderr: { FileHandle.standardError.write(Data($0.utf8)) },
-            now: { Date() }
+            stderr: { FileHandle.standardError.write(Data($0.utf8)) }
         )
     }
 

@@ -218,7 +218,6 @@ final class ProfileStore: ObservableObject {
         }
         profiles[index] = profile
         save(only: profile)
-        TelemetryService.shared.recordProfileConfiguration(profile)
     }
 
     /// Delete a profile by ID. Removes the profile from memory, rewrites the

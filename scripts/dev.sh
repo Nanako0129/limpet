@@ -72,7 +72,6 @@ build_app() {
         -derivedDataPath "$PROJECT_DIR/build"
         -destination "platform=macOS"
         ONLY_ACTIVE_ARCH=YES
-        DASH0_AUTH_TOKEN="${DASH0_AUTH_TOKEN:-}"
         build
     )
     local log
