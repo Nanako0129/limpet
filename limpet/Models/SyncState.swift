@@ -280,14 +280,6 @@ enum SyncLogPatterns {
         message.lowercased().contains("already running")
     }
 
-    /// Patterns indicating a scheduled run exited early WITHOUT syncing because
-    /// the remote failed the read-only pre-flight reachability check.
-    /// Matches "Remote unreachable, skipping sync ..." — the discriminator is
-    /// the ", skipping" clause.
-    static func isSyncSkipped(_ message: String) -> Bool {
-        message.lowercased().contains("unreachable, skipping")
-    }
-
     // MARK: - Error Categorization
 
     /// Transient "all files changed" safety-abort error that should be ignored.

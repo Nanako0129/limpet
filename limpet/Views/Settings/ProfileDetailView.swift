@@ -26,21 +26,11 @@ struct ProfileDetailView: View {
     @State private var showingReinstallConfirm: Bool = false
     @State private var availableRemotes: [String] = []
     @State private var isLoadingRemotes: Bool = false
-    @State private var isRunningResync: Bool = false
-    @State private var resyncOutputLines: [String] = []  // Circular buffer for output
-    @State private var showResyncOutput: Bool = false
-
-    // Maximum lines to keep in output buffer (prevents memory issues with large syncs)
-    private let maxOutputLines = 100
     @State private var useTextInputForFolder: Bool = false
     @State private var remotesError: String?
     @State private var availableFolders: [String] = []
     @State private var isLoadingFolders: Bool = false
     @State private var foldersError: String?
-
-    // File monitoring for resumed syncs
-    @State private var logFileMonitor: DispatchSourceFileSystemObject?
-    @State private var logFileDescriptor: Int32 = -1
 
     // Alert for sync already in progress
     @State private var showingSyncInProgressAlert: Bool = false
@@ -86,15 +76,12 @@ struct ProfileDetailView: View {
 
     // MARK: - Computed Properties
 
-    /// Check if a sync is currently running for this profile (via any method)
+    /// Check if a sync is currently running for this profile. The watcher
+    /// process is the sole thing that ever runs a sync (see limpet-plan.md
+    /// L3); this view only ever observes that fact through the profile log,
+    /// which `SyncManager`'s `LogWatcher` already parses into `.syncing`.
     private var isSyncRunningForProfile: Bool {
-        // Local resync started by this view
-        if isRunningResync { return true }
-
-        // SyncManager detected sync (includes external monitoring via lock file)
-        if syncManager.state(for: profile.id) == .syncing { return true }
-
-        return false
+        syncManager.state(for: profile.id) == .syncing
     }
 
     private var computedDrivePath: String {
@@ -212,10 +199,6 @@ struct ProfileDetailView: View {
         .onAppear {
             loadProfileValues()
             loadRcloneRemotes()
-            checkForRunningInitialSync()
-        }
-        .onDisappear {
-            stopLogFileMonitor()
         }
         .onChange(of: profile.id) { _ in
             loadProfileValues()
@@ -647,11 +630,7 @@ struct ProfileDetailView: View {
         VStack(alignment: .leading, spacing: 12) {
             // Status - check local resync state first, then syncManager state
             HStack {
-                if isRunningResync {
-                    // Local resync in progress (runs directly, not via launchd)
-                    Label("Syncing", systemImage: "arrow.triangle.2.circlepath")
-                        .foregroundColor(.blue)
-                } else if isInstalled {
+                if isInstalled {
                     let state = syncManager.state(for: profile.id)
                     switch state {
                     case .paused:
@@ -686,7 +665,7 @@ struct ProfileDetailView: View {
             }
 
             // Sync progress indicator
-            if isRunningResync || syncManager.state(for: profile.id) == .syncing {
+            if syncManager.state(for: profile.id) == .syncing {
                 HStack {
                     if let progress = syncManager.profileProgress[profile.id] {
                         SyncProgressDetailView(progress: progress)
@@ -694,7 +673,7 @@ struct ProfileDetailView: View {
                         HStack(spacing: 8) {
                             ProgressView()
                                 .controlSize(.small)
-                            Text(isRunningResync ? "Starting initial sync..." : "Starting sync...")
+                            Text("Starting sync...")
                                 .font(.caption)
                                 .foregroundStyle(.blue)
                         }
@@ -724,8 +703,8 @@ struct ProfileDetailView: View {
                 }
             }
 
-            // Last sync error from rclone (hide during active resync operations)
-            if isInstalled, !isRunningResync, let lastError = syncManager.lastError(for: profile.id) {
+            // Last sync error from rclone (hide during an active sync)
+            if isInstalled, !isSyncRunningForProfile, let lastError = syncManager.lastError(for: profile.id) {
                 VStack(alignment: .leading, spacing: 8) {
                     Label("Last sync error:", systemImage: "exclamationmark.triangle.fill")
                         .font(.caption.weight(.medium))
@@ -766,67 +745,6 @@ struct ProfileDetailView: View {
                 }
             }
 
-            // Show resync output if available (hide when detailed progress is shown)
-            if showResyncOutput && !resyncOutputLines.isEmpty && syncManager.profileProgress[profile.id] == nil {
-                VStack(alignment: .leading, spacing: 4) {
-                    HStack {
-                        Text("Sync output:")
-                            .font(.caption.weight(.medium))
-                        Spacer()
-                        Text("\(resyncOutputLines.count) lines")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                        // Open log file button
-                        Button(action: {
-                            let logPath = profile.logPath
-                            if FileManager.default.fileExists(atPath: logPath) {
-                                NSWorkspace.shared.open(URL(fileURLWithPath: logPath))
-                            } else {
-                                // Fallback to regular log if initial log was cleaned up
-                                NSWorkspace.shared.open(URL(fileURLWithPath: profile.logPath))
-                            }
-                        }) {
-                            Image(systemName: "doc.text")
-                                .foregroundColor(.secondary)
-                        }
-                        .buttonStyle(.plain)
-                        .help("Open log file")
-                        Button(action: { showResyncOutput = false }) {
-                            Image(systemName: "xmark.circle.fill")
-                                .foregroundColor(.secondary)
-                        }
-                        .buttonStyle(.plain)
-                        .help("Close output panel")
-                    }
-                    ScrollViewReader { proxy in
-                        ScrollView {
-                            LazyVStack(alignment: .leading, spacing: 0) {
-                                ForEach(Array(resyncOutputLines.enumerated()), id: \.offset) { index, line in
-                                    Text(line)
-                                        .font(.system(size: 10, design: .monospaced))
-                                        .foregroundColor(.secondary)
-                                        .frame(maxWidth: .infinity, alignment: .leading)
-                                        .id(index)
-                                }
-                            }
-                            .padding(8)
-                            .textSelection(.enabled)
-                        }
-                        .frame(maxHeight: 200)
-                        .background(Color(nsColor: .textBackgroundColor))
-                        .cornerRadius(4)
-                        .onChange(of: resyncOutputLines.count) { _ in
-                            // Auto-scroll to bottom when new content arrives
-                            if let lastIndex = resyncOutputLines.indices.last {
-                                withAnimation(.easeOut(duration: 0.1)) {
-                                    proxy.scrollTo(lastIndex, anchor: .bottom)
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
             // Info about generated files
             if isInstalled {
                 VStack(alignment: .leading, spacing: 4) {
@@ -861,11 +779,8 @@ struct ProfileDetailView: View {
                         if syncManager.isPaused(for: profile.id) {
                             return
                         }
-                        // Clean up stale lock file if exists but process not running
-                        let lockPath = profile.lockFilePath
-                        if FileManager.default.fileExists(atPath: lockPath) {
-                            try? FileManager.default.removeItem(atPath: lockPath)
-                        }
+                        // The lock file belongs to the launchd-owned watcher now —
+                        // the GUI never touches it (see limpet-plan.md L3(c)).
                         syncManager.triggerManualSync(for: profile)
                     }) {
                         Label("Sync Now", systemImage: "arrow.triangle.2.circlepath")
@@ -1250,11 +1165,9 @@ struct ProfileDetailView: View {
 
         DispatchQueue.global(qos: .userInitiated).async {
             do {
-                // 1. Install script, config, and launchd plist (DO NOT load agent yet)
-                // We always defer loading so LogWatcher is set up first
-                try setupService.install(profile: currentProfile, loadAgent: false)
-
-                // 2. Initialize paths (create dir and check files)
+                // 1. Initialize paths (create local dir) BEFORE the agent can
+                // possibly load, so the watcher's very first catch-up sync
+                // never race the directory into existence.
                 if let error = setupService.initializeSyncPaths(for: currentProfile) {
                     DispatchQueue.main.async {
                         isInstalling = false
@@ -1263,18 +1176,21 @@ struct ProfileDetailView: View {
                     return
                 }
 
+                // 2. Install script, config, plist, and load the launchd
+                // agent (KeepAlive+RunAtLoad). The watcher process this
+                // starts is the SOLE thing that ever runs a sync — see
+                // limpet-plan.md L3 — so there is no separate "run the first
+                // sync from the GUI" step here: RunAtLoad makes the watcher's
+                // own startup catch-up sync do that, and its progress shows
+                // up through the normal log-watching pipeline below.
+                try setupService.install(profile: currentProfile)
+
                 DispatchQueue.main.async {
-                    // 3. Update profile and refresh settings FIRST (creates LogWatcher)
-                    // This ensures LogWatcher is watching BEFORE the agent starts
                     var enabledProfile = currentProfile
                     enabledProfile.isEnabled = true
                     profileStore.update(enabledProfile)
-                    syncManager.refreshSettings()  // LogWatcher now ready
-
-                    // 4. Run the first sync now (with visible output), then load the
-                    // agent for scheduled runs. runResync handles clearing
-                    // isInstalling and loading the agent on completion.
-                    runResync(loadAgentOnCompletion: true)
+                    syncManager.refreshSettings()  // LogWatcher now watching
+                    isInstalling = false
                 }
             } catch {
                 DispatchQueue.main.async {
@@ -1319,296 +1235,6 @@ struct ProfileDetailView: View {
             // Ignore uninstall errors
         }
         installSync(using: overrideProfile)
-    }
-
-    private func runResync(loadAgentOnCompletion: Bool = false) {
-        // Clear installing state so resync output panel is visible
-        isInstalling = false
-        isRunningResync = true
-        resyncOutputLines = ["Starting initial sync..."]  // Clear and start fresh
-        showResyncOutput = true
-
-        // Clear any cached error and set syncing state (updates menu bar icon)
-        syncManager.clearError(for: profile.id)
-        syncManager.setSyncing(for: profile.id, isSyncing: true)
-
-        // Automatically mute notifications for initial sync (resync)
-        // This prevents notification spam when many files are being synced for the first time
-        syncManager.muteNotifications(for: profile.id)
-
-        // Capture all values from main thread before going to background
-        let currentProfile = profile
-        let capturedRcloneRemote = rcloneRemote
-        let capturedRemotePath = remotePath
-        let capturedLocalSyncPath = localSyncPath
-        let capturedAdditionalFlags = additionalRcloneFlags
-        let capturedFilterPath = profile.filterFilePath  // Exclude filter file
-        let capturedLockPath = profile.lockFilePath  // Lock file to prevent concurrent scheduled syncs
-        let capturedMaxLines = maxOutputLines
-        let syncLogPath = profile.logPath  // Use main log file (same as scheduled syncs)
-        let capturedSyncDirection = syncDirection
-
-        DispatchQueue.global(qos: .userInitiated).async {
-            let fileManager = FileManager.default
-
-            // Ensure log directory exists (append to existing log, don't truncate)
-            let logDir = (syncLogPath as NSString).deletingLastPathComponent
-            try? fileManager.createDirectory(atPath: logDir, withIntermediateDirectories: true)
-
-            // Create file if it doesn't exist
-            if !fileManager.fileExists(atPath: syncLogPath) {
-                fileManager.createFile(atPath: syncLogPath, contents: nil)
-            }
-
-            // Helper to write to log file (appends)
-            let writeToLog: (String) -> Void = { content in
-                if let data = (content + "\n").data(using: .utf8),
-                   let handle = FileHandle(forWritingAtPath: syncLogPath) {
-                    handle.seekToEndOfFile()
-                    handle.write(data)
-                    handle.closeFile()
-                }
-            }
-
-            // Track bytes written for periodic truncation
-            var bytesWritten: Int64 = 0
-            var lastTruncateTime = Date()
-            let maxLogSize: Int64 = 10_000_000  // ~10MB (increased to reduce truncation frequency)
-            let truncateInterval: TimeInterval = 30
-
-            let process = Process()
-            let pipe = Pipe()
-            let errorPipe = Pipe()
-
-            // Find rclone
-            let rclonePath = RcloneLocator.resolve()
-
-            guard let path = rclonePath else {
-                let errMsg = "Error: rclone not found. Install with: brew install rclone"
-                writeToLog(errMsg)
-                try? fileManager.removeItem(atPath: syncLogPath)
-                DispatchQueue.main.async {
-                    self.isRunningResync = false
-                    self.resyncOutputLines = [errMsg]
-                    self.syncManager.setSyncing(for: currentProfile.id, isSyncing: false)
-                }
-                return
-            }
-
-            // Build the sync command — direction determines source/destination
-            let fullRemotePath = "\(capturedRcloneRemote):\(capturedRemotePath)"
-            var arguments: [String]
-
-            if capturedSyncDirection == .localToRemote {
-                // Upload: local is source, remote is destination
-                arguments = ["sync", capturedLocalSyncPath, fullRemotePath, "--verbose", "--use-json-log", "--stats", "2s"]
-            } else {
-                // Download: remote is source, local is destination
-                arguments = ["sync", fullRemotePath, capturedLocalSyncPath, "--verbose", "--use-json-log", "--stats", "2s"]
-            }
-
-            // Add filter file if it exists (excludes ._* files, .DS_Store, etc.)
-            if fileManager.fileExists(atPath: capturedFilterPath) {
-                arguments.append(contentsOf: ["--filter-from", capturedFilterPath])
-            }
-
-            // Add --no-check-certificate if configured for this remote
-            if RcloneConfigService.shared.readRemoteConfig(name: capturedRcloneRemote)?.values["no_check_certificate"] == "true" {
-                arguments.append("--no-check-certificate")
-            }
-
-            // Add any additional flags from profile
-            if !capturedAdditionalFlags.isEmpty {
-                let extraFlags = capturedAdditionalFlags.components(separatedBy: .whitespaces).filter { !$0.isEmpty }
-                arguments.append(contentsOf: extraFlags)
-            }
-
-            process.executableURL = URL(fileURLWithPath: path)
-            process.arguments = arguments
-            process.standardOutput = pipe
-            process.standardError = errorPipe
-
-            let cmdLine = "Running: rclone \(arguments.joined(separator: " "))"
-            writeToLog(cmdLine)
-            DispatchQueue.main.async {
-                self.resyncOutputLines = [cmdLine, ""]
-            }
-
-            do {
-                try process.run()
-
-                // Create lock file with process PID to prevent concurrent scheduled syncs
-                let pid = process.processIdentifier
-                try? "\(pid)".write(toFile: capturedLockPath, atomically: true, encoding: .utf8)
-
-                // Read output in batches to reduce UI updates and lag
-                let outputHandle = pipe.fileHandleForReading
-                let errorHandle = errorPipe.fileHandleForReading
-                var outputBuffer = ""
-                var lastUpdateTime = Date()
-                let updateInterval: TimeInterval = 2.0  // Update UI every 2 seconds (reduced from 0.5s)
-                let bufferLock = NSLock()
-
-                let flushBuffer = {
-                    bufferLock.lock()
-                    let lines = outputBuffer.components(separatedBy: "\n").filter { !$0.isEmpty }
-                    let rawContent = outputBuffer
-                    outputBuffer = ""
-                    bufferLock.unlock()
-
-                    if !lines.isEmpty {
-                        // Write to log file (append raw content)
-                        if let data = rawContent.data(using: .utf8),
-                           let handle = FileHandle(forWritingAtPath: syncLogPath) {
-                            handle.seekToEndOfFile()
-                            handle.write(data)
-                            bytesWritten += Int64(data.count)
-                            handle.closeFile()
-                        }
-
-                        // Periodically truncate log file if it's getting too large
-                        let now = Date()
-                        if bytesWritten > maxLogSize && now.timeIntervalSince(lastTruncateTime) > truncateInterval {
-                            if let content = try? String(contentsOfFile: syncLogPath, encoding: .utf8) {
-                                let logLines = content.components(separatedBy: "\n")
-                                let truncated = logLines.suffix(100000).joined(separator: "\n")
-                                // Use non-atomic write to preserve inode (prevents LogWatcher from losing track)
-                                try? truncated.write(toFile: syncLogPath, atomically: false, encoding: .utf8)
-                            }
-                            bytesWritten = 0
-                            lastTruncateTime = now
-                        }
-
-                        DispatchQueue.main.async {
-                            // Circular buffer: append new lines, keep only last maxOutputLines
-                            self.resyncOutputLines.append(contentsOf: lines)
-                            if self.resyncOutputLines.count > capturedMaxLines {
-                                self.resyncOutputLines.removeFirst(self.resyncOutputLines.count - capturedMaxLines)
-                            }
-                        }
-                    }
-                }
-
-                outputHandle.readabilityHandler = { handle in
-                    let data = handle.availableData
-                    if let str = String(data: data, encoding: .utf8), !str.isEmpty {
-                        bufferLock.lock()
-                        outputBuffer += str
-                        let now = Date()
-                        let shouldFlush = now.timeIntervalSince(lastUpdateTime) >= updateInterval
-                        if shouldFlush { lastUpdateTime = now }
-                        bufferLock.unlock()
-
-                        if shouldFlush { flushBuffer() }
-                    }
-                }
-
-                errorHandle.readabilityHandler = { handle in
-                    let data = handle.availableData
-                    if let str = String(data: data, encoding: .utf8), !str.isEmpty {
-                        bufferLock.lock()
-                        outputBuffer += str
-                        let now = Date()
-                        let shouldFlush = now.timeIntervalSince(lastUpdateTime) >= updateInterval
-                        if shouldFlush { lastUpdateTime = now }
-                        bufferLock.unlock()
-
-                        if shouldFlush { flushBuffer() }
-                    }
-                }
-
-                process.waitUntilExit()
-
-                // Remove lock file now that process has finished
-                try? fileManager.removeItem(atPath: capturedLockPath)
-
-                outputHandle.readabilityHandler = nil
-                errorHandle.readabilityHandler = nil
-
-                // Flush any remaining buffered output
-                flushBuffer()
-
-                // Read any remaining data
-                let remainingOutput = outputHandle.readDataToEndOfFile()
-                let remainingError = errorHandle.readDataToEndOfFile()
-
-                DispatchQueue.main.async {
-                    if let str = String(data: remainingOutput, encoding: .utf8), !str.isEmpty {
-                        let lines = str.components(separatedBy: "\n").filter { !$0.isEmpty }
-                        self.resyncOutputLines.append(contentsOf: lines)
-                        if self.resyncOutputLines.count > capturedMaxLines {
-                            self.resyncOutputLines.removeFirst(self.resyncOutputLines.count - capturedMaxLines)
-                        }
-                    }
-                    if let str = String(data: remainingError, encoding: .utf8), !str.isEmpty {
-                        let lines = str.components(separatedBy: "\n").filter { !$0.isEmpty }
-                        self.resyncOutputLines.append(contentsOf: lines)
-                        if self.resyncOutputLines.count > capturedMaxLines {
-                            self.resyncOutputLines.removeFirst(self.resyncOutputLines.count - capturedMaxLines)
-                        }
-                    }
-
-                    let exitCode = process.terminationStatus
-                    if exitCode == 0 {
-                        self.appendOutputLine("")
-                        self.appendOutputLine("✓ Resync completed successfully!")
-
-                        // Load the launchd agent now that resync is complete
-                        // Note: We don't trigger a follow-up sync here because rclone's
-                        // "all files changed" safety check will fail it anyway. The scheduled
-                        // sync will handle this naturally - the first few syncs may fail with
-                        // this transient error, but subsequent syncs will work once the
-                        // listing files stabilize.
-                        if loadAgentOnCompletion {
-                            self.setupService.loadAgent(for: currentProfile)
-                            self.appendOutputLine("✓ Scheduled sync is now active.")
-                        }
-
-                        // Clear any errors and set to idle - resync was successful
-                        self.syncManager.clearError(for: currentProfile.id)
-                        self.syncManager.setSyncing(for: currentProfile.id, isSyncing: false)
-                        self.syncManager.refreshSettings()
-                    } else {
-                        self.appendOutputLine("")
-                        self.appendOutputLine("✗ Resync failed with exit code \(exitCode)")
-
-                        // Still load the agent even on failure so scheduled syncs can retry
-                        if loadAgentOnCompletion {
-                            self.setupService.loadAgent(for: currentProfile)
-                        }
-
-                        // Clear syncing state (will show error from log if any)
-                        self.syncManager.setSyncing(for: currentProfile.id, isSyncing: false)
-                    }
-
-                    self.isRunningResync = false
-                }
-            } catch {
-                let errMsg = "Error running rclone: \(error.localizedDescription)"
-                writeToLog(errMsg)
-                DispatchQueue.main.async {
-                    self.appendOutputLine(errMsg)
-                    self.syncManager.setSyncing(for: currentProfile.id, isSyncing: false)
-                    self.isRunningResync = false
-                }
-            }
-        }
-    }
-
-    /// Helper to append a single line to the output buffer with circular buffer logic
-    private func appendOutputLine(_ line: String) {
-        resyncOutputLines.append(line)
-        if resyncOutputLines.count > maxOutputLines {
-            resyncOutputLines.removeFirst(resyncOutputLines.count - maxOutputLines)
-        }
-    }
-
-    /// Helper to append multiple lines to the output buffer with circular buffer logic
-    private func appendOutputLines(_ lines: [String]) {
-        resyncOutputLines.append(contentsOf: lines)
-        if resyncOutputLines.count > maxOutputLines {
-            resyncOutputLines.removeFirst(resyncOutputLines.count - maxOutputLines)
-        }
     }
 
     // MARK: - File Dialogs
@@ -1762,179 +1388,6 @@ struct ProfileDetailView: View {
         }
     }
 
-    // MARK: - Initial Sync Resume Support
-
-    /// Check if there's a running initial sync that we should resume monitoring
-    /// Note: SyncManager handles detection and state management via lock file.
-    /// This method handles the log tailing UI for initial syncs started by this view.
-    private func checkForRunningInitialSync() {
-        let syncLogPath = profile.logPath
-
-        // Check if initial log exists (indicates an initial sync was started by this view)
-        guard FileManager.default.fileExists(atPath: syncLogPath) else { return }
-
-        // Check if SyncManager detected a running sync for this profile
-        // SyncManager uses lock file detection which is more reliable than pgrep
-        guard syncManager.state(for: profile.id) == .syncing else {
-            // No running sync - clean up stale log file
-            try? FileManager.default.removeItem(atPath: syncLogPath)
-            return
-        }
-
-        // Resume showing the output panel for the initial sync
-        isRunningResync = true
-        showResyncOutput = true
-
-        // Load existing content and start tailing
-        startTailingLogFile(at: syncLogPath)
-    }
-
-    /// Start tailing a log file for resumed sync monitoring
-    private func startTailingLogFile(at path: String) {
-        // Read existing content
-        if let existingContent = try? String(contentsOfFile: path, encoding: .utf8) {
-            let lines = existingContent.components(separatedBy: "\n").filter { !$0.isEmpty }
-            resyncOutputLines = Array(lines.suffix(maxOutputLines))
-        }
-
-        // Open file for monitoring
-        logFileDescriptor = open(path, O_RDONLY)
-        guard logFileDescriptor >= 0 else { return }
-
-        // Seek to end of file so we only get new content
-        lseek(logFileDescriptor, 0, SEEK_END)
-
-        // Create dispatch source for file changes
-        let source = DispatchSource.makeFileSystemObjectSource(
-            fileDescriptor: logFileDescriptor,
-            eventMask: [.write, .extend],
-            queue: DispatchQueue.global(qos: .userInitiated)
-        )
-
-        // Capture the file descriptor for the closures
-        let fd = logFileDescriptor
-
-        source.setEventHandler {
-            // Read new content
-            var buffer = [UInt8](repeating: 0, count: 4096)
-            let bytesRead = read(fd, &buffer, buffer.count)
-
-            if bytesRead > 0 {
-                if let newContent = String(bytes: buffer[0..<bytesRead], encoding: .utf8) {
-                    let lines = newContent.components(separatedBy: "\n").filter { !$0.isEmpty }
-                    if !lines.isEmpty {
-                        DispatchQueue.main.async { [self] in
-                            self.appendOutputLines(lines)
-                        }
-                    }
-                }
-            }
-        }
-
-        source.setCancelHandler {
-            if fd >= 0 {
-                close(fd)
-            }
-        }
-
-        logFileMonitor = source
-        source.resume()
-
-        // Also start a timer to check if rclone is still running
-        startSyncCompletionMonitor()
-    }
-
-    /// Monitor for sync completion (when sync process exits)
-    /// Uses lock file check which is more reliable than pgrep
-    private func startSyncCompletionMonitor() {
-        // Capture needed values for background check
-        let lockPath = profile.lockFilePath
-
-        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 5) { [self] in
-            // Check if sync is still running via lock file
-            let isRunning = self.checkSyncRunningViaLockFile(at: lockPath)
-
-            if !isRunning {
-                DispatchQueue.main.async {
-                    self.handleResumedSyncCompletion()
-                }
-            } else {
-                // Keep checking
-                self.startSyncCompletionMonitor()
-            }
-        }
-    }
-
-    /// Check if sync is running via lock file (can be called from background)
-    private func checkSyncRunningViaLockFile(at lockPath: String) -> Bool {
-        guard FileManager.default.fileExists(atPath: lockPath),
-              let pidStr = try? String(contentsOfFile: lockPath, encoding: .utf8)
-                  .trimmingCharacters(in: .whitespacesAndNewlines),
-              let pid = Int32(pidStr) else {
-            return false
-        }
-        // Check if process is still running
-        return kill(pid, 0) == 0
-    }
-
-    /// Handle completion of a resumed sync
-    private func handleResumedSyncCompletion() {
-        stopLogFileMonitor()
-
-        // Update state
-        appendOutputLine("")
-        appendOutputLine("✓ Sync completed")
-
-        isRunningResync = false
-        syncManager.setSyncing(for: profile.id, isSyncing: false)
-        syncManager.refreshSettings()
-    }
-
-    /// Stop the log file monitor
-    private func stopLogFileMonitor() {
-        logFileMonitor?.cancel()
-        logFileMonitor = nil
-    }
-
-    /// Write content to the initial sync log file
-    private func writeToInitialLog(_ content: String) {
-        let logPath = profile.logPath
-        let fileManager = FileManager.default
-
-        // Create log directory if needed
-        let logDir = (logPath as NSString).deletingLastPathComponent
-        if !fileManager.fileExists(atPath: logDir) {
-            try? fileManager.createDirectory(atPath: logDir, withIntermediateDirectories: true)
-        }
-
-        // Append to log file
-        if let data = content.data(using: .utf8) {
-            if fileManager.fileExists(atPath: logPath) {
-                if let handle = FileHandle(forWritingAtPath: logPath) {
-                    handle.seekToEndOfFile()
-                    handle.write(data)
-                    handle.closeFile()
-                }
-            } else {
-                fileManager.createFile(atPath: logPath, contents: data)
-            }
-        }
-    }
-
-    /// Truncate log file to keep only the last N lines (prevents unbounded growth)
-    private func truncateInitialLogIfNeeded() {
-        let logPath = profile.logPath
-        let maxLogLines = 100000  // ~10MB of text (increased to reduce truncation frequency)
-
-        guard let content = try? String(contentsOfFile: logPath, encoding: .utf8) else { return }
-        let lines = content.components(separatedBy: "\n")
-
-        if lines.count > maxLogLines {
-            let truncated = lines.suffix(maxLogLines).joined(separator: "\n")
-            // Use non-atomic write to preserve inode (prevents LogWatcher from losing track)
-            try? truncated.write(toFile: logPath, atomically: false, encoding: .utf8)
-        }
-    }
 }
 
 /// Browse folders on an rclone remote and pick one directly, instead of guessing the

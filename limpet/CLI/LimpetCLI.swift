@@ -23,6 +23,7 @@ enum CLICommand: Equatable {
     case profiles
     case status(target: String?)
     case sync(String)
+    case watch(String)
     case reinstall(String)
     case install(String)
     case profileCreate(CreateSource)
@@ -77,9 +78,6 @@ struct CLIEnvironment {
     var uninstallProfile: (SyncProfile) -> String?
     /// Delete the authoritative `{shortId}.profile.json`.
     var deleteProfileFile: (SyncProfile) -> Void
-    /// Run the shared sync script against a profile's derived config path,
-    /// blocking until it exits. Returns the script's exit code.
-    var runSyncScript: (_ configPath: String) -> Int32
     /// Read all of stdin (for `profile create -`). `nil` on read failure.
     var readStdin: () -> String?
     /// Read a file's contents as UTF-8 text. `nil` if missing/unreadable.
@@ -124,11 +122,12 @@ enum LimpetCLI {
 
     Operate:
       sync <name|id>                          Run a sync now and wait for it to finish
+      watch <name|id>                         Run as the profile's realtime watcher (launchd only; never exits)
 
     profile set keys: name, rcloneRemote, remotePath, localSyncPath,
       drivePathToMonitor, additionalRcloneFlags,
       syncDirection (localToRemote|remoteToLocal), syncIntervalMinutes,
-      isMuted. Use enable/disable for isEnabled.
+      transfers, isMuted. Use enable/disable for isEnabled.
 
     Profiles author JSON against schema/profile.schema.json under the config
     directory; the same file an agent can drop in or edit directly.
@@ -193,6 +192,12 @@ enum LimpetCLI {
                 return .failure(CLIUsageError(message: "usage: limpet sync <name|shortId>"))
             }
             return .success(.sync(target))
+
+        case "watch":
+            guard let target = rest.first(where: { !$0.hasPrefix("-") }) else {
+                return .failure(CLIUsageError(message: "usage: limpet watch <name|shortId>"))
+            }
+            return .success(.watch(target))
 
         case "reinstall", "install":
             guard let target = rest.first(where: { !$0.hasPrefix("-") }) else {
@@ -305,6 +310,8 @@ enum LimpetCLI {
             return runStatus(target, env: env)
         case .sync(let target):
             return runSync(target, env: env)
+        case .watch(let target):
+            return runWatch(target, env: env)
         case .reinstall(let target):
             return runReinstall(target, env: env)
         case .install(let target):
@@ -549,28 +556,43 @@ enum LimpetCLI {
 
     // MARK: - sync
 
+    /// Ask the profile's launchd-owned `limpet watch` process to sync now —
+    /// the CLI never runs rclone or the sync script itself (limpet-plan.md
+    /// L3(c)); `launchctl kill`'s exit status IS the liveness check. Returns
+    /// immediately (does not wait for the sync to finish): unlike the old
+    /// direct-run behavior, the actual sync happens in the watcher process,
+    /// asynchronously — `limpet logs <id> --follow` or `limpet status` are how
+    /// to observe it.
     private static func runSync(_ target: String, env: CLIEnvironment) -> Int32 {
         guard let profile = resolveProfile(target, in: env.readProfiles()) else {
             env.stderr("error: no profile matches \"\(target)\"\n")
             return 1
         }
-        guard env.fileExists(SyncProfile.sharedScriptPath) else {
-            env.stderr("error: sync script not installed (\(SyncProfile.sharedScriptPath))\n")
-            return 1
-        }
-        guard env.fileExists(profile.configPath) else {
-            env.stderr("error: derived config missing (\(profile.configPath)); enable the profile first\n")
-            return 1
-        }
-
-        env.stdout("syncing \"\(profile.name)\" (\(profile.shortId))…\n")
-        let code = env.runSyncScript(profile.configPath)
-        if code == 0 {
-            env.stdout("sync completed\n")
+        let (exitCode, _) = env.runLaunchctl(["kill", "SIGUSR1", "gui/\(getuid())/\(profile.launchdLabel)"])
+        if exitCode == 0 {
+            env.stdout("sync requested for \"\(profile.name)\" (\(profile.shortId)) — see: limpet logs \(profile.shortId)\n")
+            return 0
         } else {
-            env.stderr("sync exited \(code) — see: limpet logs \(profile.shortId)\n")
+            env.stderr("error: no watcher running for \"\(profile.name)\" (\(profile.shortId))\n")
+            return 1
         }
-        return code
+    }
+
+    // MARK: - watch
+
+    /// Run as `<profile>`'s realtime watcher — the single owner of that
+    /// profile's sync scheduling (limpet-plan.md L3). NEVER returns: it parks
+    /// the calling thread in `dispatchMain()` via `SyncWatchDaemon.run`. Only
+    /// `resolveProfile` runs through the (fakeable) `env` here; the daemon
+    /// itself always talks to the real filesystem/launchd, so this branch is
+    /// exercised in the self-test only up to argument parsing/resolution —
+    /// never actually invoked with `run(_: .watch, ...)`, which would hang.
+    private static func runWatch(_ target: String, env: CLIEnvironment) -> Int32 {
+        guard let profile = resolveProfile(target, in: env.readProfiles()) else {
+            env.stderr("error: no profile matches \"\(target)\"\n")
+            return 1
+        }
+        SyncWatchDaemon.run(profile: profile)
     }
 
     // MARK: - install / reinstall
@@ -848,6 +870,9 @@ enum LimpetCLI {
         case "syncIntervalMinutes":
             guard let n = int(value), n >= 1 else { return "syncIntervalMinutes must be an integer ≥ 1" }
             profile.syncIntervalMinutes = n
+        case "transfers":
+            guard let n = int(value), n >= 1 else { return "transfers must be an integer ≥ 1" }
+            profile.transfers = n
 
         // Bools.
         case "isMuted":
@@ -907,14 +932,6 @@ extension CLIEnvironment {
             deleteProfileFile: { profile in
                 let path = "\(SyncProfile.configDirectory)/\(profile.shortId).profile.json"
                 try? FileManager.default.removeItem(atPath: path)
-            },
-            runSyncScript: { configPath in
-                let (exit, _) = CLIEnvironment.runProcess(
-                    launchPath: "/bin/bash",
-                    args: [SyncProfile.sharedScriptPath, configPath],
-                    timeout: 3600  // a large repo's first sync can run for minutes
-                )
-                return exit
             },
             readStdin: {
                 let data = FileHandle.standardInput.readDataToEndOfFile()

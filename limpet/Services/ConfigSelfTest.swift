@@ -62,6 +62,9 @@ enum ConfigSelfTest {
             testDoctorPureChecks,
             testCLIResolveAndList,
             testShimInstallIdempotentNonClobber,
+            testWatchScheduler,
+            testGeneratedScriptText,
+            testGeneratedPlistShape,
         ]
 
         for check in checks {
@@ -703,7 +706,6 @@ enum ConfigSelfTest {
         installProfile: @escaping (SyncProfile) -> String? = { _ in nil },
         uninstallProfile: @escaping (SyncProfile) -> String? = { _ in nil },
         deleteProfileFile: @escaping (SyncProfile) -> Void = { _ in },
-        runSyncScript: @escaping (_ configPath: String) -> Int32 = { _ in 0 },
         readStdin: @escaping () -> String? = { nil },
         readFile: @escaping (String) -> String? = { _ in nil },
         stdout: @escaping (String) -> Void = { _ in },
@@ -719,7 +721,6 @@ enum ConfigSelfTest {
             installProfile: installProfile,
             uninstallProfile: uninstallProfile,
             deleteProfileFile: deleteProfileFile,
-            runSyncScript: runSyncScript,
             readStdin: readStdin,
             readFile: readFile,
             stdout: stdout,
@@ -828,15 +829,28 @@ enum ConfigSelfTest {
         }
 
 
-        // sync runs the script for a sync profile (script + config present).
-        var ranScript = false
+        // sync signals the watcher via `launchctl kill SIGUSR1` — it never
+        // runs the script itself (limpet-plan.md L3(c)).
+        var killArgs: [String] = []
         let syncEnv = fakeCLIEnvironment(
             readProfiles: { [enabled] },
-            fileExists: { _ in true },
-            runSyncScript: { _ in ranScript = true; return 0 }
+            runLaunchctl: { args in killArgs = args; return (0, "") }
         )
-        guard LimpetCLI.execute(["sync", enabled.shortId], env: syncEnv) == 0, ranScript else {
-            return report("AC-CLI6", "cli-write-commands", false, "(sync did not run the script)")
+        guard LimpetCLI.execute(["sync", enabled.shortId], env: syncEnv) == 0,
+              killArgs == ["kill", "SIGUSR1", "gui/\(getuid())/\(enabled.launchdLabel)"] else {
+            return report("AC-CLI6", "cli-write-commands", false, "(sync did not launchctl kill SIGUSR1: got \(killArgs))")
+        }
+
+        // No watcher running (non-zero launchctl kill) → exits non-zero, greppable.
+        var syncStderr = ""
+        let noWatcherEnv = fakeCLIEnvironment(
+            readProfiles: { [enabled] },
+            runLaunchctl: { _ in (1, "") },
+            stderr: { syncStderr += $0 }
+        )
+        guard LimpetCLI.execute(["sync", enabled.shortId], env: noWatcherEnv) != 0,
+              syncStderr.contains("no watcher running") else {
+            return report("AC-CLI6", "cli-write-commands", false, "(sync with no watcher did not report it)")
         }
 
         return report("AC-CLI6", "cli-write-commands", true)
@@ -1194,6 +1208,249 @@ enum ConfigSelfTest {
         }
 
         return report("AC-CLI4", "shim-install-idempotent-nonclobber", true)
+    }
+
+    // MARK: - AC-W1 — SyncWatchScheduler: exact rerun counts (limpet-plan.md L3)
+
+    /// A deterministic fake clock/queue for `SchedulerRunner.scheduleAfter`:
+    /// records `(fireAt, action)` pairs instead of touching a real timer, and
+    /// `advance(by:)` fires everything due, in fire-order, including actions
+    /// scheduled by an action that just fired — exactly what lets the "runner
+    /// returns 75 repeatedly while the clock advances 60s" case simulate a
+    /// full minute of 10s backoffs in a single synchronous call.
+    private final class VirtualClock {
+        private(set) var now: TimeInterval = 0
+        private var scheduled: [(fireAt: TimeInterval, action: () -> Void)] = []
+
+        func scheduleAfter(_ seconds: TimeInterval, _ action: @escaping () -> Void) {
+            scheduled.append((now + seconds, action))
+        }
+
+        func advance(by seconds: TimeInterval) {
+            let target = now + seconds
+            while true {
+                guard let nextIndex = scheduled.indices
+                    .filter({ scheduled[$0].fireAt <= target })
+                    .min(by: { scheduled[$0].fireAt < scheduled[$1].fireAt })
+                else { break }
+                let entry = scheduled.remove(at: nextIndex)
+                now = entry.fireAt
+                entry.action()
+            }
+            now = target
+        }
+    }
+
+    /// Builds a `SchedulerRunner` whose `runChild` calls `completion`
+    /// SYNCHRONOUSLY and immediately with whatever `exitCode()` currently
+    /// returns — the scheduler is pure, so no dispatch queue or real process
+    /// is needed to drive it deterministically.
+    private static func fakeSchedulerRunner(
+        sourceExists: @escaping () -> Bool = { true },
+        exitCode: @escaping () -> Int32,
+        clock: VirtualClock,
+        onLogSourceMissing: (() -> Void)? = nil
+    ) -> SchedulerRunner {
+        SchedulerRunner(
+            sourceExists: sourceExists,
+            runChild: { completion in completion(exitCode()) },
+            now: { clock.now },
+            scheduleAfter: { seconds, action in clock.scheduleAfter(seconds, action) },
+            logSourceMissing: { onLogSourceMissing?() }
+        )
+    }
+
+    private static func testWatchScheduler() -> Bool {
+        // Case 1: trigger during a run -> exactly 1 rerun. `runChild` here
+        // does NOT call completion synchronously — it captures it, so the
+        // test can trigger() a SECOND time while genuinely still "running"
+        // before manually finishing the first run.
+        do {
+            var pendingCompletions: [(Int32) -> Void] = []
+            let clock = VirtualClock()
+            let runner = SchedulerRunner(
+                sourceExists: { true },
+                runChild: { completion in pendingCompletions.append(completion) },
+                now: { clock.now },
+                scheduleAfter: { s, a in clock.scheduleAfter(s, a) },
+                logSourceMissing: {}
+            )
+            let scheduler = SyncWatchScheduler(runner: runner)
+            scheduler.trigger()  // run 1 starts, held open
+            guard pendingCompletions.count == 1 else {
+                return report("AC-W1", "watch-scheduler", false, "(expected run 1 to start immediately)")
+            }
+            scheduler.trigger()  // trigger while running -> sets pending
+            let firstCompletion = pendingCompletions.removeFirst()
+            firstCompletion(0)  // run 1 exits 0 -> pending causes exactly 1 rerun
+            guard scheduler.runCount == 2, pendingCompletions.count == 1 else {
+                return report(
+                    "AC-W1", "watch-scheduler", false,
+                    "(trigger-during-run: expected exactly 1 rerun, runCount=\(scheduler.runCount))")
+            }
+            pendingCompletions.removeFirst()(0)  // finish run 2 cleanly
+            guard scheduler.runCount == 2, scheduler.state == .idle else {
+                return report("AC-W1", "watch-scheduler", false, "(trigger-during-run: did not settle idle at 2 runs)")
+            }
+        }
+
+        // Case 2: 5 triggers during a run -> still exactly 1 rerun (coalesced).
+        do {
+            var pendingCompletions: [(Int32) -> Void] = []
+            let clock = VirtualClock()
+            let runner = SchedulerRunner(
+                sourceExists: { true },
+                runChild: { completion in pendingCompletions.append(completion) },
+                now: { clock.now },
+                scheduleAfter: { s, a in clock.scheduleAfter(s, a) },
+                logSourceMissing: {}
+            )
+            let scheduler = SyncWatchScheduler(runner: runner)
+            scheduler.trigger()
+            for _ in 0..<5 { scheduler.trigger() }
+            pendingCompletions.removeFirst()(0)
+            guard scheduler.runCount == 2, pendingCompletions.count == 1 else {
+                return report(
+                    "AC-W1", "watch-scheduler", false,
+                    "(5-triggers-during-run: expected exactly 1 rerun, runCount=\(scheduler.runCount))")
+            }
+            pendingCompletions.removeFirst()(0)
+            guard scheduler.runCount == 2 else {
+                return report("AC-W1", "watch-scheduler", false, "(5-triggers-during-run: extra rerun happened)")
+            }
+        }
+
+        // Case 3: a manual sync-now (also just `trigger()`) during a run -> 1 rerun.
+        // Same mechanism as case 1 — SIGUSR1 and FSEvents both funnel into the
+        // same `trigger()`, so this is the identical assertion under the name
+        // the plan uses for it.
+        do {
+            var pendingCompletions: [(Int32) -> Void] = []
+            let clock = VirtualClock()
+            let runner = SchedulerRunner(
+                sourceExists: { true },
+                runChild: { completion in pendingCompletions.append(completion) },
+                now: { clock.now },
+                scheduleAfter: { s, a in clock.scheduleAfter(s, a) },
+                logSourceMissing: {}
+            )
+            let scheduler = SyncWatchScheduler(runner: runner)
+            scheduler.trigger()          // run 1 (e.g. FSEvents)
+            scheduler.trigger()          // manual "sync now" while running
+            pendingCompletions.removeFirst()(1)  // exit 1 (a real failure) still reruns once
+            guard scheduler.runCount == 2 else {
+                return report("AC-W1", "watch-scheduler", false, "(manual-during-run: expected exactly 1 rerun)")
+            }
+            pendingCompletions.removeFirst()(0)
+        }
+
+        // Case 4: a trigger while idle -> 1 run (the debounce itself is
+        // `DirectoryWatcher`'s, already exercised upstream of `trigger()`).
+        do {
+            let clock = VirtualClock()
+            let scheduler = SyncWatchScheduler(
+                runner: fakeSchedulerRunner(exitCode: { 0 }, clock: clock))
+            scheduler.trigger()
+            guard scheduler.runCount == 1, scheduler.state == .idle else {
+                return report("AC-W1", "watch-scheduler", false, "(trigger-while-idle: expected exactly 1 run)")
+            }
+        }
+
+        // Case 5: runner returns 75 repeatedly while the clock advances 60s ->
+        // runs <= 60/10 + 1 (fixed 10s backoff between retries, never a hot loop).
+        do {
+            let clock = VirtualClock()
+            let scheduler = SyncWatchScheduler(
+                runner: fakeSchedulerRunner(exitCode: { 75 }, clock: clock))
+            scheduler.trigger()  // run 1 at t=0
+            clock.advance(by: 60)
+            guard scheduler.runCount <= 7, scheduler.runCount >= 2 else {
+                return report(
+                    "AC-W1", "watch-scheduler", false,
+                    "(exit-75-backoff: expected 2...7 runs over 60s at a 10s backoff, got \(scheduler.runCount))")
+            }
+        }
+
+        // Case 6: a missing source path never runs the child.
+        do {
+            let clock = VirtualClock()
+            var missingLogCount = 0
+            let scheduler = SyncWatchScheduler(
+                runner: fakeSchedulerRunner(
+                    sourceExists: { false },
+                    exitCode: { 0 },
+                    clock: clock,
+                    onLogSourceMissing: { missingLogCount += 1 }))
+            scheduler.trigger()
+            scheduler.trigger()
+            clock.advance(by: 5)
+            scheduler.trigger()
+            guard scheduler.runCount == 0 else {
+                return report("AC-W1", "watch-scheduler", false, "(missing-source: expected 0 runs, got \(scheduler.runCount))")
+            }
+            guard missingLogCount >= 1 else {
+                return report("AC-W1", "watch-scheduler", false, "(missing-source: expected at least one source-missing log)")
+            }
+        }
+
+        return report("AC-W1", "watch-scheduler", true)
+    }
+
+    // MARK: - AC-W2 — generated sync script text (limpet-plan.md L3(b))
+
+    private static func testGeneratedScriptText() -> Bool {
+        let script = SyncSetupService.shared.generateSyncScript()
+
+        guard script.contains("--links") else {
+            return report("AC-W2", "watch-script-text", false, "(missing --links)")
+        }
+        guard script.contains("exit 75") else {
+            return report("AC-W2", "watch-script-text", false, "(missing exit 75 in the lock-held branch)")
+        }
+        guard script.contains("exit 2") else {
+            return report("AC-W2", "watch-script-text", false, "(missing exit 2 for a missing source)")
+        }
+        guard !script.contains(#"mkdir -p "$LOCAL_PATH""#) else {
+            return report("AC-W2", "watch-script-text", false, "(still unconditionally creates $LOCAL_PATH)")
+        }
+        guard !script.lowercased().contains("hard-delete"), !script.lowercased().contains("hard_delete") else {
+            return report("AC-W2", "watch-script-text", false, "(contains a hard-delete flag)")
+        }
+
+        return report("AC-W2", "watch-script-text", true)
+    }
+
+    // MARK: - AC-W3 — generated launchd plist shape (limpet-plan.md L3(c))
+
+    private static func testGeneratedPlistShape() -> Bool {
+        let profile = sampleProfile()
+        let plist = SyncSetupService.shared.generateLaunchdPlist(for: profile)
+
+        guard plist.contains("<key>KeepAlive</key>"), plist.contains("<true/>") else {
+            return report("AC-W3", "watch-plist-shape", false, "(missing KeepAlive true)")
+        }
+        guard plist.contains("<key>RunAtLoad</key>") else {
+            return report("AC-W3", "watch-plist-shape", false, "(missing RunAtLoad)")
+        }
+        guard !plist.contains("StartInterval") else {
+            return report("AC-W3", "watch-plist-shape", false, "(still has StartInterval)")
+        }
+        guard let programArgsRange = plist.range(of: "<key>ProgramArguments</key>") else {
+            return report("AC-W3", "watch-plist-shape", false, "(missing ProgramArguments)")
+        }
+        let afterProgramArgs = plist[programArgsRange.upperBound...]
+        guard let arrayClose = afterProgramArgs.range(of: "</array>") else {
+            return report("AC-W3", "watch-plist-shape", false, "(ProgramArguments array not closed)")
+        }
+        let argsBlock = afterProgramArgs[..<arrayClose.lowerBound]
+        guard argsBlock.contains("<string>watch</string>"),
+              argsBlock.contains("<string>\(profile.shortId)</string>") else {
+            return report(
+                "AC-W3", "watch-plist-shape", false,
+                "(ProgramArguments does not end with watch, <shortId>)")
+        }
+
+        return report("AC-W3", "watch-plist-shape", true)
     }
 
 }
