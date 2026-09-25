@@ -499,7 +499,7 @@ final class RcloneConfigService: Sendable {  // every stored property is an immu
     /// and `limpet remote add` both get it (review finding 9).
     static func withDerivedEndpoint(type: String, values: [String: String]) -> [String: String] {
         var values = values
-        if type == "s3", values["provider"] == "Mega", (values["endpoint"] ?? "").isEmpty,
+        if type == "s3", values["provider"]?.lowercased() == "mega", (values["endpoint"] ?? "").isEmpty,
            let region = values["region"], !region.isEmpty {
             values["endpoint"] = "s3.\(region).megas4.com"
         }

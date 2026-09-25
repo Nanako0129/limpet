@@ -344,7 +344,11 @@ enum LimpetCLI {
         switch type {
         case "s3":
             values["access_key_id"] = keyId
-            values["provider"] = flags["--provider"]
+            // A known provider in any case is written in the wizard's spelling.
+            values["provider"] = flags["--provider"].map { given in
+                RemoteProvider.s3Compatible.requiredFields.first { $0.key == "provider" }?.options?
+                    .first { $0.value.caseInsensitiveCompare(given) == .orderedSame }?.value ?? given
+            }
             values["region"] = flags["--region"]
             values["endpoint"] = flags["--endpoint"]
             // A MEGA S4 endpoint is derived from --region by the shared creation

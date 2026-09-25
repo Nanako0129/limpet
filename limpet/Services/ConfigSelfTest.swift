@@ -2684,6 +2684,15 @@ enum ConfigSelfTest {
                 "access_key_id": "AKID", "provider": "Mega", "region": "ap-tokyo-1"]) else {
             return report(id, slug, false, "(remote add did not parse as expected)")
         }
+        // Internal review F9: a known provider in another case is written canonically.
+        var lower = argv
+        lower[lower.firstIndex(of: "Mega")!] = "mega"
+        guard case .success(.remoteAdd(let lowered)) = LimpetCLI.parse(lower), lowered == request,
+              case .success(.remoteAdd(let unknown)) = LimpetCLI.parse(
+                ["remote", "add", "n", "--type", "s3", "--provider", "Wasabi", "--access-key-id", "k"]),
+              unknown.values["provider"] == "Wasabi" else {
+            return report(id, slug, false, "(--provider mega not normalized to Mega, or an unknown provider changed)")
+        }
         for bad in [argv + ["--secret", "x"], argv + ["--secret-access-key=x"], ["remote", "add", "n", "--type", "s3"],
                     ["remote", "add", "n", "--type", "b2", "--access-key-id", "k", "--endpoint", "e"]] {
             guard case .failure = LimpetCLI.parse(bad) else {
@@ -2844,6 +2853,8 @@ enum ConfigSelfTest {
         let matrix: [([String: String]?, SyncProfile, Int)] = [
             (["type": "s3", "provider": "Mega"], profile, 42),
             (["type": "s3", "provider": "Mega"], versioned, 42),        // S4 has no versioning
+            (["type": "s3", "provider": "mega"], versioned, 42),        // in any case (internal review F9)
+            (["type": "s3", "provider": "CLOUDFLARE"], versioned, 42),
             (["type": "s3", "provider": "Cloudflare"], versioned, 42),  // nor has R2
             (["type": "s3", "provider": "AWS"], profile, 42),
             (["type": "s3", "provider": "AWS"], versioned, 0),
@@ -2856,6 +2867,11 @@ enum ConfigSelfTest {
         for (section, candidate, expected) in matrix
         where SyncSetupService.maxDeleteArgument(for: candidate, remoteSection: section) != expected {
             return report(id, slug, false, "(\(String(describing: section)) versioning=\(candidate.remoteVersioning) expected \(expected))")
+        }
+        // A hand-edited `provider = mega` still gets the derived MEGA S4 endpoint.
+        guard RcloneConfigService.withDerivedEndpoint(
+                type: "s3", values: ["provider": "mega", "region": "ap-tokyo-1"])["endpoint"] == "s3.ap-tokyo-1.megas4.com" else {
+            return report(id, slug, false, "(provider = mega got no derived endpoint)")
         }
         // Wired into the derived config from the remote's rclone.conf section.
         let confPath = "\(selfTestRoot)/ac-l4-12-rclone.conf"

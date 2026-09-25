@@ -180,7 +180,7 @@ refused content is copied to `profiles/refused/`, both named in
 the first attempt saved instead of creating a second one.
 
 **Delete limit (limpet-plan.md L4 F6).** For remotes that keep no deleted
-versions — s3 `provider = Mega` (MEGA S4) and `Cloudflare` (R2) always, any
+versions — s3 `provider = Mega` (MEGA S4) and `Cloudflare` (R2), in any case, always, any
 other s3 provider unless the profile sets `remoteVersioning: true` — the
 derived config carries `maxDelete` (profile field, default 100;
 `SyncSetupService.maxDeleteArgument`) and the script adds `--max-delete N`.
@@ -313,7 +313,7 @@ isn't limpet's own.
 | `limpet profile clear-delete-limit <name\|shortId>` | Remove the persistent `{shortId}.delete-limit` marker a `--max-delete` trip left (exit 76), then send the watcher SIGUSR1. Check the remote first: up to `maxDelete` files were already deleted in the run that tripped. |
 | `limpet install <name\|shortId>` | Install an already-enabled profile's launchd agent (idempotent; runs `SyncSetupService.install`). Complements `profile enable`, which early-returns without installing when the profile is ALREADY enabled — so `install` re-creates an agent that went missing. Refuses a disabled or incomplete profile. Never flips `isEnabled`. |
 | `limpet reinstall <name\|shortId>` | Regenerate script+plist and reinstall the agent (uninstall → install), i.e. the settings-save reinstall path. Works for any sync mode. Refuses a disabled profile. |
-| `limpet remote add <name> --type s3\|b2 --access-key-id <id> [--provider <p>] [--endpoint <https url>] [--region <r>]` | Create a keychain-backed remote through `RcloneConfigService.addKeychainRemote`, the same function the wizard uses. The secret is read from stdin — a no-echo prompt on a terminal, otherwise one line from the pipe — never from an argument. Writes the non-secret section plus `limpet_keychain = true` to rclone.conf (appended; nothing else rewritten) and stores the secret with `/usr/bin/security -i` (`add-generic-password -s limpet -a <name> -T /usr/bin/security`, secret hex-encoded on stdin). Names are `[A-Za-z0-9_]+` and may not collide case-insensitively with any rclone.conf section; endpoints must be https; `--provider Mega --region <r>` derives `s3.<r>.megas4.com`. |
+| `limpet remote add <name> --type s3\|b2 --access-key-id <id> [--provider <p>] [--endpoint <https url>] [--region <r>]` | Create a keychain-backed remote through `RcloneConfigService.addKeychainRemote`, the same function the wizard uses. The secret is read from stdin — a no-echo prompt on a terminal, otherwise one line from the pipe — never from an argument. Writes the non-secret section plus `limpet_keychain = true` to rclone.conf (appended; nothing else rewritten) and stores the secret with `/usr/bin/security -i` (`add-generic-password -s limpet -a <name> -T /usr/bin/security`, secret hex-encoded on stdin). Names are `[A-Za-z0-9_]+` and may not collide case-insensitively with any rclone.conf section; endpoints must be https; `--provider Mega --region <r>` derives `s3.<r>.megas4.com`; a known `--provider` in any case (`mega`) is written in the wizard's spelling (`Mega`). |
 
 **Operate:**
 

@@ -671,7 +671,8 @@ final class SyncSetupService {
     /// remote's rclone.conf section (`nil` = not found = no limit).
     static func maxDeleteArgument(for profile: SyncProfile, remoteSection: [String: String]?) -> Int {
         guard remoteSection?["type"] == "s3" else { return 0 }
-        let neverVersioned = ["Mega", "Cloudflare"].contains(remoteSection?["provider"] ?? "")
+        // Case-insensitive: a hand-edited or CLI-given `provider = mega` is still MEGA S4.
+        let neverVersioned = ["mega", "cloudflare"].contains((remoteSection?["provider"] ?? "").lowercased())
         return neverVersioned || !profile.remoteVersioning ? profile.maxDelete : 0
     }
 
