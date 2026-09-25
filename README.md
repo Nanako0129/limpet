@@ -1,393 +1,122 @@
-<p align="center">
-  <img src="/docs/assets/synctray-logo.png" alt="SyncTray Logo" height="300">
-</p>
+# limpet
 
-<h1 align="center">SyncTray</h1>
+limpet is a macOS menu bar app that mirrors a local folder to a remote
+target, one-way (local → remote), using [rclone](https://rclone.org/) as
+the sync engine. It runs a copy of every provider rclone supports.
 
-<p align="center">
-  <strong>Google Drive-style folder sync for any cloud</strong><br>
-  A native macOS menu bar app for one-way background folder sync.
-</p>
+## What it does today
 
-<p align="center">
-  <img src="https://img.shields.io/badge/macOS-13.0+-blue" alt="macOS 13.0+">
-  <img src="https://img.shields.io/badge/Swift-5-orange" alt="Swift 5">
-  <img src="https://img.shields.io/badge/License-MIT-green" alt="License: MIT">
-</p>
+- **One-way local → remote mirroring.** Each profile syncs a local
+  directory to a remote path via `rclone sync`; the remote always ends up
+  matching the local source.
+- **Menu bar status.** The menu bar icon shows idle / syncing / error /
+  drive-not-mounted state, live transfer progress, and a list of recently
+  synced files.
+- **Multiple profiles.** Any number of local-folder → remote pairs, each
+  with its own schedule, enable/disable state, and notification muting.
+- **Background runs via launchd.** Each enabled profile installs a
+  `~/Library/LaunchAgents` agent that runs the sync on an interval, so
+  syncing continues while the app isn't the active window.
+- **Headless CLI.** A `limpet` shim at `~/.local/bin/limpet` exposes the
+  same profile management, health checks, and manual sync as the GUI, so a
+  script or agent can drive it without opening a window.
+- **File-backed, editable configuration.** Profiles and settings live as
+  JSON under `~/.config/limpet/`, validated against a committed JSON
+  Schema; hand-editing a file live-applies through the same reconcile path
+  the GUI's Save button uses.
 
-<p align="center">
-  <img src="/docs/assets/profile-settings.png" alt="SyncTray Settings" height="600">
-</p>
-
----
-
-## What is SyncTray?
-
-SyncTray brings the convenience of Google Drive or Dropbox sync to **any cloud storage** supported by [rclone](https://rclone.org/) - that's over 70 providers including:
-
-- **Cloud Storage**: S3, Google Drive, OneDrive, Dropbox, iCloud Drive
-- **Self-Hosted**: Synology NAS, NextCloud, WebDAV, SFTP servers
-- **Object Storage**: Backblaze B2, Wasabi, MinIO
-
-Instead of running complex terminal commands, SyncTray gives you:
-
-- A **menu bar icon** showing sync status at a glance
-- **One-way sync**, upload or download, to match your workflow
-- **Automatic scheduled syncing** that runs in the background
-- **Real-time notifications** when files change
-- **Multiple sync profiles** for different folders/remotes
-
----
-
-## Sync Mode
-
-SyncTray syncs one-way. Choose your direction:
-
-| Mode              | Best For              | How It Works                             |
-| ----------------- | ---------------------- | ----------------------------------------- |
-| **One-Way Sync**  | Backups & mirrors     | Source overwrites destination             |
-
-### One-Way Sync
-
-Mirror files in one direction only. Choose your direction:
-
-- **Local → Remote**: Backup your local files to the cloud
-- **Remote → Local**: Mirror cloud files to your Mac
-
-The destination always matches the source exactly.
-
----
-
-## Features
-
-### Live Status Monitoring
-
-- Menu bar icon shows current state (idle, syncing, error, drive not mounted)
-- **Real-time progress** during sync: bytes transferred, percentage, ETA
-- Per-profile status indicators
-
-During sync, see detailed transfer progress:
-
-<p align="center">
-  <img src="/docs/assets/profile-syncing-transfer-details.png" alt="Sync Progress" height="600">
-</p>
-
-View sync output and logs directly in the app:
-
-<p align="center">
-  <img src="/docs/assets/profile-syncing-with-logs.png" alt="Sync Logs" height="600">
-</p>
-
-### Smart Notifications
-
-- Batched file change notifications (lists 1-3 files, summarizes 4+)
-- Click notifications to open the sync directory
-- Error notifications with actionable details
-
-### Multi-Profile Support
-
-- Create unlimited sync profiles (Work, Personal, Archive, etc.)
-- Each profile syncs on its own schedule
-- Independent enable/disable per profile
-- Per-profile status indicators in the menu
-
-### Recent Changes
-
-- View last 20 synced files in the menu dropdown
-- See operation type: Copied, Updated, Deleted, Renamed
-- Click any file to reveal it in Finder
-
-<p align="center">
-  <img src="/docs/assets/status-bar-recent-changes.png" alt="Recent Changes" height="600">
-</p>
-
-### Automatic Background Sync
-
-- Configurable sync interval (5-60 minutes per profile)
-- Uses native macOS launchd - syncs even when app is closed
-- Lock file prevents overlapping syncs
-- Smart external drive detection - pauses when unmounted
-
-### One-Click Actions
-
-- **Sync Now**: Trigger immediate sync for all enabled profiles
-- **Open Directory**: Jump to your local sync folder
-- **View Log**: Open the sync log for troubleshooting
+> **Realtime watching is a work in progress.** Right now, real-time
+> FSEvents-based triggering only runs while the menu bar app is open; the
+> launchd agent falls back to interval polling once the app is closed. A
+> planned change moves ownership of scheduling and watching into the
+> per-profile launchd agent itself, so real-time sync keeps working with
+> the app closed — see the project plan for the design.
 
 ## Requirements
 
-- **macOS 13.0** or later
-- **[rclone](https://rclone.org/)** installed and configured with at least one remote
+- macOS 13.0 or later
+- [rclone](https://rclone.org/), installed and with at least one remote
+  configured (`brew install rclone`, then `rclone config`)
 
-### Installing rclone
+limpet auto-detects rclone from Homebrew, `/usr/local/bin`, `/usr/bin`, and
+common nix install locations.
 
-```bash
-# Using Homebrew
-brew install rclone
+## Building from source
 
-# Configure your first remote
-rclone config
-```
-
-See [rclone's documentation](https://rclone.org/docs/) for detailed setup guides for each provider.
-
-SyncTray auto-detects rclone from Homebrew, `/usr/local/bin`, `/usr/bin`, and nix installs (nix-darwin, per-user, and profile paths), so a non-Homebrew rclone works without extra configuration.
-
----
-
-## Installation
-
-### Option 1: Homebrew (Recommended)
+There is no signed or notarized release and no Homebrew cask — build it
+yourself:
 
 ```bash
-brew tap mthines/synctray
-brew install --cask synctray
+git clone https://github.com/Nanako0129/limpet.git
+cd limpet
+xcodebuild -project limpet.xcodeproj -scheme limpet \
+  -configuration Debug CODE_SIGNING_ALLOWED=NO build
 ```
 
-### Option 2: Download Release
-
-Download the latest `.zip` from [Releases](../../releases), extract, and drag `SyncTray.app` to `/Applications`.
-
-**Note:** Since the app isn't notarized, you'll need to allow it once:
+The built app is unsigned. On first launch you'll need to clear the
+quarantine attribute:
 
 ```bash
-xattr -cr /Applications/SyncTray.app
+xattr -cr /Applications/limpet.app
 ```
 
-### Option 3: Build from Source
+## The `limpet` CLI
 
-```bash
-git clone https://github.com/mthines/sync-tray.git
-cd sync-tray
-xcodebuild -scheme SyncTray -configuration Release build
-```
+The app installs a `limpet` shim at `~/.local/bin/limpet` on every launch
+(add `~/.local/bin` to your `PATH`). It works whether or not the GUI app is
+running, since every mutating command goes through the same file-backed
+config the GUI reads and writes.
 
----
+| Command | Purpose |
+| --- | --- |
+| `limpet doctor` | Health check: rclone found, schemas installed, agents loaded, stale locks, remote reachability. |
+| `limpet status [name\|id]` | One line per profile: enabled, agent loaded, running, last result. |
+| `limpet profiles` | List profiles (no secrets). |
+| `limpet profile show <name\|id>` | Print a profile's full config as JSON. |
+| `limpet logs <name\|id> [--follow]` | Print or tail a profile's sync log. |
+| `limpet test-remote <name\|id>` | Probe a profile's remote reachability. |
+| `limpet listremotes` | Passthrough to `rclone listremotes`. |
+| `limpet profile create --from <file>` / `-` | Create a profile from a `.profile.json` file or stdin. |
+| `limpet profile enable` / `disable` / `delete <name\|id>` | Enable, disable, or delete a profile. |
+| `limpet profile set <name\|id> <key> <value> ...` | Edit fields on an existing profile. |
+| `limpet install` / `reinstall <name\|id>` | (Re)install a profile's launchd agent. |
+| `limpet sync <name\|id>` | Run a sync now and block until it finishes. |
 
-## Getting Started
-
-### 1. Launch SyncTray
-
-The app icon appears in your menu bar. A yellow gear indicates setup is needed.
-
-### 2. Create a Sync Profile
-
-1. Click the menu bar icon → **Settings**
-2. Click **+** to add a new profile
-
-<p align="center">
-  <img src="/docs/assets/new-profile-wizard-intro.png" alt="New Profile Wizard" height="600">
-</p>
-
-3. Select your cloud provider:
-
-<p align="center">
-  <img src="/docs/assets/new-profile-wizard-providers.png" alt="Select Provider" height="600">
-</p>
-
-4. Configure:
-   - **Name**: Give it a descriptive name (e.g., "Work Documents")
-   - **Remote**: Select from your configured rclone remotes
-   - **Remote Path**: Choose which folder on the remote to sync
-   - **Local Path**: Pick the local folder to sync to
-   - **Sync Interval**: How often to sync (default: 15 minutes)
-
-### 3. Install the Profile
-
-Click **Install** to activate the profile. SyncTray will:
-
-- Create the local directory if needed
-- Establish the initial sync baseline
-- Install a background scheduler (launchd agent)
-- Start monitoring for changes
-
-### 4. You're Done!
-
-Your folder will now sync automatically on schedule. The menu bar shows sync status, and you'll get notifications when files change.
-
-## Menu Bar States
-
-<p align="center">
-  <img src="/docs/assets/status-bar-idle.png" alt="Menu Bar" height="600">
-</p>
-
-| Icon                        | State             | Meaning                          |
-| --------------------------- | ----------------- | -------------------------------- |
-| Gray sync arrows            | Idle              | All syncs complete, system ready |
-| Blue sync arrows (animated) | Syncing           | Sync in progress                 |
-| Red warning triangle        | Error             | Last sync failed - check logs    |
-| Orange drive with X         | Drive Not Mounted | External drive disconnected      |
-| Yellow gear                 | Setup Required    | No profiles configured           |
-
-## Advanced Configuration
-
-### Additional rclone Flags
-
-Each profile supports custom rclone flags. Common options:
-
-- `--exclude "*.tmp"` - Exclude patterns
-- `--bwlimit 1M` - Limit bandwidth
-- `--dry-run` - Test without making changes
-
-### External Drive Sync
-
-When syncing to an external drive:
-
-1. Enable "External Drive" toggle in profile settings
-2. SyncTray auto-detects the mount point
-3. Syncs pause when the drive is unmounted
-4. Resume automatically when reconnected
-
-### File-Backed Configuration
-
-`~/.config/synctray/` is the editable, authoritative home for SyncTray's config. A human or a script can hand-edit these files and the running app applies the change live, no restart needed.
+## File locations
 
 | Path | Contents |
-| ---- | -------- |
-| `profiles/{id}.profile.json` | The full profile: paths, remote, sync direction, enable/mute state |
-| `settings.json` | App settings: launch at login, debug logging |
-| `schema/*.schema.json` | JSON Schemas for validating the files above |
+| --- | --- |
+| `~/.local/bin/limpet` | CLI shim |
+| `~/.local/bin/limpet-sync.sh` | Shared sync script (all profiles) |
+| `~/.config/limpet/profiles/{shortId}.profile.json` | Authoritative profile (editable) |
+| `~/.config/limpet/profiles/{shortId}.json` | Derived, script-only config |
+| `~/.config/limpet/settings.json` | App settings (editable) |
+| `~/.config/limpet/schema/*.schema.json` | JSON Schemas for the files above |
+| `~/.local/log/limpet-sync-{shortId}.log` | Per-profile sync log |
+| `/tmp/limpet-sync-{shortId}.lock` | Lock file (prevents overlapping runs) |
+| `~/Library/LaunchAgents/com.nanako.limpet.watch.{shortId}.plist` | Per-profile launchd agent |
 
-- **Live apply**: a file watcher (~1s debounce) reconciles every external edit through the same path as the app's Save button — an enabled/disabled toggle installs or removes the launchd agent.
-- **Create by dropping a file**: write a new `*.profile.json` with a fresh `id` and SyncTray creates that profile. Only five keys are required — `id`, `name`, `rcloneRemote`, `remotePath`, `localSyncPath` — every other field takes its default. The launchd agent installs only once the profile is also `isEnabled` and valid, so you can stage a profile disabled, then flip it on in a second edit.
-- **Credential-free**: rclone secrets live in `~/.config/rclone/rclone.conf`, never in these files. Validate a profile against `schema/profile.schema.json` before writing it.
+## What limpet deliberately doesn't do
 
-### The `synctray` CLI
-
-SyncTray installs a `synctray` shim at `~/.local/bin/synctray` on every launch. Add `~/.local/bin` to your `PATH` to run it. The mutating commands work through the file-backed config, so they run whether or not the menu bar app is open.
-
-**Inspect** (read-only):
-
-| Command | Purpose |
-| ------- | ------- |
-| `synctray doctor` | Health report: rclone version, schemas installed, per-profile agent state, stale locks, remote reachability. Exits non-zero on any failure. |
-| `synctray status [name\|id]` | One line per profile: enabled, agent loaded, running, last result. |
-| `synctray profiles` | List every profile with enabled state and remote (no secrets). |
-| `synctray logs <name\|id> [--follow]` | Print or tail a profile's sync log. |
-| `synctray test-remote <name\|id>` | Probe a profile's remote with a hard timeout. |
-| `synctray listremotes` | Passthrough to `rclone listremotes`. |
-
-**Configure** (mutating, headless-capable):
-
-| Command | Purpose |
-| ------- | ------- |
-| `synctray profile create --from <file>` | Create a profile from a `.profile.json` file (or `-` for stdin). |
-| `synctray profile enable <name\|id>` | Enable a profile and install its agent. |
-| `synctray profile disable <name\|id>` | Disable a profile and uninstall its agent. |
-| `synctray profile delete <name\|id>` | Uninstall the agent and remove the profile. |
-
-**Operate:**
-
-| Command | Purpose |
-| ------- | ------- |
-| `synctray sync <name\|id>` | Run one sync now and block until it finishes, returning the script's exit code. |
-
-A `<name\|id>` resolves by exact short id first, then case-insensitive name; an unmatched target exits non-zero.
-
-## File Locations
-
-SyncTray creates these files (per profile):
-
-| Location                                              | Purpose                                    |
-| ----------------------------------------------------- | ------------------------------------------ |
-| `~/.local/bin/synctray`                               | Headless CLI shim                          |
-| `~/.local/bin/synctray-sync.sh`                       | Shared sync script                         |
-| `~/.config/synctray/profiles/{id}.profile.json`       | Authoritative profile (editable)           |
-| `~/.config/synctray/profiles/{id}.json`              | Derived script-only config                 |
-| `~/.config/synctray/settings.json`                    | App settings (editable)                    |
-| `~/.local/log/synctray-sync-{id}.log`                 | Sync log output                            |
-| `~/Library/LaunchAgents/com.synctray.sync.{id}.plist` | Background scheduler                        |
-
-## Troubleshooting
-
-### "App can't be opened" warning
-
-macOS blocks unsigned apps. Fix with:
-
-**Fix (run once in Terminal):**
-
-```bash
-xattr -cr /Applications/SyncTray.app
-```
-
-### Sync shows error state
-
-1. Click **View Log** in the menu to see detailed error messages
-2. Common issues:
-   - Remote not accessible (check network/credentials)
-   - Transient network/timeout error (use **Retry Sync**)
-
-### Sync not running on schedule
-
-1. Verify the profile is installed (green checkmark in Settings)
-2. Check if launchd agent is loaded:
-   ```bash
-   launchctl list | grep synctray
-   ```
-3. Try uninstalling and reinstalling the profile
-
-### Files not appearing in Recent Changes
-
-- Only files actually transferred appear (unchanged files are skipped)
-- Check that `--use-json-log` is being used (automatic with SyncTray)
+This is a personal, reduced fork of a larger upstream project. It has no
+two-way (bisync) sync, no fallback remote, no telemetry, no
+versioning/auto-update, no notarized release, no Homebrew cask, no VFS
+mount ("Stream") mode, and no Finder extension. See LICENSE for
+attribution to the project it was forked from.
 
 ## Development
 
-### Building
-
 ```bash
-git clone https://github.com/mthines/sync-tray.git
-cd sync-tray
-xcodebuild -scheme SyncTray -configuration Debug build
+xcodebuild -project limpet.xcodeproj -scheme limpet \
+  -configuration Debug CODE_SIGNING_ALLOWED=NO build
 ```
 
-### Architecture
-
-- **SyncManager**: Orchestrates sync operations and state
-- **ProfileStore**: File-backed profile persistence (`~/.config/synctray/profiles/`)
-- **ConfigFileWatcher**: Live-applies external edits to the config directory
-- **LogWatcher**: Real-time log monitoring via DispatchSource
-- **LogParser**: Parses rclone JSON logs
-- **SyncSetupService**: Generates scripts and launchd plists
-- **SyncTrayCLI**: Headless `synctray` command
-- **NotificationService**: Smart batched notifications
-
-### Commit Convention
-
-Uses [Conventional Commits](https://www.conventionalcommits.org/):
-
-| Prefix   | Version Bump  | Example                        |
-| -------- | ------------- | ------------------------------ |
-| `feat:`  | Minor (0.X.0) | `feat: add dark mode support`  |
-| `fix:`   | Patch (0.0.X) | `fix: resolve crash on launch` |
-| `feat!:` | Major (X.0.0) | `feat!: redesign settings API` |
-
-### Creating a Release
-
-```bash
-./scripts/release.sh           # Auto-detect from commits
-./scripts/release.sh --minor   # Force minor bump
-./scripts/release.sh v1.2.3    # Exact version
-```
-
----
-
-## Community & Support
-
-Need help, want to share feedback, or have a feature idea?
-Join the SyncTray community on Discord: <https://discord.gg/KBp8kb3EwP>
-
-You can also reach the same link from inside the app via **Settings → Help & Feedback** or the menu bar dropdown.
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
+There's no XCTest target; `limpet --self-test` (Debug builds only) runs
+the assertion suite covering profile persistence, migration, the config
+reconciler, and the CLI. `scripts/check-schema-in-sync.sh` is a
+fail-closed check that the committed JSON Schema stays in lockstep with
+the `SyncProfile` model.
 
 ## License
 
-MIT License - see [LICENSE](LICENSE) for details.
-
-## Acknowledgments
-
-- [rclone](https://rclone.org/) - The powerful sync engine
-- Apple's SwiftUI and MenuBarExtra APIs
+MIT — see [LICENSE](LICENSE).
