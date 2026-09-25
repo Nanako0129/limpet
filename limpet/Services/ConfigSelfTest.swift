@@ -73,6 +73,7 @@ enum ConfigSelfTest {
             testMissingSourceIsNotCreated,
             testScriptRefusesNonNumericTransfers,
             testScriptRefusesMultilineFlags,
+            testScriptRefusesDumpFlags,
             testShimQuotesHostilePath,
             testTransfersChangeReinstalls,
             testTranslocatedAppRefused,
@@ -1964,6 +1965,21 @@ enum ConfigSelfTest {
         let argv = ((try? String(contentsOfFile: argvPath, encoding: .utf8)) ?? "")
             .split(separator: "\n").map(String.init)
         return (process.terminationStatus, fm.fileExists(atPath: ranPath), log, argv)
+    }
+
+    // MARK: - AC-W16 — --dump flags are refused (they can log credentials)
+
+    private static func testScriptRefusesDumpFlags() -> Bool {
+        for flags in ["--dump auth", "--dump=headers", "--bwlimit=5M --dump-headers"] {
+            guard let result = runScriptFixture(name: "ac-w16-dump", overrides: ["additionalFlags": flags]) else {
+                return report("AC-W16", "script-refuses-dump-flags", false, "(fixture setup failed)")
+            }
+            guard result.status == 64, !result.stubRan, result.log.contains("contains --dump") else {
+                return report("AC-W16", "script-refuses-dump-flags", false,
+                              "(\(flags): status \(result.status), stubRan \(result.stubRan))")
+            }
+        }
+        return report("AC-W16", "script-refuses-dump-flags", true)
     }
 
     // MARK: - AC-W14 — `transfers` is never evaluated as shell arithmetic

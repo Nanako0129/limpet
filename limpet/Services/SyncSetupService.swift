@@ -478,6 +478,13 @@ final class SyncSetupService {
                     echo "$(date '+%Y-%m-%d %H:%M:%S') - Refusing to sync: additionalRcloneFlags contains quotes, dollar signs, backticks or ~, which limpet passes to rclone literally. Write flags as --flag=value without quotes, e.g. --exclude=*.tmp" >> "$LOG_FILE"
                     exit 64
                 fi
+                # --dump headers/bodies/auth writes request contents to the log; for a
+                # native B2 remote --dump auth includes the application key (Basic auth).
+                # Not measured, since no network is used in tests; refused for every remote.
+                if [[ "$flag_token" == --dump* ]]; then
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') - Refusing to sync: additionalRcloneFlags contains --dump, which can write credentials into the log" >> "$LOG_FILE"
+                    exit 64
+                fi
             done
 
             # Find rclone binary. Cover the common package-manager locations,
