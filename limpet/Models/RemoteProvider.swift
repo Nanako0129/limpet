@@ -9,8 +9,28 @@ enum RemoteProvider: String, Codable, CaseIterable, Identifiable {
     case smb = "smb"
     case webdav = "webdav"
     case sftp = "sftp"
+    /// S3-compatible object storage — MEGA S4, Cloudflare R2, AWS, MinIO,
+    /// Backblaze B2's S3 API, others. Keychain-backed (limpet-plan.md L4).
+    case s3Compatible = "s3"
+    /// Backblaze B2 through rclone's native b2 backend. Keychain-backed.
+    case b2 = "b2"
 
     var id: String { rawValue }
+
+    /// Whether the remote's secret lives in the login keychain instead of
+    /// rclone.conf (limpet-plan.md L4 F2): created only through
+    /// `RcloneConfigService.addKeychainRemote`.
+    var isKeychainBacked: Bool { secretKey != nil }
+
+    /// The rclone option holding the secret, which is never written to
+    /// rclone.conf for these providers.
+    var secretKey: String? {
+        switch self {
+        case .s3Compatible: return "secret_access_key"
+        case .b2: return "key"
+        default: return nil
+        }
+    }
 
     var displayName: String {
         switch self {
@@ -28,6 +48,10 @@ enum RemoteProvider: String, Codable, CaseIterable, Identifiable {
             return "WebDAV"
         case .sftp:
             return "SFTP"
+        case .s3Compatible:
+            return "S3-compatible"
+        case .b2:
+            return "Backblaze B2"
         }
     }
 
@@ -47,6 +71,10 @@ enum RemoteProvider: String, Codable, CaseIterable, Identifiable {
             return "server.rack"
         case .sftp:
             return "terminal"
+        case .s3Compatible:
+            return "cube.box"
+        case .b2:
+            return "archivebox"
         }
     }
 
@@ -65,6 +93,10 @@ enum RemoteProvider: String, Codable, CaseIterable, Identifiable {
             return "smb"
         case .sftp:
             return "sftp"
+        case .s3Compatible:
+            return "s3"
+        case .b2:
+            return "b2"
         }
     }
 
@@ -73,7 +105,7 @@ enum RemoteProvider: String, Codable, CaseIterable, Identifiable {
         switch self {
         case .googleDrive, .dropbox, .oneDrive:
             return true
-        case .synology, .smb, .webdav, .sftp:
+        case .synology, .smb, .webdav, .sftp, .s3Compatible, .b2:
             return false
         }
     }
@@ -149,6 +181,33 @@ enum RemoteProvider: String, Codable, CaseIterable, Identifiable {
                 ProviderField(key: "disable_hashcheck", label: "Disable Hash Check",
                               type: .hidden, defaultValue: "true")
             ]
+        case .s3Compatible:
+            return [
+                ProviderField(key: "provider", label: "Provider", type: .dropdown, options: [
+                    FieldOption(value: "Mega", label: "MEGA S4"),
+                    FieldOption(value: "Cloudflare", label: "Cloudflare R2"),
+                    FieldOption(value: "AWS", label: "Amazon S3"),
+                    FieldOption(value: "Minio", label: "MinIO"),
+                    FieldOption(value: "Other", label: "Other (incl. Backblaze B2 S3 API)")
+                ], defaultValue: "Mega"),
+                ProviderField(key: "access_key_id", label: "Access Key ID", type: .text),
+                ProviderField(key: "secret_access_key", label: "Secret Access Key", type: .password,
+                              helpText: "Stored in your login keychain, never in rclone.conf. "
+                                + "When editing, enter it again."),
+                ProviderField(key: "endpoint", label: "Endpoint", type: .text,
+                              placeholder: "s3.ap-tokyo-1.megas4.com",
+                              helpText: "https only. Leave empty for Amazon S3.",
+                              isOptional: true),
+                ProviderField(key: "region", label: "Region", type: .text,
+                              placeholder: "ap-tokyo-1", isOptional: true)
+            ]
+        case .b2:
+            return [
+                ProviderField(key: "account", label: "Application Key ID", type: .text),
+                ProviderField(key: "key", label: "Application Key", type: .password,
+                              helpText: "Stored in your login keychain, never in rclone.conf. Use a "
+                                + "bucket-scoped key without the deleteFiles capability.")
+            ]
         }
     }
 
@@ -185,6 +244,9 @@ enum RemoteProvider: String, Codable, CaseIterable, Identifiable {
                 ProviderField(key: "key_file", label: "SSH Key Path", type: .file,
                               helpText: "Path to private key file (e.g., ~/.ssh/id_rsa)")
             ]
+        case .s3Compatible, .b2:
+            // Deliberately nothing: no certificate-skip option for these types (F7).
+            return []
         }
     }
 }
@@ -269,6 +331,10 @@ struct RemoteConfiguration {
 
         if name.contains(":") || name.contains(" ") {
             errors.append("Remote name cannot contain ':' or spaces")
+        }
+
+        if provider.isKeychainBacked, !name.isEmpty, !KeychainSecretStore.isValidAccount(name) {
+            errors.append("Remote name may only contain letters, digits and _")
         }
 
         for field in provider.requiredFields where field.type != .hidden && !field.isOptional {

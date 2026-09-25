@@ -86,6 +86,7 @@ enum ConfigSelfTest {
             testKeychainRemoteRefusals,
             testSecretInjectionHelper,
             testCLIRemoteAdd,
+            testWizardProvidersRemapAndRoute,
         ]
 
         for check in checks {
@@ -2344,6 +2345,7 @@ enum ConfigSelfTest {
         let body = """
             #!/bin/sh
             printf '%s\\n' "$@" > "\(dir)/argv"
+            cat > "\(dir)/stdin"
             case "$(cat "\(dir)/mode")" in
               found) printf '%s\\n' '\(secret)'; exit 0 ;;
               missing) exit 44 ;;
@@ -2624,6 +2626,73 @@ enum ConfigSelfTest {
                                              addKeychainRemote: { _, _, _, _ in calledWithoutSecret = true; return nil })
         guard LimpetCLI.execute(argv, env: noSecretEnv) == 66, !calledWithoutSecret else {
             return report(id, slug, false, "(remote add without a secret did not stop before creating)")
+        }
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L4-10 — s3/b2 providers: read back as themselves, wizard routes to the keychain path
+
+    private static func testWizardProvidersRemapAndRoute() -> Bool {
+        let id = "AC-L4-10", slug = "s3-b2-remap-and-wizard-route"
+        let dir = "\(selfTestRoot)/ac-l4-10"
+        try? FileManager.default.removeItem(atPath: dir)
+        guard let stub = makeSecurityStub(in: dir, secret: "unused") else {
+            return report(id, slug, false, "(fixture setup failed)")
+        }
+        let confPath = "\(dir)/rclone.conf"
+        let original = "[s4]\ntype = s3\nprovider = Mega\naccess_key_id = AKID\nlimpet_keychain = true\n\n"
+            + "[bb]\ntype = b2\naccount = KEYID\nlimpet_keychain = true\n"
+        let rcloneStub = "\(dir)/rclone-stub"
+        try? original.write(toFile: confPath, atomically: true, encoding: .utf8)
+        try? "#!/bin/sh\ntouch \"\(dir)/rclone-ran\"\nexit 0\n".write(toFile: rcloneStub, atomically: true, encoding: .utf8)
+        try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: rcloneStub)
+        let service = RcloneConfigService(
+            configPath: confPath, rclonePath: rcloneStub,
+            keychain: KeychainSecretStore(securityPath: stub, keychainPath: "\(dir)/k.keychain-db"))
+
+        // F5 remap: an existing s3/b2 remote edits as itself, never as webdav.
+        guard let s4 = service.readRemoteConfig(name: "s4"), s4.provider == .s3Compatible,
+              s4.generateConfigSection().contains("type = s3"),
+              let bb = service.readRemoteConfig(name: "bb"), bb.provider == .b2,
+              bb.generateConfigSection().contains("type = b2") else {
+            return report(id, slug, false, "(s3/b2 section was not read back as s3/b2)")
+        }
+
+        // Editing without re-entering the secret changes nothing (checked before the delete).
+        if (try? service.updateRemote(s4)) != nil ||
+            (try? String(contentsOfFile: confPath, encoding: .utf8)) != original ||
+            FileManager.default.fileExists(atPath: "\(dir)/rclone-ran") ||
+            FileManager.default.fileExists(atPath: "\(dir)/argv") {
+            return report(id, slug, false, "(update without a secret was not refused before touching rclone.conf)")
+        }
+
+        // The wizard's addRemote takes the keychain path: secret out of rclone.conf,
+        // marker in, and the secret reaches security on stdin (hex), never in argv.
+        let secret = "SEKRET-wizard-41e"
+        var config = RemoteConfiguration(name: "wizard_s4", provider: .s3Compatible)
+        config.values["access_key_id"] = "AKIDW"
+        config.values["endpoint"] = "https://s3.ap-tokyo-1.megas4.com"
+        config.values["secret_access_key"] = secret
+        do { try service.addRemote(config) } catch {
+            return report(id, slug, false, "(wizard addRemote threw: \(error))")
+        }
+        let conf = (try? String(contentsOfFile: confPath, encoding: .utf8)) ?? ""
+        let hex = secret.utf8.map { String(format: "%02x", $0) }.joined()
+        let argv = (try? String(contentsOfFile: "\(dir)/argv", encoding: .utf8)) ?? ""
+        let stdin = (try? String(contentsOfFile: "\(dir)/stdin", encoding: .utf8)) ?? ""
+        guard conf.hasPrefix(original), !conf.contains(secret),
+              conf.hasSuffix("[wizard_s4]\ntype = s3\naccess_key_id = AKIDW\nendpoint = https://s3.ap-tokyo-1.megas4.com\n"
+                  + "provider = Mega\nlimpet_keychain = true\n"),
+              argv == "-i\n", !argv.contains(secret), !argv.contains(hex),
+              stdin.hasPrefix("add-generic-password -s limpet -a wizard_s4 -T /usr/bin/security -X \(hex) "),
+              !stdin.contains(secret) else {
+            return report(id, slug, false, "(wizard route: conf=\(conf.replacingOccurrences(of: secret, with: "<SECRET>").debugDescription) argv=\(argv.debugDescription))")
+        }
+        var badName = RemoteConfiguration(name: "bad-name", provider: .b2)
+        badName.values["account"] = "k"
+        badName.values["key"] = "s"
+        guard badName.validate().contains(where: { $0.contains("letters, digits") }) else {
+            return report(id, slug, false, "(wizard validate accepted a keychain name with '-')")
         }
         return report(id, slug, true)
     }

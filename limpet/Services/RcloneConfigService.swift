@@ -113,6 +113,12 @@ final class RcloneConfigService: Sendable {  // every stored property is an immu
     /// Add a new remote to rclone config
     func addRemote(_ config: RemoteConfiguration) throws {
         try Self.refuseLineBreaks(config)
+        if config.provider.isKeychainBacked {
+            // The wizard's s3/b2 remotes take the same creation path as `limpet remote add`.
+            let (values, secret) = Self.splitKeychainSecret(config)
+            try addKeychainRemote(name: config.name, type: config.provider.rcloneType, values: values, secret: secret)
+            return
+        }
         // Ensure config directory exists
         let configDir = (configPath as NSString).deletingLastPathComponent
         try FileManager.default.createDirectory(
@@ -220,6 +226,10 @@ final class RcloneConfigService: Sendable {  // every stored property is an immu
             return .sftp
         case "smb":
             return .smb
+        case "s3":
+            return .s3Compatible  // F5: never rewritten as webdav on edit
+        case "b2":
+            return .b2
         default:
             return .webdav
         }
@@ -249,6 +259,18 @@ final class RcloneConfigService: Sendable {  // every stored property is an immu
     /// Update an existing remote (delete old config section, write new one)
     func updateRemote(_ config: RemoteConfiguration) throws {
         try Self.refuseLineBreaks(config)
+        if config.provider.isKeychainBacked {
+            // Rotation is delete then add (F2): the secret must be entered again.
+            // Everything checkable is checked BEFORE the old remote is deleted.
+            let (values, secret) = Self.splitKeychainSecret(config)
+            if let reason = Self.keychainRemoteError(
+                name: config.name, type: config.provider.rcloneType, values: values, secret: secret) {
+                throw ConfigError.invalidRemote(reason)
+            }
+            try deleteRemote(config.name)
+            try addKeychainRemote(name: config.name, type: config.provider.rcloneType, values: values, secret: secret)
+            return
+        }
         // Delete the existing remote first
         try deleteRemote(config.name)
 
@@ -376,26 +398,8 @@ final class RcloneConfigService: Sendable {  // every stored property is an immu
     /// `no_check_certificate` (F7). The section is APPENDED, so no other
     /// section of rclone.conf is rewritten and the file keeps its permissions.
     func addKeychainRemote(name: String, type: String, values: [String: String], secret: String) throws {
-        guard KeychainSecretStore.isValidAccount(name) else {
-            throw ConfigError.invalidRemote("a keychain-backed remote name may only contain letters, digits and _")
-        }
-        guard let allowed = Self.keychainRemoteOptions[type] else {
-            throw ConfigError.invalidRemote("type must be s3 or b2")
-        }
-        for (key, value) in values {
-            guard allowed.contains(key) else {
-                throw ConfigError.invalidRemote("option \(key) is not supported for a \(type) remote")
-            }
-            guard !value.contains("\n"), !value.contains("\r") else {
-                throw ConfigError.invalidRemote("option \(key) must not contain a line break")
-            }
-        }
-        if let endpoint = values["endpoint"], endpoint.contains("://"),
-           !endpoint.lowercased().hasPrefix("https://") {
-            throw ConfigError.invalidRemote("endpoint must use https")
-        }
-        guard !secret.isEmpty, !secret.contains("\n"), !secret.contains("\r") else {
-            throw ConfigError.invalidRemote("the secret must be one non-empty line")
+        if let reason = Self.keychainRemoteError(name: name, type: type, values: values, secret: secret) {
+            throw ConfigError.invalidRemote(reason)
         }
 
         let existing = (try? String(contentsOfFile: configPath, encoding: .utf8)) ?? ""
@@ -416,6 +420,39 @@ final class RcloneConfigService: Sendable {  // every stored property is an immu
             _ = keychain.delete(account: name)  // no orphaned secret
             throw error
         }
+    }
+
+    /// Every check on a keychain-backed remote that needs no rclone.conf read.
+    private static func keychainRemoteError(
+        name: String, type: String, values: [String: String], secret: String
+    ) -> String? {
+        guard KeychainSecretStore.isValidAccount(name) else {
+            return "a keychain-backed remote name may only contain letters, digits and _"
+        }
+        guard let allowed = keychainRemoteOptions[type] else { return "type must be s3 or b2" }
+        for (key, value) in values {
+            guard allowed.contains(key) else { return "option \(key) is not supported for a \(type) remote" }
+            guard !value.contains("\n"), !value.contains("\r") else {
+                return "option \(key) must not contain a line break"
+            }
+        }
+        if let endpoint = values["endpoint"], endpoint.contains("://"),
+           !endpoint.lowercased().hasPrefix("https://") {
+            return "endpoint must use https"
+        }
+        guard !secret.isEmpty, !secret.contains("\n"), !secret.contains("\r") else {
+            return "the secret must be one non-empty line"
+        }
+        return nil
+    }
+
+    /// The wizard keeps the secret in `values` like any password field; pull it
+    /// out (and the marker read back on edit) so it can only go to the keychain.
+    private static func splitKeychainSecret(_ config: RemoteConfiguration) -> (values: [String: String], secret: String) {
+        var values = config.values.filter { !$0.value.isEmpty }
+        let secret = config.provider.secretKey.flatMap { values.removeValue(forKey: $0) } ?? ""
+        values.removeValue(forKey: keychainMarker)
+        return (values, secret)
     }
 
     private func appendSection(_ section: String, existing: String) throws {
