@@ -98,6 +98,7 @@ enum ConfigSelfTest {
             testTransfersRange,
             testRefusedDropQuarantined,
             testOverlapOnlyAmongEnabledInstalled,
+            testProfileChangeRefusedBeforePersist,
         ]
 
         for check in checks {
@@ -3121,6 +3122,72 @@ enum ConfigSelfTest {
         } catch SyncSetupService.SetupError.refusedProfile {
         } catch {
             return report(id, slug, false, "(install threw \(error), not refusedProfile)")
+        }
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L4-19 — edits and enables are refused before anything is persisted
+
+    /// Review finding 6: the edit/enable path (`applyProfileChange`, used by
+    /// applyExternalProfileEdit and setProfileEnabled) must validate BEFORE
+    /// persisting, and report refusals and install errors instead of printing.
+    private static func testProfileChangeRefusedBeforePersist() -> Bool {
+        let id = "AC-L4-19", slug = "profile-change-refused-before-persist"
+        let running = sampleProfile(name: "Running")
+        var current = sampleProfile(name: "Mine")
+        current.remotePath = "Elsewhere"
+        struct Failed: Error {}
+        func apply(_ updated: SyncProfile, installThrows: Bool = false) -> ([String], [String]) {
+            var events: [String] = [], errors: [String] = []
+            SyncManager.applyProfileChange(
+                from: current, to: updated, others: [running, current],
+                isInstalled: { $0.id == running.id },
+                persist: { _ in events.append("persist") },
+                install: { _ in events.append("install"); if installThrows { throw Failed() } },
+                uninstall: { _ in events.append("uninstall") },
+                reportError: { errors.append($0) })
+            return (events, errors)
+        }
+        var overlapping = current
+        overlapping.remotePath = running.remotePath + "/sub"
+        var connectionString = current
+        connectionString.rcloneRemote = connectionStringRemote
+        for refused in [overlapping, connectionString] {
+            let (events, errors) = apply(refused)
+            guard events.isEmpty, errors.count == 1, errors[0].hasPrefix("Not saved"),
+                  !errors[0].contains(connectionStringSecret) else {
+                return report(id, slug, false, "(refused change: events=\(events) errors=\(errors))")
+            }
+        }
+        var moved = current
+        moved.remotePath = "Elsewhere2"
+        guard apply(moved).0 == ["persist", "uninstall", "install"], apply(moved).1.isEmpty else {
+            return report(id, slug, false, "(valid change not persisted then reinstalled: \(apply(moved)))")
+        }
+        let (events, errors) = apply(moved, installThrows: true)
+        guard events == ["persist", "uninstall", "install"], errors.count == 1, errors[0].hasPrefix("Saved, but") else {
+            return report(id, slug, false, "(install error not reported: \(events) \(errors))")
+        }
+        // install treats the profile it installs as enabled (the detail view
+        // installs before flipping the flag), so a disabled one is checked too.
+        var disabledOverlap = overlapping
+        disabledOverlap.isEnabled = false
+        do {
+            try SyncSetupService.shared.install(
+                profile: disabledOverlap, loadAgent: false, executablePath: translocatedExecutable,
+                otherProfiles: [running], isInstalled: { $0.id == running.id })
+            return report(id, slug, false, "(install of a disabled overlapping profile did not throw)")
+        } catch SyncSetupService.SetupError.refusedProfile {
+        } catch {
+            return report(id, slug, false, "(install threw \(error), not refusedProfile)")
+        }
+        // Likewise a running watcher, whatever the flag in its own copy says.
+        let dir = "\(selfTestRoot)/ac-l4-19-profiles"
+        try? FileManager.default.removeItem(atPath: dir)
+        guard ProfileStore.writeProfileFile(running, in: dir) != nil,
+              SyncWatchDaemon.refusalReason(
+                for: disabledOverlap, profilesDirectory: dir, isInstalled: { $0.id == running.id }) != nil else {
+            return report(id, slug, false, "(a watcher whose copy says disabled skipped the overlap rule)")
         }
         return report(id, slug, true)
     }

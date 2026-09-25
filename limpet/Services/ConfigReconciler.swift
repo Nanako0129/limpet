@@ -69,6 +69,55 @@ extension SyncManager {
         return .createdAndInstalled
     }
 
+    /// Review finding 6: what a profile change must pass BEFORE anything is
+    /// persisted — F4 field validation and the F6 overlap rule.
+    nonisolated static func profileChangeRefusal(
+        _ updated: SyncProfile, others: [SyncProfile], isInstalled: (SyncProfile) -> Bool
+    ) -> String? {
+        updated.validationError ?? SyncProfile.overlapError(updated, among: others, isInstalled: isInstalled)
+    }
+
+    /// Apply an edit or an enable/disable of an EXISTING profile: refuse before
+    /// persisting (nothing written, the old agent keeps running), then persist,
+    /// then drive the launchd delta `reconcileAction` picks. Every refusal and
+    /// every install/uninstall error goes to `reportError` instead of only
+    /// being printed. Pure over its closures so `ConfigSelfTest` checks the
+    /// order; `applyExternalProfileEdit` and `setProfileEnabled` use it.
+    /// Returns whether the change was persisted.
+    @discardableResult
+    static func applyProfileChange(
+        from current: SyncProfile,
+        to updated: SyncProfile,
+        others: [SyncProfile],
+        isInstalled: (SyncProfile) -> Bool,
+        persist: (SyncProfile) -> Void,
+        install: (SyncProfile) throws -> Void,
+        uninstall: (SyncProfile) throws -> Void,
+        reportError: (String) -> Void
+    ) -> Bool {
+        if let reason = profileChangeRefusal(updated, others: others, isInstalled: isInstalled) {
+            reportError("Not saved: \(reason)")
+            return false
+        }
+        persist(updated)
+        do {
+            switch reconcileAction(from: current, to: updated) {
+            case .none:
+                break
+            case .install:
+                try install(updated)
+            case .uninstall:
+                try uninstall(updated)
+            case .reinstall:
+                try? uninstall(updated)  // cleanup; the install below regenerates everything
+                try install(updated)
+            }
+        } catch {
+            reportError("Saved, but the background sync was not updated: \(error.localizedDescription)")
+        }
+        return true
+    }
+
     /// Move a refused dropped profile file to `<profiles>/refused/<stem>.<UTC
     /// timestamp>.json`, so that neither `ProfileStore.load`, the watcher's
     /// re-read (both list `*.profile.json` directly in `profiles/`) nor

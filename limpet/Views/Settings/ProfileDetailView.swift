@@ -973,6 +973,14 @@ struct ProfileDetailView: View {
         let needsReinstall = isInstalled
             && SyncManager.reconcileAction(from: currentProfile, to: updatedProfile) == .reinstall
 
+        // Refuse BEFORE persisting (review finding 6): a refused edit must
+        // leave the stored profile and the running agent as they were.
+        if let reason = SyncManager.profileChangeRefusal(
+            updatedProfile, others: profileStore.profiles, isInstalled: SyncProfile.agentInstalled) {
+            installError = "Not saved: \(reason)"
+            return
+        }
+
         profileStore.update(updatedProfile)
 
         // Clear any cached error since config changed

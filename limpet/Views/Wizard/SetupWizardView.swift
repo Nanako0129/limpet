@@ -728,8 +728,9 @@ struct SetupWizardView: View {
             updatedProfile.drivePathToMonitor = drivePath
             updatedProfile.syncIntervalMinutes = syncInterval
             updatedProfile.syncDirection = syncDirection
-
-            profileStore.update(updatedProfile)
+            // The wizard installs what it saves, so the profile is enabled;
+            // an installed-but-disabled profile would escape the F6 overlap rule.
+            updatedProfile.isEnabled = true
             profileToInstall = updatedProfile
         } else {
             // Create new profile
@@ -740,19 +741,33 @@ struct SetupWizardView: View {
                 localSyncPath: localPath,
                 drivePathToMonitor: drivePath,
                 syncIntervalMinutes: syncInterval,
+                isEnabled: true,
                 syncDirection: syncDirection
             )
-
-            profileStore.add(profile)
             profileToInstall = profile
+        }
+
+        // Refuse BEFORE persisting anything (review finding 6).
+        if let reason = SyncManager.profileChangeRefusal(
+            profileToInstall, others: profileStore.profiles, isInstalled: SyncProfile.agentInstalled) {
+            isLoading = false
+            errorMessage = "Not saved: \(reason)"
+            return
+        }
+        if editingProfile != nil {
+            profileStore.update(profileToInstall)
+        } else {
+            profileStore.add(profileToInstall)
         }
 
         // Automatically install the scheduled sync
         do {
             try SyncSetupService.shared.install(profile: profileToInstall)
         } catch {
-            print("Failed to install scheduled sync: \(error)")
-            // Don't block - the user can manually install from settings
+            // Saved, but not running: say so instead of closing silently.
+            isLoading = false
+            errorMessage = "Saved, but the background sync could not be installed: \(error.localizedDescription)"
+            return
         }
 
         isLoading = false

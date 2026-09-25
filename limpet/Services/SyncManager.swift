@@ -263,29 +263,38 @@ final class SyncManager: ObservableObject {
 
     // MARK: - Profile Management
 
-    /// Enable/disable scheduled sync for a profile
+    /// Enable/disable scheduled sync for a profile. Refused changes and
+    /// install/uninstall failures are shown through `profileErrors`, and a
+    /// refused enable persists nothing (review finding 6).
     func setProfileEnabled(_ profile: SyncProfile, enabled: Bool) {
         var updatedProfile = profile
         updatedProfile.isEnabled = enabled
-        profileStore.update(updatedProfile)
-
-        if enabled {
-            do {
-                try setupService.install(profile: updatedProfile)
-                startWatching(profile: updatedProfile)
-            } catch {
-                print("Failed to install profile: \(error)")
-            }
-        } else {
-            do {
-                try setupService.uninstall(profile: updatedProfile)
-                stopWatching(profileId: profile.id)
-            } catch {
-                print("Failed to uninstall profile: \(error)")
-            }
-        }
-
+        applyProfileChange(from: profile, to: updatedProfile)
         updateAggregateState()
+    }
+
+    /// Production wiring of `applyProfileChange` (ConfigReconciler.swift).
+    private func applyProfileChange(from current: SyncProfile, to updated: SyncProfile) {
+        clearError(for: updated.id)
+        Self.applyProfileChange(
+            from: current,
+            to: updated,
+            others: profileStore.profiles,
+            isInstalled: SyncProfile.agentInstalled,
+            persist: { profileStore.update($0) },
+            install: { [self] profile in
+                try setupService.install(profile: profile)
+                startWatching(profile: profile)
+            },
+            uninstall: { [self] profile in
+                try setupService.uninstall(profile: profile)
+                stopWatching(profileId: profile.id)
+            },
+            reportError: { [self] message in
+                profileErrors[updated.id] = message
+                LimpetSettings.debugLog("[\(updated.shortId)] \(message)")
+            }
+        )
     }
 
     // MARK: - External Config Reconcile
@@ -336,45 +345,7 @@ final class SyncManager: ObservableObject {
             return
         }
 
-        let action = Self.reconcileAction(from: currentProfile, to: updatedProfile)
-
-        profileStore.update(updatedProfile)
-        clearError(for: updatedProfile.id)
-
-        switch action {
-        case .none:
-            break
-
-        case .install:
-            do {
-                try setupService.install(profile: updatedProfile)
-                startWatching(profile: updatedProfile)
-            } catch {
-                print("Failed to install externally-edited profile: \(error)")
-            }
-
-        case .uninstall:
-            do {
-                try setupService.uninstall(profile: updatedProfile)
-                stopWatching(profileId: updatedProfile.id)
-            } catch {
-                print("Failed to uninstall externally-edited profile: \(error)")
-            }
-
-        case .reinstall:
-            do {
-                try setupService.uninstall(profile: updatedProfile)
-            } catch {
-                // Ignore uninstall errors, matching ProfileDetailView.reinstallSync.
-            }
-            do {
-                try setupService.install(profile: updatedProfile)
-                startWatching(profile: updatedProfile)
-            } catch {
-                print("Failed to reinstall externally-edited profile: \(error)")
-            }
-        }
-
+        applyProfileChange(from: currentProfile, to: updatedProfile)
         updateAggregateState()
     }
 

@@ -121,8 +121,13 @@ final class SyncSetupService {
         // AND a translocated executable path, so if this check ever went missing
         // the translocation guard below still stops install before it touches a
         // real file, and the test sees the wrong error instead of side effects.
+        // Installing makes the profile sync whatever its isEnabled flag says
+        // (the detail view installs first and flips the flag afterwards), so
+        // the overlap rule treats it as enabled.
+        var running = profile
+        running.isEnabled = true
         if let reason = profile.validationError
-            ?? SyncProfile.overlapError(profile, among: otherProfiles, isInstalled: isInstalled) {
+            ?? SyncProfile.overlapError(running, among: otherProfiles, isInstalled: isInstalled) {
             throw SetupError.refusedProfile(reason)
         }
 

@@ -124,8 +124,11 @@ enum SyncWatchDaemon {
         profilesDirectory: String,
         isInstalled: (SyncProfile) -> Bool = SyncProfile.agentInstalled
     ) -> String? {
-        profile.validationError ?? SyncProfile.overlapError(
-            profile, among: ProfileStore.profilesOnDisk(in: profilesDirectory), isInstalled: isInstalled)
+        // A running watcher syncs, whatever the flag in its copy says.
+        var running = profile
+        running.isEnabled = true
+        return profile.validationError ?? SyncProfile.overlapError(
+            running, among: ProfileStore.profilesOnDisk(in: profilesDirectory), isInstalled: isInstalled)
     }
 
     /// What `runSyncChild` returns when the remote's secret could not be read.
