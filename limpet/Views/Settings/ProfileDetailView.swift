@@ -878,7 +878,7 @@ struct ProfileDetailView: View {
             VStack(alignment: .leading, spacing: 4) {
                 Text("Additional rclone Flags")
                     .font(.subheadline.weight(.medium))
-                Text("Extra flags to pass to the rclone sync command")
+                Text("Extra flags to pass to the rclone sync command. Whitespace-separated; a flag's value cannot contain a space.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 TextField("--dry-run --verbose", text: $additionalRcloneFlags)

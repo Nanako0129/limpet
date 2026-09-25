@@ -41,7 +41,7 @@
     },
     "additionalRcloneFlags": {
       "type": "string",
-      "description": "Extra flags appended to the rclone command."
+      "description": "Extra flags appended to the rclone command. Whitespace-separated (split on IFS, not shell-parsed); a flag's value cannot contain a space."
     },
     "isEnabled": {
       "type": "boolean",

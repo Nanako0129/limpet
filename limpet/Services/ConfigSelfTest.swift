@@ -64,6 +64,9 @@ enum ConfigSelfTest {
             testShimInstallIdempotentNonClobber,
             testWatchScheduler,
             testGeneratedScriptText,
+            testGeneratedScriptNoEval,
+            testGeneratedScriptRunsWithoutExpandingConfigValues,
+            testGeneratedScriptPropagatesRcloneExitCode,
             testGeneratedPlistShape,
             testMissingSourceIsNotCreated,
             testShimQuotesHostilePath,
@@ -1423,6 +1426,201 @@ enum ConfigSelfTest {
         }
 
         return report("AC-W2", "watch-script-text", true)
+    }
+
+    // MARK: - AC-W9 — the generated script never hands a config value to eval
+
+    /// Static guard for the P1 fixed here: `eval "$RCLONE_CMD"` re-expanded any
+    /// `$`/backtick/`"`/`\` in LOCAL_PATH, REMOTE or FILTER_FILE (all sourced from
+    /// the per-profile JSON). The rclone command must be an argv array run directly.
+    private static func testGeneratedScriptNoEval() -> Bool {
+        let script = SyncSetupService.shared.generateSyncScript()
+        guard !script.contains("eval") else {
+            return report("AC-W9", "watch-script-no-eval", false, "(script still contains eval)")
+        }
+        return report("AC-W9", "watch-script-no-eval", true)
+    }
+
+    // MARK: - AC-W10 — a hostile LOCAL_PATH reaches rclone literally, never expanded
+
+    /// Behavioral counterpart to AC-W9. Writes the generated script and a profile
+    /// config into scratch dirs, with a local source directory whose name contains
+    /// `$HOME`, a backtick and a double quote, and a fake `rclone` (injected via the
+    /// `RCLONE_BIN` env var the script now honors before its hardcoded candidate
+    /// paths) that records its argv one per line. Runs the script with `/bin/bash`
+    /// and asserts the recorded source argument is the literal directory path with
+    /// no shell expansion. Never touches real rclone, ~/.config, ~/.local or launchd.
+    private static func testGeneratedScriptRunsWithoutExpandingConfigValues() -> Bool {
+        let fm = FileManager.default
+        let root = (selfTestRoot as NSString).appendingPathComponent("ac-w10-no-eval")
+        try? fm.removeItem(atPath: root)
+        try? fm.createDirectory(atPath: root, withIntermediateDirectories: true)
+
+        // A directory name containing shell metacharacters that `eval` would have
+        // re-expanded: `$HOME` (command/variable expansion), a backtick (command
+        // substitution) and a double quote (breaks out of the quoted string).
+        let hostileName = "Data$HOME`x`\"q"
+        let localPath = (root as NSString).appendingPathComponent(hostileName)
+        do {
+            try fm.createDirectory(atPath: localPath, withIntermediateDirectories: true)
+        } catch {
+            return report("AC-W10", "watch-script-no-expand", false, "(fixture setup failed: \(error))")
+        }
+
+        let scriptPath = (root as NSString).appendingPathComponent("limpet-sync.sh")
+        let configPath = (root as NSString).appendingPathComponent("profile.json")
+        let filterPath = (root as NSString).appendingPathComponent("exclude.txt")
+        let logPath = (root as NSString).appendingPathComponent("sync.log")
+        let lockPath = (root as NSString).appendingPathComponent("sync.lock")
+        let rcloneStubPath = (root as NSString).appendingPathComponent("rclone-stub.sh")
+        let argvPath = (root as NSString).appendingPathComponent("recorded-argv.txt")
+
+        let script = SyncSetupService.shared.generateSyncScript()
+        let config: [String: Any] = [
+            "remote": "selftest-fixture-remote:SelfTest",
+            "localPath": localPath,
+            "logPath": logPath,
+            "lockFile": lockPath,
+            "drivePath": "",
+            "additionalFlags": "",
+            "filterPath": filterPath,
+            "syncDirection": "localToRemote",
+            "remotePath": "SelfTest",
+            "transfers": 4,
+        ]
+        // The stub records argv one per line and exits 0. Real rclone is never invoked.
+        let rcloneStub = """
+            #!/bin/sh
+            for arg in "$@"; do
+                printf '%s\\n' "$arg"
+            done > "\(argvPath)"
+            exit 0
+            """
+
+        do {
+            try "".write(toFile: filterPath, atomically: true, encoding: .utf8)
+            try script.write(toFile: scriptPath, atomically: true, encoding: .utf8)
+            try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: scriptPath)
+            let configData = try JSONSerialization.data(withJSONObject: config)
+            try configData.write(to: URL(fileURLWithPath: configPath))
+            try rcloneStub.write(toFile: rcloneStubPath, atomically: true, encoding: .utf8)
+            try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: rcloneStubPath)
+        } catch {
+            return report("AC-W10", "watch-script-no-expand", false, "(fixture setup failed: \(error))")
+        }
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/bash")
+        process.arguments = [scriptPath, configPath]
+        var env = ProcessInfo.processInfo.environment
+        env["RCLONE_BIN"] = rcloneStubPath
+        process.environment = env
+        let stderrPipe = Pipe()
+        process.standardError = stderrPipe
+        do {
+            try process.run()
+        } catch {
+            return report("AC-W10", "watch-script-no-expand", false, "(could not run script: \(error))")
+        }
+        process.waitUntilExit()
+        let stderr = String(data: stderrPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+
+        guard process.terminationStatus == 0 else {
+            return report("AC-W10", "watch-script-no-expand", false,
+                          "(script exited \(process.terminationStatus): \(stderr))")
+        }
+        guard let argvData = try? String(contentsOfFile: argvPath, encoding: .utf8) else {
+            return report("AC-W10", "watch-script-no-expand", false, "(rclone stub was never invoked)")
+        }
+        let argv = argvData.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        guard argv.contains(localPath) else {
+            return report("AC-W10", "watch-script-no-expand", false,
+                          "(local path argument was expanded; recorded argv: \(argv))")
+        }
+        return report("AC-W10", "watch-script-no-expand", true)
+    }
+
+    // MARK: - AC-W11 — the script's own exit code is rclone's, not always 0
+
+    /// The script used to always exit 0 (its last command was an unconditional
+    /// `echo`), so `SyncWatchScheduler`/`SyncWatchDaemon` — and a plain
+    /// `limpet sync` / `bash limpet-sync.sh` caller — could never see a real
+    /// rclone failure in the process exit status, only in the log text. Runs
+    /// the script against a fake `rclone` that exits 7 and asserts the script
+    /// itself exits 7 (missing-source's 2 and lock-held's 75 are untouched by
+    /// this change and already covered by AC-W2 / the scheduler's own tests).
+    private static func testGeneratedScriptPropagatesRcloneExitCode() -> Bool {
+        let fm = FileManager.default
+        let root = (selfTestRoot as NSString).appendingPathComponent("ac-w11-exit-code")
+        try? fm.removeItem(atPath: root)
+        try? fm.createDirectory(atPath: root, withIntermediateDirectories: true)
+
+        let localPath = (root as NSString).appendingPathComponent("source")
+        do {
+            try fm.createDirectory(atPath: localPath, withIntermediateDirectories: true)
+        } catch {
+            return report("AC-W11", "watch-script-exit-code", false, "(fixture setup failed: \(error))")
+        }
+
+        let scriptPath = (root as NSString).appendingPathComponent("limpet-sync.sh")
+        let configPath = (root as NSString).appendingPathComponent("profile.json")
+        let filterPath = (root as NSString).appendingPathComponent("exclude.txt")
+        let logPath = (root as NSString).appendingPathComponent("sync.log")
+        let lockPath = (root as NSString).appendingPathComponent("sync.lock")
+        let rcloneStubPath = (root as NSString).appendingPathComponent("rclone-stub.sh")
+
+        let script = SyncSetupService.shared.generateSyncScript()
+        let config: [String: Any] = [
+            "remote": "selftest-fixture-remote:SelfTest",
+            "localPath": localPath,
+            "logPath": logPath,
+            "lockFile": lockPath,
+            "drivePath": "",
+            "additionalFlags": "",
+            "filterPath": filterPath,
+            "syncDirection": "localToRemote",
+            "remotePath": "SelfTest",
+            "transfers": 4,
+        ]
+        // A stub that always fails with a distinctive, non-75/non-2 exit code.
+        let rcloneStub = """
+            #!/bin/sh
+            exit 7
+            """
+
+        do {
+            try "".write(toFile: filterPath, atomically: true, encoding: .utf8)
+            try script.write(toFile: scriptPath, atomically: true, encoding: .utf8)
+            try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: scriptPath)
+            let configData = try JSONSerialization.data(withJSONObject: config)
+            try configData.write(to: URL(fileURLWithPath: configPath))
+            try rcloneStub.write(toFile: rcloneStubPath, atomically: true, encoding: .utf8)
+            try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: rcloneStubPath)
+        } catch {
+            return report("AC-W11", "watch-script-exit-code", false, "(fixture setup failed: \(error))")
+        }
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/bash")
+        process.arguments = [scriptPath, configPath]
+        var env = ProcessInfo.processInfo.environment
+        env["RCLONE_BIN"] = rcloneStubPath
+        process.environment = env
+        let stderrPipe = Pipe()
+        process.standardError = stderrPipe
+        do {
+            try process.run()
+        } catch {
+            return report("AC-W11", "watch-script-exit-code", false, "(could not run script: \(error))")
+        }
+        process.waitUntilExit()
+        let stderr = String(data: stderrPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+
+        guard process.terminationStatus == 7 else {
+            return report("AC-W11", "watch-script-exit-code", false,
+                          "(expected exit 7, got \(process.terminationStatus): \(stderr))")
+        }
+        return report("AC-W11", "watch-script-exit-code", true)
     }
 
     // MARK: - AC-W3 — generated launchd plist shape (limpet-plan.md L3(c))
