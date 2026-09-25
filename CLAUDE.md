@@ -95,7 +95,7 @@ running app applies the change live, without a restart.
 | Path | Contents | Notes |
 |------|----------|-------|
 | `profiles/{shortId}.profile.json` | Full `SyncProfile`, including `isEnabled`, `isMuted` | NEW authoritative file. Written by `ProfileStore.save()` (encodes the whole model, so any new `SyncProfile` field flows in automatically); read by `ProfileStore.load()` (file-authoritative). References `../schema/profile.schema.json` via `$schema`. |
-| `profiles/{shortId}.json` | Derived, script-only subset (frozen key set) | Unchanged, byte-for-byte — this is `SyncSetupService.generateProfileConfig`'s output, consumed only by the sync shell script. The app never reads it back. |
+| `profiles/{shortId}.json` | Derived, script-only subset | `SyncSetupService.generateProfileConfig`'s output, rewritten on every install and consumed by the sync shell script. Its key set changes only with the script: L4 added `maxDelete`, which is computed at install time from the remote's rclone.conf section. The app does not read it back; only `limpet doctor` reads it, to warn when `maxDelete` is stale. |
 | `settings.json` | Enumerated safe subset of `LimpetSettings` (`debugLoggingEnabled`, `launchAtLogin`) | Written by `AppSettingsFileStore`. |
 | `schema/profile.schema.json`, `schema/settings.schema.json` | Committed JSON Schemas | Copied out of the app bundle by `ConfigSchemaInstaller` at every launch. Kept in lockstep with `SyncProfile.CodingKeys` by the fail-closed `scripts/check-schema-in-sync.sh`, run locally and in CI. |
 
@@ -114,9 +114,15 @@ and why both paths share one decision function.
 `id` is UNKNOWN to `ProfileStore` creates that profile — this is no longer
 silently ignored. `applyExternalProfileEdit` routes an unknown-but-decodable id
 to `SyncManager.applyExternalCreateIfNeeded` (`ConfigReconciler.swift`): the
-profile is always persisted; the launchd agent is installed only when it's
-`isEnabled && isValid`, so an agent can stage a profile and flip it on in a
-second edit. A dropped file whose basename isn't the canonical
+profile is persisted unless it is refused (see **Refused values** below), and
+the launchd agent is installed only when it's `isEnabled && isValid`, so an
+agent can stage a profile and flip it on in a second edit. A drop refused for
+overlap is moved to `profiles/refused/<stem>.<UTC timestamp>.json`, where no
+`*.profile.json` scanner and no file watcher sees it; a drop that fails to
+decode (including an F4-refused value) stays where it is and is ignored until
+the next full `ProfileStore.save()` (a profile delete), whose orphan prune
+moves it to `profiles/refused/` instead of deleting it — the prune removes
+only files that decode. A dropped file whose basename isn't the canonical
 `{shortId}.profile.json` is rewritten to the canonical name and the original
 pruned (the canonical write notes its own hash in `ConfigSelfWriteRegistry`, so
 this can never loop). See `ConfigSelfTest`'s AC-C1–AC-C4 for the exact
@@ -128,9 +134,83 @@ a human edits files under `~/.config/limpet` to set limpet up. It does not
 widen the trust boundary. Every writer of `~/.config/limpet/profiles/` already
 runs as the user, and a same-user process can write a `~/Library/LaunchAgents/*.plist`
 and `launchctl load` it directly — limpet adds no privilege the attacker lacked.
-The profile files are also credential-free: rclone remotes and secrets live in
-`~/.config/rclone/rclone.conf`, never here, so a malicious drop can schedule an
-agent but can't exfiltrate or forge credentials through this path.
+The profile files are credential-free by enforcement, not convention: an
+`rcloneRemote` that could carry a credential (on-the-fly backend, connection
+string) is refused at decode and at every write (see **Refused values** below).
+Secrets live elsewhere. s3/b2 remotes created by limpet (`limpet remote add` or
+the wizard) keep theirs in the login keychain, service `limpet`, in an item
+whose only trusted application is `/usr/bin/security`; every rclone invocation
+receives it through `RcloneConfigService.secretEnvironment` as an
+`RCLONE_CONFIG_<NAME>_…` variable, and limpet never writes it to rclone.conf,
+profile JSON, the sync script, a log or UserDefaults (rclone 1.75.1 at `-vv`
+logs such a variable as `secret_access_key=XXX` — measured 2026-09-26;
+`--dump auth` was not measured). Any process running as the user
+can read that item through `/usr/bin/security` without a prompt — that is the
+price of launchd reading it without one (limpet-plan.md L4 F2). Every other
+remote's secrets sit in `~/.config/rclone/rclone.conf`, where rclone's
+`obscure` is reversible encoding, not encryption. So a malicious drop can
+point a profile at an existing remote and schedule an agent, but it gains no
+credential that a same-user process could not already read.
+
+**Refused values (limpet-plan.md L4 F4/F6).** An `rcloneRemote` that starts
+with `:` (an on-the-fly backend) or contains `,` or `=` (a connection string)
+can carry a credential in plain text, so it is refused by the decoder, by every
+profile write (`ProfileStore.writeProfileFile`/`add`/`update`), by
+`SyncSetupService.install` and by the watcher before every run — a dropped
+file carrying one simply does not load. `transfers` outside 1–64 is refused
+the same way (and `profile set` refuses a leading zero). Two profiles whose
+remote paths on the same remote are equal or nested (`SyncProfile.overlapError`)
+may not both sync: a profile that is enabled (or being installed, or running)
+is compared only with profiles that are enabled AND have an installed agent,
+so a disabled profile never blocks, and the installed one wins over one that
+was never installed. The overlap is refused at `profile create`/`profile
+set`/`profile enable` (exit 65, nothing written), at file-drop create
+(`applyExternalCreateIfNeeded` → `.refusedOverlap`, file moved aside), by
+`install`, and by the watcher, which re-reads every profile file before each
+run and logs `Refusing to sync: …` into the profile log instead of running.
+The app's edit paths (Save, the wizard, enable/disable, an external edit)
+check F4 and the overlap BEFORE persisting (`SyncManager.profileChangeRefusal`
+/ `applyProfileChange`) and show refusals and install errors in the UI
+(`profileErrors`, the detail view's and wizard's error text) instead of only
+printing them. A refused external edit of an existing profile file (or one
+that is JSON with the profile's id but no longer decodes) is rolled back: the
+last accepted profile is written back through the self-write path and the
+refused content is copied to `profiles/refused/`, both named in
+`profileErrors`. A wizard retry after a failed install updates the profile
+the first attempt saved instead of creating a second one.
+
+**Delete limit (limpet-plan.md L4 F6).** For remotes that keep no deleted
+versions — s3 `provider = Mega` (MEGA S4) and `Cloudflare` (R2), in any case, always, any
+other s3 provider unless the profile sets `remoteVersioning: true` — the
+derived config carries `maxDelete` (profile field, default 100;
+`SyncSetupService.maxDeleteArgument`) and the script adds `--max-delete N`.
+rclone 1.75.1 then deletes at most N files and exits 7 (measured); the script
+turns that into exit 76 only when the run's own output also contains `Got
+fatal error on delete: --max-delete threshold reached`. On 76 the watcher
+writes `profiles/{shortId}.delete-limit` and refuses every later run —
+including after a respawn, login or reinstall — while staying alive and idle.
+`limpet profile clear-delete-limit <name|shortId>` or the menu's red octagon
+button removes the marker and sends the watcher SIGUSR1. A clear is not a
+bypass: the next run still carries `--max-delete N`, so with more than N
+deletions pending it deletes N and trips again (measured live on S4
+2026-09-26 with N=2: draining the backlog after a trip took two clears).
+This is intended — each clear releases one batch. B2 is not limited
+(it hides instead of deleting); `limpet doctor` warns when a B2 bucket has no
+`daysFromHidingToDeleting` lifecycle rule. `maxDelete` is decided when the
+profile is INSTALLED; after changing a remote's provider (or the profile's
+`remoteVersioning`) in rclone.conf directly, run `limpet reinstall
+<name|shortId>`. `limpet doctor` warns when the installed value differs from
+what the current rclone.conf section gives.
+
+**No unprompted keychain dialogs.** Before any `security` call,
+`KeychainSecretStore` asks a lock-status provider (production:
+`SecKeychainGetStatus`, unverified that it can never prompt). While the login
+keychain is locked nothing reads it: the watcher logs `Keychain locked — open
+limpet and click "Allow keychain access"` (like every keychain line, at most
+once per 30 s, the refusal and source-missing throttle), starts no rclone and
+waits for its next trigger; the menu shows "Allow keychain access", the only action that
+may raise the system unlock dialog, which then sends the waiting watchers
+SIGUSR1.
 
 **Self-write suppression.** `ConfigSelfWriteRegistry` tracks the content hash
 of every file limpet itself writes; `ConfigFileWatcher.shouldReconcile`
@@ -189,8 +269,10 @@ creation behavior. Only FIVE keys are required — `id`, `name`, `rcloneRemote`,
 let every other field take its default (the decoder fills `syncDirection=localToRemote`,
 `syncIntervalMinutes=5`, `isEnabled=false`, …, all mirrored
 from the memberwise-init defaults; an app-written file that emits every key
-still round-trips unchanged). A profile is created whenever the file decodes
-successfully and `id` is a well-formed UUID; the launchd agent installs (i.e.
+still round-trips unchanged). A profile is created when the file decodes
+(which already refuses the F4 values and a `transfers` outside 1–64), `id` is
+a well-formed UUID, and it does not overlap an enabled, installed profile
+(then the file is moved to `profiles/refused/`); the launchd agent installs (i.e.
 the sync actually starts running) only when the profile is also `isEnabled`
 and `isValid` (non-empty `name`/`rcloneRemote`/`remotePath`/`localSyncPath`) —
 so an agent can stage a profile disabled, then flip `isEnabled` in a follow-up
@@ -211,10 +293,10 @@ isn't limpet's own.
 
 | Command | Purpose |
 |---------|---------|
-| `limpet doctor` | Health report: rclone found + version, config schemas installed, per-profile derived-config presence, launchd agent loaded (enabled profiles), stale lock files, remote reachability. Exits non-zero iff any check is `[fail]`; `[warn]` never fails the run. |
+| `limpet doctor` | Health report: rclone found + version, config schemas installed, per-profile derived-config presence, a stale installed `maxDelete` (warn), launchd agent loaded (enabled profiles), stale lock files, remote reachability (a keychain-backed remote reads its secret without ever prompting), B2 bucket without a `daysFromHidingToDeleting` rule (warn). Exits non-zero iff any check is `[fail]`; `[warn]` never fails the run. |
 | `limpet status [name\|shortId]` | One tab-separated line per profile (or a single one): `enabled=`, `agent=loaded\|unloaded\|n/a`, `running=` (lock present), `last=started\|completed\|failed\|none` (from the log tail via the shared `SyncLogPatterns`). |
 | `limpet profiles` | List every profile: name, shortId, mode, `enabled=`, `remote=` — no secrets. (`profile list` is an alias.) |
-| `limpet profile show <name\|shortId>` | Print one profile's FULL config as pretty, sorted-key JSON — the same shape as its `.profile.json`, so an agent can `show` → edit → `profile create`/`profile set` round-trip. No secrets (credentials live in `rclone.conf`). |
+| `limpet profile show <name\|shortId>` | Print one profile's FULL config as pretty, sorted-key JSON — the same shape as its `.profile.json`, so an agent can `show` → edit → `profile create`/`profile set` round-trip. No secrets (credentials live in `rclone.conf` or the login keychain). |
 | `limpet logs <name\|shortId> [--follow]` | Print (or `tail -f`) that profile's sync log. |
 | `limpet test-remote <name\|shortId>` | Probe one profile's remote with `rclone lsd` under a hard timeout; prints `reachable: <remote>` or the real rclone stderr. |
 | `limpet listremotes` | `rclone listremotes`, passthrough. |
@@ -223,13 +305,15 @@ isn't limpet's own.
 
 | Command | Purpose |
 |---------|---------|
-| `limpet profile create --from <file>` / `... create -` | Create a profile from a `.profile.json` file (or stdin `-`). Validates by decoding (a bad file exits `65` with the decode error — the feedback an agent needs); refuses a colliding `id`/`shortId` (`1`); writes the authoritative file, then installs the launchd agent iff `isEnabled && isValid` — the SAME persist-then-install rule as the file-watcher create path (`applyExternalCreateIfNeeded`). |
+| `limpet profile create --from <file>` / `... create -` | Create a profile from a `.profile.json` file (or stdin `-`). Validates by decoding (a bad file — including an F4-refused remote or `transfers` outside 1–64 — exits `65` with the decode error, the feedback an agent needs); refuses a colliding `id`/`shortId` (`1`) and an overlap with an enabled, installed profile (`65`); writes the authoritative file, then installs the launchd agent iff `isEnabled && isValid` — the SAME persist-then-install rule as the file-watcher create path (`applyExternalCreateIfNeeded`). |
 | `limpet profile enable <name\|shortId>` | Set `isEnabled=true`, rewrite the file, install the agent. |
 | `limpet profile disable <name\|shortId>` | Set `isEnabled=false`, rewrite the file, uninstall the agent. |
 | `limpet profile set <name\|shortId> <key> <value> [<key> <value> …]` | Edit fields on an existing profile from a BOUNDED key set (mirrors `SyncProfile.CodingKeys` minus `id`/`isEnabled`; positional `key value` pairs), rewrite the authoritative `.profile.json`, then drive the launchd delta `SyncManager.reconcileAction` dictates (reinstall as needed). Validates ALL assignments against a copy first — an unknown key or invalid value exits `65` and writes nothing. Use `enable`/`disable` for `isEnabled`. |
 | `limpet profile delete <name\|shortId>` | Uninstall the agent and remove the `.profile.json`. |
+| `limpet profile clear-delete-limit <name\|shortId>` | Remove the persistent `{shortId}.delete-limit` marker a `--max-delete` trip left (exit 76), then send the watcher SIGUSR1. Check the remote first: up to `maxDelete` files were already deleted in the run that tripped. |
 | `limpet install <name\|shortId>` | Install an already-enabled profile's launchd agent (idempotent; runs `SyncSetupService.install`). Complements `profile enable`, which early-returns without installing when the profile is ALREADY enabled — so `install` re-creates an agent that went missing. Refuses a disabled or incomplete profile. Never flips `isEnabled`. |
 | `limpet reinstall <name\|shortId>` | Regenerate script+plist and reinstall the agent (uninstall → install), i.e. the settings-save reinstall path. Works for any sync mode. Refuses a disabled profile. |
+| `limpet remote add <name> --type s3\|b2 --access-key-id <id> [--provider <p>] [--endpoint <https url>] [--region <r>]` | Create a keychain-backed remote through `RcloneConfigService.addKeychainRemote`, the same function the wizard uses. The secret is read from stdin — a no-echo prompt on a terminal, otherwise one line from the pipe — never from an argument. Writes the non-secret section plus `limpet_keychain = true` to rclone.conf (appended; nothing else rewritten) and stores the secret with `/usr/bin/security -i` (`add-generic-password -s limpet -a <name> -T /usr/bin/security`, secret hex-encoded on stdin). Names are `[A-Za-z0-9_]+` and may not collide case-insensitively with any rclone.conf section; endpoints must be https; `--provider Mega --region <r>` derives `s3.<r>.megas4.com`; a known `--provider` in any case (`mega`) is written in the wizard's spelling (`Mega`). |
 
 **Operate:**
 
@@ -247,8 +331,9 @@ whether or not the menu-bar app is running:** they write the authoritative
 launchd delta chosen by the shared `SyncManager.reconcileAction`). When the app
 IS running, its `ConfigFileWatcher` also sees the write and reconciles — the two
 converge on identical files and one loaded agent, so running both is redundant,
-not conflicting. Profile files stay credential-free (rclone secrets live in
-`~/.config/rclone/rclone.conf`), so nothing the CLI writes carries a credential.
+not conflicting. Profile files stay credential-free (secrets live in
+`~/.config/rclone/rclone.conf` or, for keychain-backed remotes, the login
+keychain), so no profile file the CLI writes carries a credential.
 
 **Dispatch and safety.** `LimpetCLI.dispatch` is checked at the very top of
 `LimpetApp.init` — before `--self-test`, before `MigrationRunner`,

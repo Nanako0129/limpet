@@ -107,11 +107,30 @@ final class SyncSetupService {
     ///   - executablePath: The running app's own executable path. Overridable so
     ///     `ConfigSelfTest` can exercise the translocation guard without a real
     ///     translocated launch; the app never needs to pass this itself.
+    ///   - otherProfiles: every profile on disk, read fresh per install, for the
+    ///     F6 overlap refusal. Overridable for `ConfigSelfTest`.
     func install(
         profile: SyncProfile,
         loadAgent: Bool = true,
-        executablePath: String = Bundle.main.executablePath ?? ""
+        executablePath: String = Bundle.main.executablePath ?? "",
+        otherProfiles: [SyncProfile] = ProfileStore.profilesOnDisk(in: SyncProfile.configDirectory),
+        isInstalled: (SyncProfile) -> Bool = SyncProfile.agentInstalled
     ) throws {
+        // F4/F6 (limpet-plan.md L4) come FIRST, before anything is written. The
+        // self-test relies on this order: it calls install with a refused profile
+        // AND a translocated executable path, so if this check ever went missing
+        // the translocation guard below still stops install before it touches a
+        // real file, and the test sees the wrong error instead of side effects.
+        // Installing makes the profile sync whatever its isEnabled flag says
+        // (the detail view installs first and flips the flag afterwards), so
+        // the overlap rule treats it as enabled.
+        var running = profile
+        running.isEnabled = true
+        if let reason = profile.validationError
+            ?? SyncProfile.overlapError(running, among: otherProfiles, isInstalled: isInstalled) {
+            throw SetupError.refusedProfile(reason)
+        }
+
         // Refuse a translocated launch outright — see `CLIShimInstaller.isTranslocated`.
         // AppTranslocation is a randomized, non-persistent Gatekeeper mount; an agent
         // whose shim was refreshed from it would work until the mount disappears.
@@ -298,17 +317,22 @@ final class SyncSetupService {
 
         let remoteRoot = "\(profile.rcloneRemote):\(profile.remotePath)"
         let skipCert = RcloneConfigService.shared.readRemoteConfig(name: profile.rcloneRemote)?.values["no_check_certificate"] == "true"
+        // F3: best-effort cleanup — a keychain read failure just skips it.
+        guard let environment = RcloneConfigService.shared.processEnvironment(
+            forRemote: profile.rcloneRemote, log: { LimpetSettings.debugLog($0) }) else { return }
         _ = runRcloneSimple(
             rclonePath: rclonePath,
             args: ["delete", remoteRoot, "--include", Self.checkFileName],
-            skipCert: skipCert)
+            skipCert: skipCert,
+            environment: environment)
     }
 
     /// Run rclone with given args, return exit code (or -1 on launch failure).
     /// Adds connection/operation timeouts so unreachable remotes fail within ~15s.
-    private func runRcloneSimple(rclonePath: String, args: [String], skipCert: Bool) -> Int32 {
+    private func runRcloneSimple(rclonePath: String, args: [String], skipCert: Bool, environment: [String: String]) -> Int32 {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: rclonePath)
+        process.environment = environment
         var fullArgs = args + ["--contimeout", "5s", "--timeout", "15s", "--retries", "1", "--low-level-retries", "1"]
         if skipCert { fullArgs.append("--no-check-certificate") }
         process.arguments = fullArgs
@@ -357,11 +381,30 @@ final class SyncSetupService {
 
     // MARK: - Script Generation
 
+    /// Whether generated scripts honour `RCLONE_BIN` from the environment: Debug
+    /// builds only. The self-test runs only in Debug, so it can exercise the
+    /// Release variant through `generateSyncScript(honorRcloneBinOverride:
+    /// false)` but cannot observe this constant's Release value itself.
+    static let honorsRcloneBinOverride: Bool = {
+        #if DEBUG
+        return true
+        #else
+        return false
+        #endif
+    }()
+
     /// Generate the shared sync script that reads config from JSON
     /// Generate the shared sync script. Not private — `ConfigSelfTest` reads
     /// this text directly to assert its exit-code/flag shape (limpet-plan.md
     /// L3(b)) without writing it to disk.
-    func generateSyncScript() -> String {
+    func generateSyncScript(honorRcloneBinOverride: Bool = SyncSetupService.honorsRcloneBinOverride) -> String {
+        // Carried from L4.0 (limpet-plan.md L4): an RCLONE_BIN from the
+        // environment exists only for the self-test's stub rclone. A shipped
+        // script must never run whatever binary an environment variable names,
+        // so outside Debug builds the variable is cleared before the search.
+        let rcloneBinSelection = honorRcloneBinOverride
+            ? #"if [[ -z "${RCLONE_BIN:-}" || ! -x "$RCLONE_BIN" ]]; then"#
+            : #"RCLONE_BIN=""; if true; then"#
         return """
             #!/bin/bash
             # limpet Sync Script
@@ -416,6 +459,14 @@ final class SyncSetupService {
             fi
             CHECKERS=$((TRANSFERS * 2))
 
+            # maxDelete (0 = no limit) is written by limpet from an Int; anything
+            # else in the derived config is refused rather than passed on.
+            MAX_DELETE=$(parse_json "maxDelete" "0")
+            if [[ ! "$MAX_DELETE" =~ ^(0|[1-9][0-9]*)$ ]]; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S') - Refusing to sync: maxDelete must be a whole number" >> "$LOG_FILE"
+                exit 64
+            fi
+
             # `read -r -a` only consumes the first line, so a flag after a newline would
             # be dropped silently (turning `--exclude=*.tmp` + newline + `--dry-run` into
             # a real sync). Refuse instead.
@@ -434,6 +485,13 @@ final class SyncSetupService {
                     echo "$(date '+%Y-%m-%d %H:%M:%S') - Refusing to sync: additionalRcloneFlags contains quotes, dollar signs, backticks or ~, which limpet passes to rclone literally. Write flags as --flag=value without quotes, e.g. --exclude=*.tmp" >> "$LOG_FILE"
                     exit 64
                 fi
+                # --dump headers/bodies/auth writes request contents to the log; for a
+                # native B2 remote --dump auth includes the application key (Basic auth).
+                # Not measured, since no network is used in tests; refused for every remote.
+                if [[ "$flag_token" == --dump* ]]; then
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') - Refusing to sync: additionalRcloneFlags contains --dump, which can write credentials into the log" >> "$LOG_FILE"
+                    exit 64
+                fi
             done
 
             # Find rclone binary. Cover the common package-manager locations,
@@ -441,10 +499,9 @@ final class SyncSetupService {
             # Homebrew's dirs (issue #53). $USER can be unset under launchd, so derive
             # it. Fall back to a PATH lookup for any other install layout.
             RCLONE_USER="${USER:-$(id -un)}"
-            # Honor an RCLONE_BIN already set in the environment (e.g. a test
-            # harness injecting a stub) before falling back to the hardcoded
-            # candidates below.
-            if [[ -z "${RCLONE_BIN:-}" || ! -x "$RCLONE_BIN" ]]; then
+            # Debug builds honor an RCLONE_BIN already set in the environment (the
+            # self-test's stub); other builds always search the candidates below.
+            \(rcloneBinSelection)
                 RCLONE_BIN=""
                 RCLONE_CANDIDATES=(
                     /opt/homebrew/bin/rclone
@@ -554,16 +611,45 @@ final class SyncSetupService {
                 cmd+=("$NO_CHECK_CERT")
             fi
 
+            if [[ "$MAX_DELETE" != "0" ]]; then
+                cmd+=(--max-delete "$MAX_DELETE")
+            fi
+
             # additionalFlags was already validated and split into
             # ADDITIONAL_FLAGS_ARRAY above; append its tokens as-is.
             if [[ ${#ADDITIONAL_FLAGS_ARRAY[@]} -gt 0 ]]; then
                 cmd+=("${ADDITIONAL_FLAGS_ARRAY[@]}")
             fi
 
-            # Run sync command
-            "${cmd[@]}" 2>&1 | tee -a "$LOG_FILE"
+            # The max-delete lines of THIS run only (never an older run's lines in
+            # the profile log), and only those lines, not the whole output.
+            MAX_DELETE_MESSAGE='Got fatal error on delete: --max-delete threshold reached'
+            RUN_MATCHES=$(mktemp "${TMPDIR:-/tmp}/limpet-run.XXXXXX") || {
+                echo "$(date '+%Y-%m-%d %H:%M:%S') - Refusing to sync: could not create a temporary file" >> "$LOG_FILE"
+                exit 1
+            }
+            trap 'rm -f "$LOCK_FILE" "$RUN_MATCHES"' EXIT
+
+            # Run sync command. awk passes every line on and copies matching ones
+            # to RUN_MATCHES. It is a pipeline stage, not a process substitution:
+            # /bin/bash 3.2.57 sets no $! for one (measured 2026-09-26), so the
+            # script could not wait for it. awk reads to the end (no early exit,
+            # so no SIGPIPE for tee or rclone), and the pipeline has finished
+            # before the check below.
+            "${cmd[@]}" 2>&1 | tee -a "$LOG_FILE" | awk -v m="$MAX_DELETE_MESSAGE" -v f="$RUN_MATCHES" 'index($0, m) { print > f } { print }'
 
             EXIT_CODE=${PIPESTATUS[0]}
+
+            # --max-delete tripped: stop for good (exit 76, the watcher then keeps
+            # a persistent marker). Measured 2026-09-26 with rclone 1.75.1, local to
+            # local, 5 files removed from the source, --max-delete 2: exit 7, exactly
+            # 2 files deleted, each refused delete logged as "Got fatal error on
+            # delete: --max-delete threshold reached" (text and JSON log alike).
+            # Exit 7 is every fatal error, so the code AND the message must match.
+            if [[ $EXIT_CODE -eq 7 && -s "$RUN_MATCHES" ]]; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S') - Delete limit reached: rclone stopped at --max-delete $MAX_DELETE; limpet will not sync this profile again until the limit is cleared (limpet profile clear-delete-limit, or the menu)" >> "$LOG_FILE"
+                EXIT_CODE=76
+            fi
 
             if [[ $EXIT_CODE -eq 0 ]]; then
                 echo "$(date '+%Y-%m-%d %H:%M:%S') - Sync completed successfully" >> "$LOG_FILE"
@@ -577,11 +663,27 @@ final class SyncSetupService {
             """
     }
 
+    /// `--max-delete` for `profile`, or 0 for none (limpet-plan.md L4 F6): only
+    /// where a wrong delete cannot be undone. MEGA S4 and Cloudflare R2 keep no
+    /// deleted versions, so always; any other s3 provider (AWS, MinIO, Other)
+    /// unless the user states versioning is on. B2 hides instead of deleting,
+    /// and other remote types keep today's behaviour. `remoteSection` is the
+    /// remote's rclone.conf section (`nil` = not found = no limit).
+    static func maxDeleteArgument(for profile: SyncProfile, remoteSection: [String: String]?) -> Int {
+        guard remoteSection?["type"] == "s3" else { return 0 }
+        // Case-insensitive: a hand-edited or CLI-given `provider = mega` is still MEGA S4.
+        let neverVersioned = ["mega", "cloudflare"].contains((remoteSection?["provider"] ?? "").lowercased())
+        return neverVersioned || !profile.remoteVersioning ? profile.maxDelete : 0
+    }
+
     /// Generate profile-specific JSON config.
     /// Not private — `ConfigSelfTest` calls this directly to verify the
     /// derived config's key set stays frozen (AC-2) without going through
     /// the side-effecting `install(profile:)` (which touches launchd).
-    func generateProfileConfig(for profile: SyncProfile) -> String {
+    /// `rcloneConfig` is where the remote's type/provider is read for
+    /// `maxDelete`; the self-test passes a scratch one.
+    func generateProfileConfig(for profile: SyncProfile, rcloneConfig: RcloneConfigService = .shared) -> String {
+        let remoteSection = rcloneConfig.section(named: String(profile.rcloneRemote.prefix { $0 != ":" }))
         let config: [String: Any] = [
             "profileId": profile.id.uuidString,
             "name": profile.name,
@@ -596,6 +698,7 @@ final class SyncSetupService {
             "syncDirection": profile.syncDirection.rawValue,
             "remotePath": profile.remotePath,
             "transfers": profile.transfers,
+            "maxDelete": Self.maxDeleteArgument(for: profile, remoteSection: remoteSection),
         ]
 
         if let data = try? JSONSerialization.data(
@@ -743,6 +846,7 @@ final class SyncSetupService {
         case translocatedApp
         case shimNotOwned
         case shimInstallFailed
+        case refusedProfile(String)
 
         var errorDescription: String? {
             switch self {
@@ -765,6 +869,8 @@ final class SyncSetupService {
                     + "won't be overwritten. Move or remove that file, then try again."
             case .shimInstallFailed:
                 return "Failed to write the limpet CLI shim at ~/.local/bin/limpet"
+            case .refusedProfile(let reason):
+                return "Refusing to install: \(reason)"
             }
         }
     }

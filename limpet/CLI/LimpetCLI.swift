@@ -14,6 +14,14 @@ struct ProfileAssignment: Equatable {
     let value: String
 }
 
+/// `limpet remote add` arguments. The secret is deliberately NOT here: it is
+/// never an argument, only read from stdin (limpet-plan.md L4 F2).
+struct RemoteAddRequest: Equatable {
+    let name: String
+    let type: String
+    let values: [String: String]
+}
+
 /// Parsed CLI subcommand — the pure, testable result of `LimpetCLI.parse`.
 enum CLICommand: Equatable {
     case doctor
@@ -31,6 +39,8 @@ enum CLICommand: Equatable {
     case profileDelete(String)
     case profileSet(target: String, assignments: [ProfileAssignment])
     case profileSetEnabled(target: String, enabled: Bool)
+    case profileClearDeleteLimit(String)
+    case remoteAdd(RemoteAddRequest)
     case help
 }
 
@@ -58,8 +68,10 @@ struct DoctorCheck: Equatable {
 /// no real `Process`, `FileManager`, or stdio needed to test dispatch logic.
 struct CLIEnvironment {
     /// Run rclone with `args`, hard-killed after `timeout` seconds if still
-    /// running. Returns `(exitCode, stdout, stderr)`.
-    var runRclone: (_ args: [String], _ timeout: TimeInterval) -> (Int32, String, String)
+    /// running. Returns `(exitCode, stdout, stderr)`. `remote` names the remote
+    /// the command touches, so a keychain-backed one gets its secret through
+    /// the F3 helper (`nil` for `version`/`listremotes`).
+    var runRclone: (_ args: [String], _ remote: String?, _ timeout: TimeInterval) -> (Int32, String, String)
     /// Read every profile from the file-authoritative profiles directory.
     var readProfiles: () -> [SyncProfile]
     var fileExists: (String) -> Bool
@@ -67,6 +79,8 @@ struct CLIEnvironment {
     var runLaunchctl: (_ args: [String]) -> (Int32, String)
     /// Whether the JSON schema files are installed under the config directory.
     var schemaFilesPresent: () -> Bool
+    /// The rclone.conf section of a remote (`type` included), or `nil`.
+    var remoteSection: (_ remoteName: String) -> [String: String]?
     /// Persist a profile's authoritative `{shortId}.profile.json`. Returns
     /// `true` on success. Same byte format the app writes (`ProfileStore`).
     var writeProfile: (SyncProfile) -> Bool
@@ -78,10 +92,18 @@ struct CLIEnvironment {
     var uninstallProfile: (SyncProfile) -> String?
     /// Delete the authoritative `{shortId}.profile.json`.
     var deleteProfileFile: (SyncProfile) -> Void
+    /// Remove a file (the delete-limit marker). Returns whether it succeeded.
+    var removeFile: (String) -> Bool
     /// Read all of stdin (for `profile create -`). `nil` on read failure.
     var readStdin: () -> String?
     /// Read a file's contents as UTF-8 text. `nil` if missing/unreadable.
     var readFile: (String) -> String?
+    /// Read a secret: a no-echo prompt on a TTY, else one line of stdin.
+    /// Never from argv (limpet-plan.md L4 F2).
+    var readSecret: (_ prompt: String) -> String?
+    /// `RcloneConfigService.addKeychainRemote` — the one creation path shared
+    /// with the wizard. Returns an error message or `nil`.
+    var addKeychainRemote: (_ name: String, _ type: String, _ values: [String: String], _ secret: String) -> String?
     var stdout: (String) -> Void
     var stderr: (String) -> Void
 }
@@ -117,8 +139,13 @@ enum LimpetCLI {
       profile delete <name|id>     Delete a profile and its launchd agent
       profile set <name|id> <key> <value> [<key> <value> ...]
                                    Edit fields on an existing profile and reconcile
+      profile clear-delete-limit <name|id>
+                                   Resume a profile stopped by --max-delete, and sync now
       install <name|id>            Install an enabled profile's launchd agent (idempotent)
       reinstall <name|id>          Regenerate script+plist and reinstall the agent
+      remote add <name> --type s3|b2 --access-key-id <id> [--provider <p>] [--endpoint <https url>] [--region <r>]
+                                   Add a remote whose secret lives in the login keychain;
+                                   the secret is read from stdin (no-echo prompt on a terminal)
 
     Operate:
       sync <name|id>                          Ask the profile's watcher to sync now (returns immediately)
@@ -127,7 +154,8 @@ enum LimpetCLI {
     profile set keys: name, rcloneRemote, remotePath, localSyncPath,
       drivePathToMonitor, additionalRcloneFlags,
       syncDirection (localToRemote|remoteToLocal), syncIntervalMinutes,
-      transfers, isMuted. Use enable/disable for isEnabled.
+      transfers, isMuted, maxDelete, remoteVersioning.
+      Use enable/disable for isEnabled.
 
     Profiles author JSON against schema/profile.schema.json under the config
     directory; the same file an agent can drop in or edit directly.
@@ -211,6 +239,9 @@ enum LimpetCLI {
         case "profile":
             return parseProfile(rest)
 
+        case "remote":
+            return parseRemote(rest)
+
         case "help", "-h", "--help":
             return .success(.help)
 
@@ -276,9 +307,61 @@ enum LimpetCLI {
             }
             return .success(.profileDelete(target))
 
+        case "clear-delete-limit":
+            guard let target = args.first(where: { !$0.hasPrefix("-") }) else {
+                return .failure(CLIUsageError(message: "usage: limpet profile clear-delete-limit <name|shortId>"))
+            }
+            return .success(.profileClearDeleteLimit(target))
+
         default:
             return .failure(CLIUsageError(message: "unknown 'profile' subcommand: \(sub)\n" + usage))
         }
+    }
+
+    /// Parse `remote add <name> --type s3|b2 --access-key-id <id> [--provider
+    /// <p>] [--endpoint <e>] [--region <r>]`. There is no flag for the secret,
+    /// and a flag that looks like one is refused with a pointer to stdin.
+    private static func parseRemote(_ rest: [String]) -> Result<CLICommand, CLIUsageError> {
+        let usage = CLIUsageError(message: "usage: limpet remote add <name> --type s3|b2 --access-key-id <id> "
+            + "[--provider <p>] [--endpoint <https url>] [--region <r>]  (the secret is read from stdin)")
+        guard rest.first == "add", rest.count >= 2, !rest[1].hasPrefix("-") else { return .failure(usage) }
+        let name = rest[1]
+        var flags: [String: String] = [:]
+        var idx = 2
+        while idx < rest.count {
+            let flag = rest[idx]
+            if flag.lowercased().contains("secret") || flag == "--key" || flag == "--password" {
+                return .failure(CLIUsageError(
+                    message: "error: the secret is never an argument; pipe it on stdin or type it at the prompt"))
+            }
+            guard ["--type", "--provider", "--endpoint", "--region", "--access-key-id"].contains(flag),
+                  idx + 1 < rest.count, flags[flag] == nil else { return .failure(usage) }
+            flags[flag] = rest[idx + 1]
+            idx += 2
+        }
+        guard let type = flags["--type"], let keyId = flags["--access-key-id"] else { return .failure(usage) }
+        var values: [String: String] = [:]
+        switch type {
+        case "s3":
+            values["access_key_id"] = keyId
+            // A known provider in any case is written in the wizard's spelling.
+            values["provider"] = flags["--provider"].map { given in
+                RemoteProvider.s3Compatible.requiredFields.first { $0.key == "provider" }?.options?
+                    .first { $0.value.caseInsensitiveCompare(given) == .orderedSame }?.value ?? given
+            }
+            values["region"] = flags["--region"]
+            values["endpoint"] = flags["--endpoint"]
+            // A MEGA S4 endpoint is derived from --region by the shared creation
+            // function (RcloneConfigService.withDerivedEndpoint).
+        case "b2":
+            guard flags["--provider"] == nil, flags["--endpoint"] == nil, flags["--region"] == nil else {
+                return .failure(CLIUsageError(message: "error: --provider/--endpoint/--region apply to --type s3 only"))
+            }
+            values["account"] = keyId
+        default:
+            return .failure(usage)
+        }
+        return .success(.remoteAdd(RemoteAddRequest(name: name, type: type, values: values)))
     }
 
     /// Parse + dispatch, printing usage via `env.stderr` on a parse failure.
@@ -326,6 +409,10 @@ enum LimpetCLI {
             return runProfileSet(target, assignments: assignments, env: env)
         case .profileSetEnabled(let target, let enabled):
             return runProfileSetEnabled(target, enabled: enabled, env: env)
+        case .profileClearDeleteLimit(let target):
+            return runClearDeleteLimit(target, env: env)
+        case .remoteAdd(let request):
+            return runRemoteAdd(request, env: env)
         case .help:
             env.stdout(Self.usage + "\n")
             return 0
@@ -358,7 +445,7 @@ enum LimpetCLI {
     static func doctorChecks(env: CLIEnvironment) -> [DoctorCheck] {
         var checks: [DoctorCheck] = []
 
-        let (rcloneExit, rcloneOut, _) = env.runRclone(["version"], 5)
+        let (rcloneExit, rcloneOut, _) = env.runRclone(["version"], nil, 5)
         if rcloneExit == 0 {
             let version = rcloneOut.split(separator: "\n").first.map(String.init) ?? "unknown"
             checks.append(DoctorCheck(name: "rclone", status: .ok, detail: version))
@@ -393,6 +480,21 @@ enum LimpetCLI {
                 : DoctorCheck(name: label, status: .fail, detail: "derived config missing")
         )
 
+        // maxDelete is decided at install time from the remote's rclone.conf
+        // section; a provider changed there since is not picked up until a
+        // reinstall. Warn (never fail) when they disagree.
+        let remoteName = String(profile.rcloneRemote.prefix { $0 != ":" })
+        if env.fileExists(profile.configPath), let derived = env.readFile(profile.configPath),
+           let config = (try? JSONSerialization.jsonObject(with: Data(derived.utf8))) as? [String: Any] {
+            let installed = config["maxDelete"] as? Int ?? 0
+            let current = SyncSetupService.maxDeleteArgument(for: profile, remoteSection: env.remoteSection(remoteName))
+            if installed != current {
+                checks.append(DoctorCheck(name: label, status: .warn,
+                    detail: "installed with maxDelete \(installed), but the remote's current rclone.conf section "
+                        + "gives \(current); run 'limpet reinstall \(profile.shortId)'"))
+            }
+        }
+
         if profile.isEnabled {
             let (_, launchctlOut) = env.runLaunchctl(["print", "gui/\(getuid())/\(profile.launchdLabel)"])
             checks.append(
@@ -408,12 +510,32 @@ enum LimpetCLI {
                 : DoctorCheck(name: label, status: .ok, detail: "no stale lock")
         )
 
-        let (remoteExit, _, remoteErr) = env.runRclone(["lsd", profile.fullRemotePath], 5)
+        let (remoteExit, _, remoteErr) = env.runRclone(["lsd", profile.fullRemotePath], profile.fullRemotePath, 5)
         checks.append(
             remoteExit == 0
                 ? DoctorCheck(name: label, status: .ok, detail: "remote reachable")
                 : DoctorCheck(name: label, status: .fail, detail: "remote unreachable: \(remoteErr)")
         )
+
+        // limpet-plan.md L4 F6, B2: warn (never fail) when the bucket has no
+        // daysFromHidingToDeleting lifecycle rule. The output shape is rclone
+        // 1.75.1's own `rclone backend help b2` example (`[]` when there are no
+        // rules, else objects with "daysFromHidingToDeleting": N); it was not
+        // measured against a live bucket here.
+        if env.remoteSection(remoteName)?["type"] == "b2" {
+            let bucket = profile.remotePath.split(separator: "/").first.map(String.init) ?? ""
+            let (code, rules, _) = env.runRclone(
+                ["backend", "lifecycle", "\(remoteName):\(bucket)"], profile.fullRemotePath, 10)
+            let advice = "use a bucket-scoped application key without deleteFiles"
+            if code != 0 {
+                checks.append(DoctorCheck(name: label, status: .warn,
+                    detail: "could not read the B2 lifecycle rules of \(bucket); \(advice)"))
+            } else if rules.range(of: #""daysFromHidingToDeleting"\s*:\s*[1-9]"#, options: .regularExpression) == nil {
+                checks.append(DoctorCheck(name: label, status: .warn,
+                    detail: "B2 bucket \(bucket) has no daysFromHidingToDeleting lifecycle rule, so deleted "
+                        + "and overwritten files are kept as hidden versions indefinitely; \(advice)"))
+            }
+        }
 
         return checks
     }
@@ -427,7 +549,7 @@ enum LimpetCLI {
         }
 
         // Prints the remote name to the user's own terminal — fine.
-        let (exit, _, err) = env.runRclone(["lsd", profile.fullRemotePath], 10)
+        let (exit, _, err) = env.runRclone(["lsd", profile.fullRemotePath], profile.fullRemotePath, 10)
         if exit == 0 {
             env.stdout("reachable: \(profile.fullRemotePath)\n")
             return 0
@@ -470,7 +592,7 @@ enum LimpetCLI {
     // MARK: - listremotes
 
     private static func runListRemotes(env: CLIEnvironment) -> Int32 {
-        let (exit, out, err) = env.runRclone(["listremotes"], 10)
+        let (exit, out, err) = env.runRclone(["listremotes"], nil, 10)
         if exit == 0 {
             env.stdout(out)
             return 0
@@ -680,13 +802,19 @@ enum LimpetCLI {
             env.stderr("error: profile \(profile.shortId) already exists; edit its file or use 'profile enable/disable'\n")
             return 1
         }
+        // F6: decode already refused F4 values; overlap needs the other profiles.
+        if let reason = SyncProfile.overlapError(
+            profile, among: existing, isInstalled: { env.fileExists($0.plistPath) }) {
+            env.stderr("error: \(reason)\n")
+            return 65
+        }
 
         guard env.writeProfile(profile) else {
             env.stderr("error: failed to write profile file\n")
             return 1
         }
 
-        // Persist-always, install-iff-ready — the SAME rule the file-watcher
+        // Persist unless refused (above), install-iff-ready — the SAME rule the file-watcher
         // create path applies (`SyncManager.applyExternalCreateIfNeeded`).
         guard profile.isEnabled, profile.isValid else {
             env.stdout("created \(profile.name) (\(profile.shortId)) — not installed (disabled or incomplete)\n")
@@ -740,7 +868,8 @@ enum LimpetCLI {
     // MARK: - profile enable / disable
 
     private static func runProfileSetEnabled(_ target: String, enabled: Bool, env: CLIEnvironment) -> Int32 {
-        guard let profile = resolveProfile(target, in: env.readProfiles()) else {
+        let all = env.readProfiles()
+        guard let profile = resolveProfile(target, in: all) else {
             env.stderr("error: no profile matches \"\(target)\"\n")
             return 1
         }
@@ -751,6 +880,13 @@ enum LimpetCLI {
 
         var updated = profile
         updated.isEnabled = enabled
+        // F6: enabling makes the profile take part in the overlap rule; refuse
+        // BEFORE the enabled flag is persisted.
+        if let reason = SyncProfile.overlapError(
+            updated, among: all, isInstalled: { env.fileExists($0.plistPath) }) {
+            env.stderr("error: \(reason)\n")
+            return 65
+        }
         guard env.writeProfile(updated) else {
             env.stderr("error: failed to write profile file\n")
             return 1
@@ -801,7 +937,8 @@ enum LimpetCLI {
     /// `error:` and rewrites NOTHING (all assignments are validated against a copy
     /// before any write).
     private static func runProfileSet(_ target: String, assignments: [ProfileAssignment], env: CLIEnvironment) -> Int32 {
-        guard let original = resolveProfile(target, in: env.readProfiles()) else {
+        let all = env.readProfiles()
+        guard let original = resolveProfile(target, in: all) else {
             env.stderr("error: no profile matches \"\(target)\"\n")
             return 1
         }
@@ -813,6 +950,12 @@ enum LimpetCLI {
                 env.stderr("error: \(err)\n")
                 return 65  // EX_DATAERR
             }
+        }
+        // F4/F6 on the result as a whole: the overlap depends on remote and path together.
+        if let reason = updated.validationError
+            ?? SyncProfile.overlapError(updated, among: all, isInstalled: { env.fileExists($0.plistPath) }) {
+            env.stderr("error: \(reason)\n")
+            return 65
         }
 
         guard updated != original else {
@@ -871,8 +1014,18 @@ enum LimpetCLI {
             guard let n = int(value), n >= 1 else { return "syncIntervalMinutes must be an integer ≥ 1" }
             profile.syncIntervalMinutes = n
         case "transfers":
-            guard let n = int(value), n >= 1 else { return "transfers must be an integer ≥ 1" }
+            // 1–64, digits only, no leading zero (bash reads `08` as octal).
+            guard let first = value.first, first != "0", value.allSatisfy(\.isASCII),
+                  value.allSatisfy(\.isNumber), let n = int(value), (1...64).contains(n) else {
+                return "transfers must be a whole number from 1 to 64 without a leading zero"
+            }
             profile.transfers = n
+        case "maxDelete":
+            guard let n = int(value), n >= 1 else { return "maxDelete must be an integer ≥ 1" }
+            profile.maxDelete = n
+        case "remoteVersioning":
+            guard let b = bool(value) else { return "remoteVersioning must be true or false" }
+            profile.remoteVersioning = b
 
         // Bools.
         case "isMuted":
@@ -898,6 +1051,51 @@ enum LimpetCLI {
         return nil
     }
 
+    // MARK: - profile clear-delete-limit
+
+    /// Remove the persistent delete-limit marker (limpet-plan.md L4 F6), then
+    /// ask the watcher to sync now — the same SIGUSR1 request `limpet sync` sends.
+    private static func runClearDeleteLimit(_ target: String, env: CLIEnvironment) -> Int32 {
+        guard let profile = resolveProfile(target, in: env.readProfiles()) else {
+            env.stderr("error: no profile matches \"\(target)\"\n")
+            return 1
+        }
+        let marker = profile.deleteLimitMarkerPath
+        guard env.fileExists(marker) else {
+            env.stdout("no delete limit is set for \(profile.name) (\(profile.shortId))\n")
+            return 0
+        }
+        guard env.removeFile(marker) else {
+            env.stderr("error: could not remove \(marker)\n")
+            return 1
+        }
+        let (exitCode, _) = env.runLaunchctl(["kill", "SIGUSR1", "gui/\(getuid())/\(profile.launchdLabel)"])
+        env.stdout("cleared the delete limit for \(profile.name) (\(profile.shortId)); "
+            + (exitCode == 0 ? "sync requested\n" : "no watcher running, it syncs when its agent next starts\n"))
+        return 0
+    }
+
+    // MARK: - remote add
+
+    /// Create a keychain-backed remote through the SAME function the wizard
+    /// uses (`RcloneConfigService.addKeychainRemote`). The secret comes from
+    /// `readSecret` only and is never printed.
+    private static func runRemoteAdd(_ request: RemoteAddRequest, env: CLIEnvironment) -> Int32 {
+        guard let secret = env.readSecret("Secret for \(request.name): "), !secret.isEmpty else {
+            env.stderr("error: no secret given (type it at the prompt, or pipe one line on stdin)\n")
+            return 66  // EX_NOINPUT
+        }
+        if let error = env.addKeychainRemote(request.name, request.type, request.values, secret) {
+            env.stderr("error: \(error)\n")
+            return 1
+        }
+        env.stdout("added \(request.type) remote \(request.name): secret stored in the login keychain "
+            + "(service \(KeychainSecretStore.service)), rclone.conf has no secret\n")
+        if request.type == "b2" {
+            env.stdout("note: use a bucket-scoped application key without the deleteFiles capability\n")
+        }
+        return 0
+    }
 }
 
 // MARK: - Production environment
@@ -909,7 +1107,19 @@ extension CLIEnvironment {
     /// `ProfileStore.profilesOnDisk(in:)` file read.
     static func production() -> CLIEnvironment {
         CLIEnvironment(
-            runRclone: { args, timeout in CLIEnvironment.runRcloneProcess(args: args, timeout: timeout) },
+            runRclone: { args, remote, timeout in
+                var environment = ProcessInfo.processInfo.environment
+                if let remote {
+                    // F3: never start rclone without the remote's secret.
+                    var keychainError = ""
+                    guard let merged = RcloneConfigService.shared.processEnvironment(
+                        forRemote: remote, log: { keychainError = $0 }) else {
+                        return (78, "", keychainError)  // EX_CONFIG
+                    }
+                    environment = merged
+                }
+                return CLIEnvironment.runRcloneProcess(args: args, environment: environment, timeout: timeout)
+            },
             readProfiles: { ProfileStore.profilesOnDisk(in: SyncProfile.configDirectory) },
             fileExists: { FileManager.default.fileExists(atPath: $0) },
             runLaunchctl: { args in CLIEnvironment.runProcess(launchPath: "/bin/launchctl", args: args) },
@@ -918,6 +1128,7 @@ extension CLIEnvironment {
                     FileManager.default.fileExists(atPath: "\(ConfigSchemaInstaller.schemaDirectory())/\($0)")
                 }
             },
+            remoteSection: { RcloneConfigService.shared.section(named: $0) },
             writeProfile: { profile in
                 ProfileStore.writeProfileFile(profile, in: SyncProfile.configDirectory) != nil
             },
@@ -933,11 +1144,27 @@ extension CLIEnvironment {
                 let path = "\(SyncProfile.configDirectory)/\(profile.shortId).profile.json"
                 try? FileManager.default.removeItem(atPath: path)
             },
+            removeFile: { (try? FileManager.default.removeItem(atPath: $0)) != nil },
             readStdin: {
                 let data = FileHandle.standardInput.readDataToEndOfFile()
                 return String(data: data, encoding: .utf8)
             },
             readFile: { try? String(contentsOfFile: $0, encoding: .utf8) },
+            readSecret: { prompt in
+                guard isatty(STDIN_FILENO) != 0 else { return readLine(strippingNewline: true) }
+                var buffer = [CChar](repeating: 0, count: 1024)
+                defer { for i in buffer.indices { buffer[i] = 0 } }
+                guard readpassphrase(prompt, &buffer, buffer.count, RPP_ECHO_OFF) != nil else { return nil }
+                return String(cString: buffer)
+            },
+            addKeychainRemote: { name, type, values, secret in
+                do {
+                    try RcloneConfigService.shared.addKeychainRemote(name: name, type: type, values: values, secret: secret)
+                    return nil
+                } catch {
+                    return error.localizedDescription
+                }
+            },
             stdout: { FileHandle.standardOutput.write(Data($0.utf8)) },
             stderr: { FileHandle.standardError.write(Data($0.utf8)) }
         )
@@ -946,7 +1173,9 @@ extension CLIEnvironment {
     /// Run rclone at its located path with a hard process-level watchdog —
     /// mirrors `RcloneLocator.resolveViaLoginShell`'s timeout pattern, since
     /// SMB/WebDAV remotes can hang past rclone's own `--timeout`.
-    fileprivate static func runRcloneProcess(args: [String], timeout: TimeInterval) -> (Int32, String, String) {
+    fileprivate static func runRcloneProcess(
+        args: [String], environment: [String: String], timeout: TimeInterval
+    ) -> (Int32, String, String) {
         guard let rclonePath = RcloneLocator.resolve() else {
             return (127, "", "rclone not found")
         }
@@ -954,6 +1183,7 @@ extension CLIEnvironment {
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: rclonePath)
         proc.arguments = args
+        proc.environment = environment
         let stdoutPipe = Pipe()
         let stderrPipe = Pipe()
         proc.standardOutput = stdoutPipe

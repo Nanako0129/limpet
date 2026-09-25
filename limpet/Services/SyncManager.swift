@@ -128,6 +128,59 @@ final class SyncManager: ObservableObject {
         }
     }
 
+    /// Whether an enabled profile needs a keychain secret while the login
+    /// keychain is locked — its watcher then waits instead of reading (and
+    /// raising a dialog). Drives the menu's "Allow keychain access" button.
+    var isKeychainAccessNeeded: Bool {
+        let service = RcloneConfigService.shared
+        return !keychainBackedEnabledProfiles.isEmpty
+            && service.keychain.lockStatus(service.keychain.keychainPath) != .unlocked
+    }
+
+    private var keychainBackedEnabledProfiles: [SyncProfile] {
+        profileStore.enabledProfiles.filter {
+            RcloneConfigService.shared.section(named: String($0.rcloneRemote.prefix { $0 != ":" }))?[
+                RcloneConfigService.keychainMarker] == "true"
+        }
+    }
+
+    /// The user clicked "Allow keychain access": the only path that may raise
+    /// a keychain dialog (the system unlock prompt). Afterwards the waiting
+    /// watchers are asked to sync now.
+    func allowKeychainAccess() {
+        let path = RcloneConfigService.shared.keychain.keychainPath
+        let profiles = keychainBackedEnabledProfiles
+        DispatchQueue.global(qos: .userInitiated).async {
+            let unlocked = KeychainSecretStore.requestUnlock(keychainPath: path)
+            DispatchQueue.main.async {
+                if unlocked {
+                    for profile in profiles { self.sendSyncNowSignal(to: profile) }
+                }
+                self.objectWillChange.send()
+            }
+        }
+    }
+
+    /// Whether `profile` is stopped by the persistent delete-limit marker
+    /// (limpet-plan.md L4 F6).
+    func isDeleteLimitReached(for profile: SyncProfile) -> Bool {
+        FileManager.default.fileExists(atPath: profile.deleteLimitMarkerPath)
+    }
+
+    /// The menu action twin of `limpet profile clear-delete-limit`: remove the
+    /// marker, then send the watcher the same "sync now" request.
+    func clearDeleteLimit(for profile: SyncProfile) {
+        do {
+            try FileManager.default.removeItem(atPath: profile.deleteLimitMarkerPath)
+        } catch {
+            profileErrors[profile.id] = "could not clear the delete limit: \(error.localizedDescription)"
+            return
+        }
+        clearError(for: profile.id)
+        sendSyncNowSignal(to: profile)
+        objectWillChange.send()
+    }
+
     /// `launchctl kill SIGUSR1 gui/<uid>/<label>` — addressed by label, not
     /// PID, so this never races a launchd respawn. A non-zero exit means no
     /// watcher is currently loaded for that profile; reported to the user as
@@ -243,29 +296,42 @@ final class SyncManager: ObservableObject {
 
     // MARK: - Profile Management
 
-    /// Enable/disable scheduled sync for a profile
+    /// Enable/disable scheduled sync for a profile. Refused changes and
+    /// install/uninstall failures are shown through `profileErrors`, and a
+    /// refused enable persists nothing (review finding 6).
     func setProfileEnabled(_ profile: SyncProfile, enabled: Bool) {
         var updatedProfile = profile
         updatedProfile.isEnabled = enabled
-        profileStore.update(updatedProfile)
-
-        if enabled {
-            do {
-                try setupService.install(profile: updatedProfile)
-                startWatching(profile: updatedProfile)
-            } catch {
-                print("Failed to install profile: \(error)")
-            }
-        } else {
-            do {
-                try setupService.uninstall(profile: updatedProfile)
-                stopWatching(profileId: profile.id)
-            } catch {
-                print("Failed to uninstall profile: \(error)")
-            }
-        }
-
+        applyProfileChange(from: profile, to: updatedProfile)
         updateAggregateState()
+    }
+
+    /// Production wiring of `applyProfileChange` (ConfigReconciler.swift).
+    private func applyProfileChange(from current: SyncProfile, to updated: SyncProfile) {
+        clearError(for: updated.id)
+        Self.applyProfileChange(
+            from: current,
+            to: updated,
+            others: profileStore.profiles,
+            isInstalled: SyncProfile.agentInstalled,
+            persist: { profileStore.update($0) },
+            install: { [self] in try installAndWatch($0) },
+            uninstall: { [self] in try uninstallAndStopWatching($0) },
+            reportError: { [self] message in
+                profileErrors[updated.id] = message
+                LimpetSettings.debugLog("[\(updated.shortId)] \(message)")
+            }
+        )
+    }
+
+    private func installAndWatch(_ profile: SyncProfile) throws {
+        try setupService.install(profile: profile)
+        startWatching(profile: profile)
+    }
+
+    private func uninstallAndStopWatching(_ profile: SyncProfile) throws {
+        try setupService.uninstall(profile: profile)
+        stopWatching(profileId: profile.id)
     }
 
     // MARK: - External Config Reconcile
@@ -305,56 +371,32 @@ final class SyncManager: ObservableObject {
     /// / `SyncManager.applyExternalCreateIfNeeded`), so an agent can bootstrap a
     /// new sync purely by dropping a file.
     func applyExternalProfileEdit(fromFileAt path: String) {
-        guard let data = FileManager.default.contents(atPath: path),
-              let updatedProfile = try? JSONDecoder().decode(SyncProfile.self, from: data) else {
-            LimpetSettings.debugLog("[ConfigFileWatcher] Failed to decode external profile edit at \(path); skipping")
-            return
-        }
-
-        guard let currentProfile = profileStore.profile(for: updatedProfile.id) else {
-            applyExternalProfileCreate(decoded: updatedProfile, sourcePath: path)
-            return
-        }
-
-        let action = Self.reconcileAction(from: currentProfile, to: updatedProfile)
-
-        profileStore.update(updatedProfile)
-        clearError(for: updatedProfile.id)
-
-        switch action {
-        case .none:
+        guard let data = FileManager.default.contents(atPath: path) else { return }
+        let outcome = Self.applyExternalEdit(
+            data: data,
+            path: path,
+            known: { [self] in profileStore.profile(for: $0) },
+            others: profileStore.profiles,
+            isInstalled: SyncProfile.agentInstalled,
+            persist: { [self] profile in
+                clearError(for: profile.id)
+                profileStore.update(profile)
+            },
+            install: { [self] in try installAndWatch($0) },
+            uninstall: { [self] in try uninstallAndStopWatching($0) },
+            reportError: { [self] id, message in
+                profileErrors[id] = message
+                print(message)
+                LimpetSettings.debugLog("[ConfigFileWatcher] \(message)")
+            })
+        switch outcome {
+        case .create(let profile):
+            applyExternalProfileCreate(decoded: profile, sourcePath: path)
+        case .ignored:
+            LimpetSettings.debugLog("[ConfigFileWatcher] \(path) is not a complete profile yet; skipping")
+        case .applied, .restored:
             break
-
-        case .install:
-            do {
-                try setupService.install(profile: updatedProfile)
-                startWatching(profile: updatedProfile)
-            } catch {
-                print("Failed to install externally-edited profile: \(error)")
-            }
-
-        case .uninstall:
-            do {
-                try setupService.uninstall(profile: updatedProfile)
-                stopWatching(profileId: updatedProfile.id)
-            } catch {
-                print("Failed to uninstall externally-edited profile: \(error)")
-            }
-
-        case .reinstall:
-            do {
-                try setupService.uninstall(profile: updatedProfile)
-            } catch {
-                // Ignore uninstall errors, matching ProfileDetailView.reinstallSync.
-            }
-            do {
-                try setupService.install(profile: updatedProfile)
-                startWatching(profile: updatedProfile)
-            } catch {
-                print("Failed to reinstall externally-edited profile: \(error)")
-            }
         }
-
         updateAggregateState()
     }
 
@@ -374,6 +416,8 @@ final class SyncManager: ObservableObject {
         let outcome = Self.applyExternalCreateIfNeeded(
             decoded: decoded,
             isKnownId: false,
+            existing: profileStore.profiles,
+            isInstalled: SyncProfile.agentInstalled,
             persist: { [weak self] profile in
                 self?.profileStore.add(profile)
                 self?.clearError(for: profile.id)
@@ -391,10 +435,17 @@ final class SyncManager: ObservableObject {
                 } catch {
                     print("Failed to install newly-created external profile: \(error)")
                 }
+            },
+            quarantine: { reason in
+                let moved = Self.quarantineRefusedDrop(at: sourcePath)
+                let message = "Refused dropped profile \(decoded.shortId): \(reason); "
+                    + (moved.map { "moved it to \($0)" } ?? "could not move \(sourcePath) aside")
+                print(message)
+                LimpetSettings.debugLog(message)
             }
         )
 
-        guard outcome != .ignored else { return }
+        guard outcome != .ignored, outcome != .refusedOverlap else { return }
 
         updateAggregateState()
     }

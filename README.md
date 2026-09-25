@@ -76,6 +76,18 @@ config the GUI reads and writes.
 | `limpet profile set <name\|id> <key> <value> ...` | Edit fields on an existing profile. |
 | `limpet install` / `reinstall <name\|id>` | (Re)install a profile's launchd agent. |
 | `limpet sync <name\|id>` | Run a sync now and block until it finishes. |
+| `limpet profile clear-delete-limit <name\|id>` | Resume a profile stopped by its delete limit (see below). |
+
+### Delete limit
+
+For remotes that keep no deleted versions (MEGA S4, Cloudflare R2, and any
+other S3 provider unless the profile sets `remoteVersioning: true`), each
+sync deletes at most `maxDelete` files (default 100). A run that hits the
+limit stops the profile until you clear it from the menu or with
+`limpet profile clear-delete-limit`. Clearing allows one more batch of up to
+`maxDelete` deletions, not an unlimited run: if more files than that are
+still pending, the limit trips again and you clear it again after checking
+the remote. To delete a large batch on purpose, raise `maxDelete` first.
 
 ## File locations
 

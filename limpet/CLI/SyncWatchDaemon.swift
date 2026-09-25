@@ -84,12 +84,20 @@ enum SyncWatchDaemon {
     private static func productionRunner(for profile: SyncProfile) -> SchedulerRunner {
         SchedulerRunner(
             sourceExists: { FileManager.default.fileExists(atPath: profile.localSyncPath) },
-            runChild: { completion in
+            runChild: { mayLog, completion in
                 DispatchQueue.global(qos: .utility).async {
-                    let code = runChildProcess(
-                        scriptPath: SyncProfile.sharedScriptPath,
-                        configPath: profile.configPath
-                    )
+                    let code = runSyncChild(
+                        profile: profile,
+                        service: .shared,
+                        // Throttled: a locked keychain fails every ~5 s trigger alike.
+                        // mayLog touches scheduler state, which lives on main.
+                        log: { if DispatchQueue.main.sync(execute: mayLog) { appendProfileLogLine($0, profile: profile) } },
+                        spawn: { environment in
+                            runChildProcess(
+                                scriptPath: SyncProfile.sharedScriptPath,
+                                configPath: profile.configPath,
+                                environment: environment)
+                        })
                     DispatchQueue.main.async { completion(code) }
                 }
             },
@@ -97,8 +105,51 @@ enum SyncWatchDaemon {
             scheduleAfter: { seconds, action in
                 DispatchQueue.main.asyncAfter(deadline: .now() + seconds, execute: action)
             },
-            logSourceMissing: { appendSourceMissingLine(profile: profile) }
+            logSourceMissing: { appendProfileLogLine("Source missing: \(profile.localSyncPath)", profile: profile) },
+            refusalReason: { refusalReason(for: profile, profilesDirectory: SyncProfile.configDirectory) },
+            logRefusal: { appendProfileLogLine("Refusing to sync: \($0)", profile: profile) },
+            deleteLimitReached: { FileManager.default.fileExists(atPath: profile.deleteLimitMarkerPath) },
+            recordDeleteLimit: {
+                FileManager.default.createFile(
+                    atPath: profile.deleteLimitMarkerPath,
+                    contents: Data("rclone stopped at --max-delete; remove this file (or run 'limpet profile clear-delete-limit \(profile.shortId)') to sync again\n".utf8))
+            }
         )
+    }
+
+    /// F4/F6 gate the watcher asks before every run (limpet-plan.md L4). Re-reads
+    /// every profile file each time: a profile created or edited since this
+    /// watcher started must be seen. Not private so `ConfigSelfTest` drives the
+    /// exact production closure against a scratch profiles directory.
+    static func refusalReason(
+        for profile: SyncProfile,
+        profilesDirectory: String,
+        isInstalled: (SyncProfile) -> Bool = SyncProfile.agentInstalled
+    ) -> String? {
+        // A running watcher syncs, whatever the flag in its copy says.
+        var running = profile
+        running.isEnabled = true
+        return profile.validationError ?? SyncProfile.overlapError(
+            running, among: ProfileStore.profilesOnDisk(in: profilesDirectory), isInstalled: isInstalled)
+    }
+
+    /// What `runSyncChild` returns when the remote's secret could not be read.
+    static let secretUnavailableExitCode: Int32 = 78  // EX_CONFIG
+
+    /// F3 (limpet-plan.md L4): the sync script child — and therefore rclone —
+    /// starts only with the environment the secret-injection helper returns.
+    /// On a keychain failure the helper has already logged its one line and
+    /// nothing is spawned. The script itself never touches the keychain.
+    static func runSyncChild(
+        profile: SyncProfile,
+        service: RcloneConfigService,
+        log: (String) -> Void,
+        spawn: ([String: String]) -> Int32
+    ) -> Int32 {
+        guard let environment = service.processEnvironment(forRemote: profile.rcloneRemote, log: log) else {
+            return secretUnavailableExitCode
+        }
+        return spawn(environment)
     }
 
     /// Run the shared sync script as a child. stdout/stderr go to
@@ -106,10 +157,11 @@ enum SyncWatchDaemon {
     /// profile log itself (`tee -a "$LOG_FILE"`), so piping the child's
     /// stdout through here too would duplicate every line (limpet-plan.md
     /// v2→v3 disposition #6).
-    private static func runChildProcess(scriptPath: String, configPath: String) -> Int32 {
+    private static func runChildProcess(scriptPath: String, configPath: String, environment: [String: String]) -> Int32 {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/bash")
         process.arguments = [scriptPath, configPath]
+        process.environment = environment
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
         do {
@@ -121,14 +173,15 @@ enum SyncWatchDaemon {
         return process.terminationStatus
     }
 
-    /// Append the fixed `YYYY-MM-DD HH:MM:SS - Source missing: <path>` line to
-    /// the PROFILE log — the file `LogWatcher`/the GUI reads — never the
-    /// separate launchd stdout log, so a missing source is visible in the
-    /// same place every other sync outcome is (limpet-plan.md L3(a)).
-    private static func appendSourceMissingLine(profile: SyncProfile) {
+    /// Append a fixed `YYYY-MM-DD HH:MM:SS - <message>` line (e.g. `Source
+    /// missing: <path>`) to the PROFILE log — the file `LogWatcher`/the GUI
+    /// reads — never the separate launchd stdout log, so the watcher's own
+    /// outcomes are visible in the same place every sync outcome is
+    /// (limpet-plan.md L3(a)).
+    private static func appendProfileLogLine(_ message: String, profile: SyncProfile) {
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
-        let line = "\(formatter.string(from: Date())) - Source missing: \(profile.localSyncPath)\n"
+        let line = "\(formatter.string(from: Date())) - \(message)\n"
         guard let data = line.data(using: .utf8) else { return }
 
         let fm = FileManager.default

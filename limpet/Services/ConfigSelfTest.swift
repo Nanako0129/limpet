@@ -32,6 +32,8 @@ enum ConfigSelfTest {
 
     /// Run every self-test. Returns 0 if all passed, 1 otherwise.
     static func run() -> Int32 {
+        // No self-test may reach a real keychain (see makeSecurityStub).
+        KeychainSecretStore.realKeychainForbidden = true
         // Start clean so a previous run's leftovers can't mask a real failure.
         try? FileManager.default.removeItem(atPath: selfTestRoot)
         try? FileManager.default.createDirectory(atPath: selfTestRoot, withIntermediateDirectories: true)
@@ -73,10 +75,39 @@ enum ConfigSelfTest {
             testMissingSourceIsNotCreated,
             testScriptRefusesNonNumericTransfers,
             testScriptRefusesMultilineFlags,
+            testScriptRefusesDumpFlags,
             testShimQuotesHostilePath,
             testTransfersChangeReinstalls,
             testTranslocatedAppRefused,
             testInstallRefusesNonOwnedShim,
+            testRemoteSpecRefusedAtDecodeAndWrite,
+            testRemoteSpecRefusedAtCLI,
+            testRefusedAtInstall,
+            testOverlapRefused,
+            testWatcherRefusesBeforeEveryRun,
+            testKeychainRemoteCreatedThroughSecurityOnly,
+            testKeychainRemoteRefusals,
+            testSecretInjectionHelper,
+            testCLIRemoteAdd,
+            testWizardProvidersRemapAndRoute,
+            testScriptMapsMaxDeleteTo76,
+            testMaxDeleteOnlyForNonVersionedProviders,
+            testWatcherStopsAtDeleteLimit,
+            testCLIClearDeleteLimit,
+            testDoctorWarnsB2WithoutLifecycle,
+            testTransfersRange,
+            testRefusedDropQuarantined,
+            testOverlapOnlyAmongEnabledInstalled,
+            testProfileChangeRefusedBeforePersist,
+            testKeychainRemoteEditDeleteConsistency,
+            testKeychainLockedNoRead,
+            testDoctorWarnsStaleMaxDelete,
+            testRefusedExternalEditRestored,
+            testWizardRetryKeepsProfileId,
+            testPruneKeepsUndecodableFile,
+            testEditKeepsNonSecretRequiredErrors,
+            testKeychainLockedLogThrottled,
+            testKeychainLargeOutputDrained,
         ]
 
         for check in checks {
@@ -150,14 +181,16 @@ enum ConfigSelfTest {
 
     private static func testDerivedJSONFrozen() -> Bool {
         let profile = sampleProfile()
-        let json = SyncSetupService.shared.generateProfileConfig(for: profile)
+        // A scratch rclone.conf, so the self-test never reads the user's real one.
+        let json = SyncSetupService.shared.generateProfileConfig(
+            for: profile, rcloneConfig: RcloneConfigService(configPath: "\(selfTestRoot)/ac2-absent-rclone.conf"))
 
         let forbidden = ["\"isEnabled\"", "\"isMuted\""]
         for key in forbidden where json.contains(key) {
             return report("AC-2", "derived-json-frozen", false, "(unexpectedly contains \(key))")
         }
 
-        let requiredFrozenKeys = ["\"profileId\"", "\"remote\"", "\"localPath\"", "\"syncIntervalMinutes\""]
+        let requiredFrozenKeys = ["\"profileId\"", "\"remote\"", "\"localPath\"", "\"syncIntervalMinutes\"", "\"maxDelete\""]
         for key in requiredFrozenKeys where !json.contains(key) {
             return report("AC-2", "derived-json-frozen", false, "(missing frozen key \(key))")
         }
@@ -566,8 +599,11 @@ enum ConfigSelfTest {
         let outcome = SyncManager.applyExternalCreateIfNeeded(
             decoded: profile,
             isKnownId: false,
+            existing: [],
+            isInstalled: { _ in true },
             persist: { _ in persistCalls += 1 },
-            install: { _ in installCalls += 1 }
+            install: { _ in installCalls += 1 },
+            quarantine: { _ in }
         )
 
         guard outcome == .createdAndInstalled else {
@@ -588,8 +624,11 @@ enum ConfigSelfTest {
             var installCalls = 0
             let outcome = SyncManager.applyExternalCreateIfNeeded(
                 decoded: profile, isKnownId: false,
+                existing: [],
+                isInstalled: { _ in true },
                 persist: { _ in persistCalls += 1 },
-                install: { _ in installCalls += 1 }
+                install: { _ in installCalls += 1 },
+                quarantine: { _ in }
             )
             return (outcome, persistCalls, installCalls)
         }
@@ -621,8 +660,11 @@ enum ConfigSelfTest {
         var installCalls = 0
         let outcome = SyncManager.applyExternalCreateIfNeeded(
             decoded: nil, isKnownId: false,
+            existing: [],
+            isInstalled: { _ in true },
             persist: { _ in persistCalls += 1 },
-            install: { _ in installCalls += 1 }
+            install: { _ in installCalls += 1 },
+            quarantine: { _ in }
         )
         guard outcome == .ignored, persistCalls == 0, installCalls == 0 else {
             return report(
@@ -665,6 +707,8 @@ enum ConfigSelfTest {
         let outcome = SyncManager.applyExternalCreateIfNeeded(
             decoded: profile,
             isKnownId: false,
+            existing: [],
+            isInstalled: { _ in true },
             persist: { p in
                 let store = ProfileStore(
                     profilesDirectory: dir,
@@ -677,7 +721,8 @@ enum ConfigSelfTest {
                     try? FileManager.default.removeItem(atPath: sourcePath)
                 }
             },
-            install: { _ in }
+            install: { _ in },
+            quarantine: { _ in }
         )
         guard outcome == .createdOnly else {
             return report("AC-C4", "external-create-canonical-no-loop", false, "(expected .createdOnly, got \(outcome))")
@@ -709,17 +754,21 @@ enum ConfigSelfTest {
     /// Build a `CLIEnvironment` with inert defaults, overridable per test —
     /// mirrors `sampleProfile`'s role for the Enabler-1 tests above.
     private static func fakeCLIEnvironment(
-        runRclone: @escaping (_ args: [String], _ timeout: TimeInterval) -> (Int32, String, String) = { _, _ in (0, "", "") },
+        runRclone: @escaping (_ args: [String], _ remote: String?, _ timeout: TimeInterval) -> (Int32, String, String) = { _, _, _ in (0, "", "") },
         readProfiles: @escaping () -> [SyncProfile] = { [] },
         fileExists: @escaping (String) -> Bool = { _ in false },
         runLaunchctl: @escaping (_ args: [String]) -> (Int32, String) = { _ in (0, "") },
         schemaFilesPresent: @escaping () -> Bool = { true },
+        remoteSection: @escaping (String) -> [String: String]? = { _ in nil },
         writeProfile: @escaping (SyncProfile) -> Bool = { _ in true },
         installProfile: @escaping (SyncProfile) -> String? = { _ in nil },
         uninstallProfile: @escaping (SyncProfile) -> String? = { _ in nil },
         deleteProfileFile: @escaping (SyncProfile) -> Void = { _ in },
+        removeFile: @escaping (String) -> Bool = { _ in true },
         readStdin: @escaping () -> String? = { nil },
         readFile: @escaping (String) -> String? = { _ in nil },
+        readSecret: @escaping (String) -> String? = { _ in nil },
+        addKeychainRemote: @escaping (String, String, [String: String], String) -> String? = { _, _, _, _ in nil },
         stdout: @escaping (String) -> Void = { _ in },
         stderr: @escaping (String) -> Void = { _ in }
     ) -> CLIEnvironment {
@@ -729,12 +778,16 @@ enum ConfigSelfTest {
             fileExists: fileExists,
             runLaunchctl: runLaunchctl,
             schemaFilesPresent: schemaFilesPresent,
+            remoteSection: remoteSection,
             writeProfile: writeProfile,
             installProfile: installProfile,
             uninstallProfile: uninstallProfile,
             deleteProfileFile: deleteProfileFile,
+            removeFile: removeFile,
             readStdin: readStdin,
             readFile: readFile,
+            readSecret: readSecret,
+            addKeychainRemote: addKeychainRemote,
             stdout: stdout,
             stderr: stderr
         )
@@ -1044,7 +1097,7 @@ enum ConfigSelfTest {
         }
 
         var capturedArgs: [String] = []
-        let listEnv = fakeCLIEnvironment(runRclone: { args, _ in
+        let listEnv = fakeCLIEnvironment(runRclone: { args, _, _ in
             capturedArgs = args
             return (0, "remote1:\nremote2:\n", "")
         })
@@ -1061,7 +1114,7 @@ enum ConfigSelfTest {
     private static func testDoctorPureChecks() -> Bool {
         // rclone present + schema present + no profiles → no .fail check.
         let healthyEnv = fakeCLIEnvironment(
-            runRclone: { args, _ in args.first == "version" ? (0, "rclone v1.66.0", "") : (0, "", "") },
+            runRclone: { args, _, _ in args.first == "version" ? (0, "rclone v1.66.0", "") : (0, "", "") },
             readProfiles: { [] },
             schemaFilesPresent: { true }
         )
@@ -1074,7 +1127,7 @@ enum ConfigSelfTest {
         }
 
         // rclone absent → .fail, exit non-zero.
-        let noRcloneEnv = fakeCLIEnvironment(runRclone: { _, _ in (127, "", "not found") })
+        let noRcloneEnv = fakeCLIEnvironment(runRclone: { _, _, _ in (127, "", "not found") })
         let noRcloneChecks = LimpetCLI.doctorChecks(env: noRcloneEnv)
         guard noRcloneChecks.contains(where: { $0.name == "rclone" && $0.status == .fail }) else {
             return report("AC-CLI2", "doctor-pure-checks", false, "(rclone-absent env did not produce a .fail rclone check)")
@@ -1085,7 +1138,7 @@ enum ConfigSelfTest {
 
         // schema missing → .warn only, exit still 0.
         let noSchemaEnv = fakeCLIEnvironment(
-            runRclone: { args, _ in args.first == "version" ? (0, "rclone v1.66.0", "") : (0, "", "") },
+            runRclone: { args, _, _ in args.first == "version" ? (0, "rclone v1.66.0", "") : (0, "", "") },
             schemaFilesPresent: { false }
         )
         let noSchemaChecks = LimpetCLI.doctorChecks(env: noSchemaEnv)
@@ -1099,7 +1152,7 @@ enum ConfigSelfTest {
         // Per-profile: derived config missing → .fail, exit non-zero.
         let profile = sampleProfile(isEnabled: false)
         let missingConfigEnv = fakeCLIEnvironment(
-            runRclone: { args, _ in args.first == "version" ? (0, "rclone v1.66.0", "") : (0, "", "") },
+            runRclone: { args, _, _ in args.first == "version" ? (0, "rclone v1.66.0", "") : (0, "", "") },
             readProfiles: { [profile] },
             fileExists: { _ in false },
             schemaFilesPresent: { true }
@@ -1114,7 +1167,7 @@ enum ConfigSelfTest {
 
         // Derived config present → no .fail for that profile.
         let presentConfigEnv = fakeCLIEnvironment(
-            runRclone: { args, _ in args.first == "version" ? (0, "rclone v1.66.0", "") : (0, "", "") },
+            runRclone: { args, _, _ in args.first == "version" ? (0, "rclone v1.66.0", "") : (0, "", "") },
             readProfiles: { [profile] },
             fileExists: { path in path == profile.configPath },
             schemaFilesPresent: { true }
@@ -1128,7 +1181,7 @@ enum ConfigSelfTest {
 
         // Stale lock present → .warn only, exit still 0.
         let staleLockEnv = fakeCLIEnvironment(
-            runRclone: { args, _ in args.first == "version" ? (0, "rclone v1.66.0", "") : (0, "", "") },
+            runRclone: { args, _, _ in args.first == "version" ? (0, "rclone v1.66.0", "") : (0, "", "") },
             readProfiles: { [profile] },
             fileExists: { path in path == profile.configPath || path == profile.lockFilePath },
             schemaFilesPresent: { true }
@@ -1265,10 +1318,14 @@ enum ConfigSelfTest {
     ) -> SchedulerRunner {
         SchedulerRunner(
             sourceExists: sourceExists,
-            runChild: { completion in completion(exitCode()) },
+            runChild: { _, completion in completion(exitCode()) },
             now: { clock.now },
             scheduleAfter: { seconds, action in clock.scheduleAfter(seconds, action) },
-            logSourceMissing: { onLogSourceMissing?() }
+            logSourceMissing: { onLogSourceMissing?() },
+            refusalReason: { nil },
+            logRefusal: { _ in },
+            deleteLimitReached: { false },
+            recordDeleteLimit: { true }
         )
     }
 
@@ -1282,10 +1339,14 @@ enum ConfigSelfTest {
             let clock = VirtualClock()
             let runner = SchedulerRunner(
                 sourceExists: { true },
-                runChild: { completion in pendingCompletions.append(completion) },
+                runChild: { _, completion in pendingCompletions.append(completion) },
                 now: { clock.now },
                 scheduleAfter: { s, a in clock.scheduleAfter(s, a) },
-                logSourceMissing: {}
+                logSourceMissing: {},
+                refusalReason: { nil },
+                logRefusal: { _ in },
+                deleteLimitReached: { false },
+                recordDeleteLimit: { true }
             )
             let scheduler = SyncWatchScheduler(runner: runner)
             scheduler.trigger()  // run 1 starts, held open
@@ -1312,10 +1373,14 @@ enum ConfigSelfTest {
             let clock = VirtualClock()
             let runner = SchedulerRunner(
                 sourceExists: { true },
-                runChild: { completion in pendingCompletions.append(completion) },
+                runChild: { _, completion in pendingCompletions.append(completion) },
                 now: { clock.now },
                 scheduleAfter: { s, a in clock.scheduleAfter(s, a) },
-                logSourceMissing: {}
+                logSourceMissing: {},
+                refusalReason: { nil },
+                logRefusal: { _ in },
+                deleteLimitReached: { false },
+                recordDeleteLimit: { true }
             )
             let scheduler = SyncWatchScheduler(runner: runner)
             scheduler.trigger()
@@ -1341,10 +1406,14 @@ enum ConfigSelfTest {
             let clock = VirtualClock()
             let runner = SchedulerRunner(
                 sourceExists: { true },
-                runChild: { completion in pendingCompletions.append(completion) },
+                runChild: { _, completion in pendingCompletions.append(completion) },
                 now: { clock.now },
                 scheduleAfter: { s, a in clock.scheduleAfter(s, a) },
-                logSourceMissing: {}
+                logSourceMissing: {},
+                refusalReason: { nil },
+                logRefusal: { _ in },
+                deleteLimitReached: { false },
+                recordDeleteLimit: { true }
             )
             let scheduler = SyncWatchScheduler(runner: runner)
             scheduler.trigger()          // run 1 (e.g. FSEvents)
@@ -1867,8 +1936,8 @@ enum ConfigSelfTest {
     /// not be set up; otherwise the script's exit status, whether the stub ran, and
     /// the profile log text.
     private static func runScriptFixture(
-        name: String, overrides: [String: Any]
-    ) -> (status: Int32, stubRan: Bool, log: String)? {
+        name: String, overrides: [String: Any], stubTail: String = "exit 0\n", extraEnvironment: [String: String] = [:]
+    ) -> (status: Int32, stubRan: Bool, log: String, argv: [String])? {
         let fm = FileManager.default
         let root = (selfTestRoot as NSString).appendingPathComponent(name)
         try? fm.removeItem(atPath: root)
@@ -1879,6 +1948,7 @@ enum ConfigSelfTest {
         let logPath = (root as NSString).appendingPathComponent("sync.log")
         let stubPath = (root as NSString).appendingPathComponent("rclone-stub.sh")
         let ranPath = (root as NSString).appendingPathComponent("stub-ran")
+        let argvPath = (root as NSString).appendingPathComponent("stub-argv")
         var config: [String: Any] = [
             "remote": "selftest-fixture-remote:SelfTest",
             "localPath": localPath,
@@ -1897,7 +1967,8 @@ enum ConfigSelfTest {
             try "".write(toFile: filterPath, atomically: true, encoding: .utf8)
             try SyncSetupService.shared.generateSyncScript().write(toFile: scriptPath, atomically: true, encoding: .utf8)
             try JSONSerialization.data(withJSONObject: config).write(to: URL(fileURLWithPath: configPath))
-            try "#!/bin/sh\ntouch \"\(ranPath)\"\nexit 0\n".write(toFile: stubPath, atomically: true, encoding: .utf8)
+            try ("#!/bin/sh\ntouch \"\(ranPath)\"\nprintf '%s\\n' \"$@\" > \"\(argvPath)\"\n" + stubTail)
+                .write(toFile: stubPath, atomically: true, encoding: .utf8)
             try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: stubPath)
         } catch {
             return nil
@@ -1907,13 +1978,31 @@ enum ConfigSelfTest {
         process.arguments = [scriptPath, configPath]
         var env = ProcessInfo.processInfo.environment
         env["RCLONE_BIN"] = stubPath
+        env.merge(extraEnvironment) { _, new in new }
         process.environment = env
         process.standardError = FileHandle.nullDevice
         process.standardOutput = FileHandle.nullDevice
         guard (try? process.run()) != nil else { return nil }
         process.waitUntilExit()
         let log = (try? String(contentsOfFile: logPath, encoding: .utf8)) ?? ""
-        return (process.terminationStatus, fm.fileExists(atPath: ranPath), log)
+        let argv = ((try? String(contentsOfFile: argvPath, encoding: .utf8)) ?? "")
+            .split(separator: "\n").map(String.init)
+        return (process.terminationStatus, fm.fileExists(atPath: ranPath), log, argv)
+    }
+
+    // MARK: - AC-W16 — --dump flags are refused (they can log credentials)
+
+    private static func testScriptRefusesDumpFlags() -> Bool {
+        for flags in ["--dump auth", "--dump=headers", "--bwlimit=5M --dump-headers"] {
+            guard let result = runScriptFixture(name: "ac-w16-dump", overrides: ["additionalFlags": flags]) else {
+                return report("AC-W16", "script-refuses-dump-flags", false, "(fixture setup failed)")
+            }
+            guard result.status == 64, !result.stubRan, result.log.contains("contains --dump") else {
+                return report("AC-W16", "script-refuses-dump-flags", false,
+                              "(\(flags): status \(result.status), stubRan \(result.stubRan))")
+            }
+        }
+        return report("AC-W16", "script-refuses-dump-flags", true)
     }
 
     // MARK: - AC-W14 — `transfers` is never evaluated as shell arithmetic
@@ -2086,6 +2175,1566 @@ enum ConfigSelfTest {
         }
 
         return report("AC-W7", "install-refuses-nonowned-shim", true)
+    }
+
+    // MARK: - L4 validation fixtures (limpet-plan.md L4 F4/F6)
+
+    /// A connection string carrying a recognisable fake secret, so every
+    /// assertion below can also check the value never reached a file or output.
+    private static let connectionStringSecret = "SEKRET-connstr-7f3a"
+    private static var connectionStringRemote: String {
+        ":s3,access_key_id=AKID,secret_access_key=\(connectionStringSecret):bucket"
+    }
+    private static let translocatedExecutable =
+        "/private/tmp/AppTranslocation/ABCDEF12-3456/d/limpet.app/Contents/MacOS/limpet"
+
+    /// JSON for `profile` with `rcloneRemote` replaced — built from a dict so a
+    /// refused value can be written without going through the (refusing) encoder.
+    private static func profileJSON(_ profile: SyncProfile, rcloneRemote: String) -> String {
+        let dict: [String: Any] = [
+            "id": profile.id.uuidString, "name": profile.name, "rcloneRemote": rcloneRemote,
+            "remotePath": profile.remotePath, "localSyncPath": profile.localSyncPath, "isEnabled": true,
+        ]
+        let data = (try? JSONSerialization.data(withJSONObject: dict)) ?? Data()
+        return String(decoding: data, as: UTF8.self)
+    }
+
+    // MARK: - AC-L4-1 — refused remote specs never decode, never get written
+
+    private static func testRemoteSpecRefusedAtDecodeAndWrite() -> Bool {
+        let id = "AC-L4-1", slug = "remote-spec-refused-at-decode-and-write"
+        let base = sampleProfile()
+        for refused in [connectionStringRemote, ":local:", "myremote,x=y:", "a=b"] {
+            let json = profileJSON(base, rcloneRemote: refused)
+            if (try? JSONDecoder().decode(SyncProfile.self, from: Data(json.utf8))) != nil {
+                return report(id, slug, false, "(\(refused.debugDescription) decoded)")
+            }
+        }
+        for accepted in ["b2-home", "b2-home:", "limpet_test_s4"] {
+            let json = profileJSON(base, rcloneRemote: accepted)
+            guard (try? JSONDecoder().decode(SyncProfile.self, from: Data(json.utf8))) != nil else {
+                return report(id, slug, false, "(\(accepted.debugDescription) was refused)")
+            }
+        }
+
+        // Write seam: a profile built in memory (bypassing decode) is never written.
+        let dir = "\(selfTestRoot)/ac-l4-1"
+        try? FileManager.default.removeItem(atPath: dir)
+        var bad = base
+        bad.rcloneRemote = connectionStringRemote
+        guard ProfileStore.writeProfileFile(bad, in: dir) == nil,
+              !FileManager.default.fileExists(atPath: "\(dir)/\(bad.shortId).profile.json") else {
+            return report(id, slug, false, "(writeProfileFile wrote a connection-string profile)")
+        }
+        // The app's store keeps it out of memory too, so the blob mirror never gets it.
+        let defaults = UserDefaults(suiteName: "com.nanako.limpet.selftest.l4-1.\(UUID().uuidString)")!
+        let store = ProfileStore(profilesDirectory: dir, defaults: defaults)
+        store.add(bad)
+        let blob = defaults.data(forKey: ProfileStore.profilesKey).map { String(decoding: $0, as: UTF8.self) } ?? ""
+        guard store.profiles.isEmpty, !blob.contains(connectionStringSecret) else {
+            return report(id, slug, false, "(ProfileStore.add kept a connection-string profile)")
+        }
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L4-2 — CLI profile create / set refuse a connection string
+
+    private static func testRemoteSpecRefusedAtCLI() -> Bool {
+        let id = "AC-L4-2", slug = "remote-spec-refused-at-cli"
+        let existing = sampleProfile(name: "Existing")
+        var output = "", wrote = false, installed = false
+        let env = fakeCLIEnvironment(
+            readProfiles: { [existing] },
+            writeProfile: { _ in wrote = true; return true },
+            installProfile: { _ in installed = true; return nil },
+            readStdin: { profileJSON(sampleProfile(name: "New"), rcloneRemote: connectionStringRemote) },
+            stdout: { output += $0 },
+            stderr: { output += $0 }
+        )
+        guard LimpetCLI.execute(["profile", "create", "-"], env: env) == 65, !wrote, !installed else {
+            return report(id, slug, false, "(profile create accepted a connection string)")
+        }
+        guard LimpetCLI.execute(["profile", "set", existing.shortId, "rcloneRemote", connectionStringRemote], env: env) == 65,
+              !wrote, !installed else {
+            return report(id, slug, false, "(profile set accepted a connection string)")
+        }
+        guard !output.contains(connectionStringSecret) else {
+            return report(id, slug, false, "(the refused value was echoed to stdout/stderr)")
+        }
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L4-3 — install and a reconcile-driven reinstall refuse before any side effect
+
+    /// `install` is called with a TRANSLOCATED executable path on purpose: F4/F6
+    /// run before the translocation guard, so a passing run throws
+    /// `.refusedProfile`, and a regression throws `.translocatedApp` instead —
+    /// either way nothing real under ~/.local or ~/Library is ever written.
+    private static func testRefusedAtInstall() -> Bool {
+        let id = "AC-L4-3", slug = "refused-at-install"
+        func installError(_ profile: SyncProfile, others: [SyncProfile]) -> Error? {
+            do {
+                try SyncSetupService.shared.install(
+                    profile: profile, loadAgent: false,
+                    executablePath: translocatedExecutable, otherProfiles: others, isInstalled: { _ in true })
+                return nil
+            } catch { return error }
+        }
+        func isRefusal(_ error: Error?) -> Bool {
+            if case .refusedProfile? = error as? SyncSetupService.SetupError { return true }
+            return false
+        }
+        var bad = sampleProfile()
+        bad.rcloneRemote = connectionStringRemote
+        let badError = installError(bad, others: [])
+        guard isRefusal(badError), !"\(badError!)".contains(connectionStringSecret) else {
+            return report(id, slug, false, "(install did not refuse a connection string: \(String(describing: badError)))")
+        }
+        let first = sampleProfile(name: "First")
+        var nested = sampleProfile(name: "Nested")
+        nested.remotePath = first.remotePath + "/inner"
+        guard isRefusal(installError(nested, others: [first])) else {
+            return report(id, slug, false, "(install did not refuse an overlapping profile)")
+        }
+
+        // Reconcile-driven reinstall: `limpet reinstall` routes uninstall → install;
+        // the install step is the real one, so the refusal surfaces as a failed reinstall.
+        var reinstallErr = ""
+        let env = fakeCLIEnvironment(
+            readProfiles: { [bad] },
+            installProfile: { profile in
+                installError(profile, others: []).map { "\($0)" }
+            },
+            stderr: { reinstallErr += $0 }
+        )
+        guard LimpetCLI.execute(["reinstall", bad.shortId], env: env) == 1,
+              reinstallErr.contains("refusedProfile") else {
+            return report(id, slug, false, "(reinstall of a connection-string profile was not refused: \(reinstallErr))")
+        }
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L4-4 — overlapping remote paths refused at create, set and file drop
+
+    private static func testOverlapRefused() -> Bool {
+        let id = "AC-L4-4", slug = "overlap-refused"
+        let first = sampleProfile(name: "First")  // selftest-fixture-remote: / SelfTest
+
+        // The pure rule: equal, nested (either way), trailing/double slashes and
+        // remote-name case all overlap; a sibling prefix or another remote does not.
+        func overlaps(remote: String, path: String) -> Bool {
+            var other = sampleProfile(name: "Other")
+            other.rcloneRemote = remote
+            other.remotePath = path
+            return SyncProfile.overlapError(other, among: [first], isInstalled: { _ in true }) != nil
+        }
+        let expectOverlap = [("selftest-fixture-remote:", "SelfTest"), ("selftest-fixture-remote", "SelfTest/"),
+                             ("SELFTEST-fixture-remote:", "SelfTest//a"), ("selftest-fixture-remote:", "")]
+        for (remote, path) in expectOverlap where !overlaps(remote: remote, path: path) {
+            return report(id, slug, false, "(\(remote)\(path) was not seen as overlapping)")
+        }
+        for (remote, path) in [("selftest-fixture-remote:", "SelfTest2"), ("other-remote:", "SelfTest")]
+        where overlaps(remote: remote, path: path) {
+            return report(id, slug, false, "(\(remote)\(path) was wrongly seen as overlapping)")
+        }
+        guard SyncProfile.overlapError(first, among: [first], isInstalled: { _ in true }) == nil else {
+            return report(id, slug, false, "(a profile overlapped with itself)")
+        }
+
+        // CLI create.
+        var wrote = false, installed = false
+        var nested = sampleProfile(name: "Nested")
+        nested.remotePath = "SelfTest/inner"
+        guard let nestedJSON = try? JSONEncoder().encode(nested) else {
+            return report(id, slug, false, "(could not encode fixture)")
+        }
+        let createEnv = fakeCLIEnvironment(
+            readProfiles: { [first] },
+            fileExists: { $0 == first.plistPath },
+            writeProfile: { _ in wrote = true; return true },
+            installProfile: { _ in installed = true; return nil },
+            readStdin: { String(decoding: nestedJSON, as: UTF8.self) }
+        )
+        guard LimpetCLI.execute(["profile", "create", "-"], env: createEnv) == 65, !wrote, !installed else {
+            return report(id, slug, false, "(profile create accepted an overlapping profile)")
+        }
+
+        // CLI profile set: moving a disjoint profile under the first one.
+        var disjoint = sampleProfile(name: "Disjoint")
+        disjoint.remotePath = "Elsewhere"
+        let setEnv = fakeCLIEnvironment(
+            readProfiles: { [first, disjoint] },
+            fileExists: { $0 == first.plistPath },
+            writeProfile: { _ in wrote = true; return true },
+            installProfile: { _ in installed = true; return nil },
+            uninstallProfile: { _ in installed = true; return nil }
+        )
+        guard LimpetCLI.execute(["profile", "set", disjoint.shortId, "remotePath", "SelfTest/moved"], env: setEnv) == 65,
+              !wrote, !installed else {
+            return report(id, slug, false, "(profile set accepted an overlapping remotePath)")
+        }
+
+        // File drop.
+        var persisted = 0, dropInstalled = 0, quarantined = 0
+        let outcome = SyncManager.applyExternalCreateIfNeeded(
+            decoded: nested, isKnownId: false, existing: [first], isInstalled: { _ in true },
+            persist: { _ in persisted += 1 }, install: { _ in dropInstalled += 1 },
+            quarantine: { _ in quarantined += 1 })
+        guard outcome == .refusedOverlap, persisted == 0, dropInstalled == 0, quarantined == 1 else {
+            return report(id, slug, false, "(file drop: \(outcome), persist=\(persisted) install=\(dropInstalled))")
+        }
+        return report(id, slug, true)
+    }
+
+    // MARK: - L4 keychain fixtures (limpet-plan.md L4 F2/F3/F5/F7)
+
+    /// Run a tool with a hard timeout; returns (status, stdout). Status -9 = timed out.
+    private static func runTool(_ path: String, _ args: [String], timeout: TimeInterval = 20) -> (Int32, String) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: path)
+        process.arguments = args
+        let out = Pipe()
+        process.standardOutput = out
+        process.standardError = FileHandle.nullDevice
+        process.standardInput = Pipe()
+        let done = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in done.signal() }
+        guard (try? process.run()) != nil else { return (-1, "") }
+        guard done.wait(timeout: .now() + timeout) == .success else { process.terminate(); return (-9, "") }
+        return (process.terminationStatus, String(decoding: out.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self))
+    }
+
+    /// A FAKE `security` (a shell script). No self-test ever runs the real
+    /// `/usr/bin/security` or touches any real keychain, throwaway ones
+    /// included: on 2026-09-26 keychain operations on this machine raised
+    /// login-keychain dialogs for the user, so the real behaviour (ACL, prompt
+    /// freedom) is verified live by the verifier, not here.
+    ///
+    /// Behaviour: every call appends its argv (space-joined) to `<dir>/calls`
+    /// and writes it to `<dir>/argv`; `-i` saves its stdin to `<dir>/add-stdin`
+    /// and stores the hex `-X` value (decoded) in `<dir>/stored`;
+    /// `delete-generic-password` removes it (44 if absent); `find-generic-password`
+    /// answers per `<dir>/mode`: `found` (prints `secret`), `missing` (44),
+    /// `error` (51), `hang` (sleeps 5 s), anything else = print `stored` (44
+    /// if absent). A file `<dir>/fail-<first argument>` makes that call exit 51;
+    /// `<dir>/corrupt-add` makes `-i` store something other than the secret.
+    private static func makeSecurityStub(in dir: String, secret: String, mode: String = "found") -> String? {
+        let stub = "\(dir)/security-stub"
+        let body = """
+            #!/bin/sh
+            D="\(dir)"
+            printf '%s\\n' "$@" > "$D/argv"
+            echo "$*" >> "$D/calls"
+            input=$(cat)
+            [ -f "$D/fail-$1" ] && exit 51
+            mode=$(cat "$D/mode")
+            case "$1" in
+              -i)
+                printf '%s\\n' "$input" > "$D/add-stdin"
+                [ "$mode" = hang ] && { sleep 5; exit 0; }
+                hex=$(printf '%s\\n' "$input" | sed -n 's/.* -X \\([0-9a-f]*\\) .*/\\1/p')
+                [ -f "$D/corrupt-add" ] && hex=00
+                printf '%s' "$hex" | xxd -r -p > "$D/stored"
+                exit 0 ;;
+              delete-generic-password)
+                [ -f "$D/stored" ] || exit 44
+                rm -f "$D/stored"; exit 0 ;;
+              find-generic-password)
+                case "$mode" in
+                  found) printf '%s\\n' '\(secret)'; exit 0 ;;
+                  missing) exit 44 ;;
+                  error) exit 51 ;;
+                  hang) sleep 5; exit 0 ;;
+                esac
+                [ -f "$D/stored" ] || exit 44
+                cat "$D/stored"; printf '\\n'; exit 0 ;;
+            esac
+            exit 0
+            """
+        do {
+            try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+            try body.write(toFile: stub, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: stub)
+            try mode.write(toFile: "\(dir)/mode", atomically: true, encoding: .utf8)
+        } catch { return nil }
+        return stub
+    }
+
+    // MARK: - AC-L4-6 — keychain remote: created through `security -i` with -T /usr/bin/security only, secret nowhere else
+
+    /// Fake-driven (see `makeSecurityStub`): what is asserted is the exact
+    /// command limpet hands to `security`, not the keychain's reaction to it.
+    /// That the resulting item's ACL lists only /usr/bin/security, and that a
+    /// launchd-started read raises no dialog, is verified live by the verifier.
+    private static func testKeychainRemoteCreatedThroughSecurityOnly() -> Bool {
+        let id = "AC-L4-6", slug = "keychain-remote-created-through-security-only"
+        let fm = FileManager.default
+        let dir = "\(selfTestRoot)/ac-l4-6"
+        try? fm.removeItem(atPath: dir)
+        let secret = "SEKRET-l4-6 \"q'$x"
+        guard let stub = makeSecurityStub(in: dir, secret: "unused", mode: "store") else {
+            return report(id, slug, false, "(fixture setup failed)")
+        }
+        let keychainPath = "\(dir)/fake.keychain-db"   // only ever passed to the fake
+        let confPath = "\(dir)/rclone.conf"
+        let existingSection = "[existing]\ntype = local\n"
+        let rcloneStub = "\(dir)/rclone-stub"
+        do {
+            try existingSection.write(toFile: confPath, atomically: true, encoding: .utf8)
+            try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: confPath)
+            try "#!/bin/sh\nexit 0\n".write(toFile: rcloneStub, atomically: true, encoding: .utf8)
+            try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: rcloneStub)
+        } catch {
+            return report(id, slug, false, "(fixture setup failed: \(error))")
+        }
+        let store = KeychainSecretStore(securityPath: stub, keychainPath: keychainPath, lockStatus: { _ in .unlocked })
+        let service = RcloneConfigService(configPath: confPath, rclonePath: rcloneStub, keychain: store)
+        do {
+            try service.addKeychainRemote(
+                name: "limpet_test_st", type: "s3",
+                values: ["provider": "Mega", "access_key_id": "AKIDSELFTEST",
+                         "endpoint": "s3.ap-tokyo-1.megas4.com", "region": "ap-tokyo-1"],
+                secret: secret)
+        } catch {
+            return report(id, slug, false, "(addKeychainRemote threw: \(error))")
+        }
+
+        // rclone.conf: the non-secret section + marker, appended; nothing else changed.
+        let conf = (try? String(contentsOfFile: confPath, encoding: .utf8)) ?? ""
+        let expected = existingSection + "\n[limpet_test_st]\ntype = s3\naccess_key_id = AKIDSELFTEST\n"
+            + "endpoint = s3.ap-tokyo-1.megas4.com\nprovider = Mega\nregion = ap-tokyo-1\nlimpet_keychain = true\n"
+        guard conf == expected else {
+            return report(id, slug, false, "(unexpected rclone.conf: \(conf.replacingOccurrences(of: secret, with: "<SECRET>").debugDescription))")
+        }
+        let perms = (try? fm.attributesOfItem(atPath: confPath)[.posixPermissions] as? NSNumber)?.intValue
+        guard perms == 0o600 else {
+            return report(id, slug, false, "(rclone.conf permissions changed to \(String(describing: perms)))")
+        }
+
+        // The command handed to security: -T /usr/bin/security, never -A, the
+        // secret only hex-encoded on stdin, never in any argv.
+        let hex = secret.utf8.map { String(format: "%02x", $0) }.joined()
+        let addStdin = (try? String(contentsOfFile: "\(dir)/add-stdin", encoding: .utf8)) ?? ""
+        let calls = (try? String(contentsOfFile: "\(dir)/calls", encoding: .utf8)) ?? ""
+        guard addStdin == "add-generic-password -s limpet -a limpet_test_st -T /usr/bin/security "
+                + "-X \(hex) \"\(keychainPath)\"\n",
+              calls.components(separatedBy: "\n").contains("-i"),
+              !calls.contains(secret), !calls.contains(hex), !calls.contains(" -A") else {
+            return report(id, slug, false, "(unexpected security interaction: calls=\(calls.debugDescription))")
+        }
+        guard store.read(account: "limpet_test_st") == .found(secret) else {
+            return report(id, slug, false, "(fake keychain read-back did not return the secret)")
+        }
+
+        // F3: the helper maps it to the s3 variable.
+        guard service.secretEnvironment(forRemote: "limpet_test_st:bucket/path", log: { _ in })
+                == ["RCLONE_CONFIG_LIMPET_TEST_ST_SECRET_ACCESS_KEY": secret] else {
+            return report(id, slug, false, "(helper did not return the s3 secret variable)")
+        }
+
+        // F5: the secret is in no profile JSON and no script; the script never touches the keychain.
+        var profile = sampleProfile()
+        profile.rcloneRemote = "limpet_test_st:"
+        let profileJSON = (try? JSONEncoder().encode(profile)).map { String(decoding: $0, as: UTF8.self) } ?? secret
+        let script = SyncSetupService.shared.generateSyncScript()
+        guard !profileJSON.contains(secret), !script.contains(secret),
+              !script.contains("security"), !script.lowercased().contains("keychain"),
+              !script.contains("eval") else {
+            return report(id, slug, false, "(secret, keychain access or eval found in profile JSON / script)")
+        }
+
+        // F7: deleting the remote deletes its keychain item.
+        do { try service.deleteRemote("limpet_test_st") } catch {
+            return report(id, slug, false, "(deleteRemote threw: \(error))")
+        }
+        guard store.read(account: "limpet_test_st") == .notFound else {
+            return report(id, slug, false, "(keychain item survived deleteRemote)")
+        }
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L4-7 — keychain remote refusals: nothing written, no keychain item
+
+    private static func testKeychainRemoteRefusals() -> Bool {
+        let id = "AC-L4-7", slug = "keychain-remote-refusals"
+        let dir = "\(selfTestRoot)/ac-l4-7"
+        try? FileManager.default.removeItem(atPath: dir)
+        guard let stub = makeSecurityStub(in: dir, secret: "unused") else {
+            return report(id, slug, false, "(fixture setup failed)")
+        }
+        let confPath = "\(dir)/rclone.conf"
+        let original = "[Limpet_Taken]\ntype = local\n"
+        try? original.write(toFile: confPath, atomically: true, encoding: .utf8)
+        let service = RcloneConfigService(
+            configPath: confPath, rclonePath: "/usr/bin/false",
+            keychain: KeychainSecretStore(securityPath: stub, keychainPath: "\(dir)/unused.keychain-db", lockStatus: { _ in .unlocked }))
+        let good: [String: String] = ["provider": "Mega", "access_key_id": "AKID"]
+        let refused: [(String, String, [String: String], String)] = [
+            ("bad-name", "s3", good, "s"),                                          // name charset
+            ("limpet_taken", "s3", good, "s"),                                      // case-insensitive collision
+            ("ok_name", "webdav", [:], "s"),                                        // type
+            ("ok_name", "s3", good.merging(["no_check_certificate": "true"]) { $1 }, "s"),  // F7
+            ("ok_name", "s3", good.merging(["secret_access_key": "x"]) { $1 }, "s"),        // secret in conf
+            ("ok_name", "s3", good.merging(["endpoint": "http://s3.example.com"]) { $1 }, "s"),  // F7 https
+            ("ok_name", "s3", good.merging(["region": "x\ntype = local"]) { $1 }, "s"),       // F4 newline
+            ("ok_name", "s3", good, ""),                                            // empty secret
+            ("ok_name", "s3", good, "two\nlines"),
+        ]
+        for (name, type, values, secret) in refused {
+            if (try? service.addKeychainRemote(name: name, type: type, values: values, secret: secret)) != nil {
+                return report(id, slug, false, "(accepted name=\(name) type=\(type) values=\(values.keys.sorted()))")
+            }
+        }
+        let conf = (try? String(contentsOfFile: confPath, encoding: .utf8)) ?? ""
+        guard conf == original, !FileManager.default.fileExists(atPath: "\(dir)/argv") else {
+            return report(id, slug, false, "(a refused remote still wrote rclone.conf or ran security)")
+        }
+
+        // The existing (non-keychain) addRemote path refuses line breaks too (F4).
+        var webdav = RemoteConfiguration(name: "plain_webdav", provider: .webdav)
+        webdav.values["url"] = "https://dav.example.com"
+        webdav.values["user"] = "me\n[injected]\ntype = local"
+        if (try? service.addRemote(webdav)) != nil ||
+            (try? String(contentsOfFile: confPath, encoding: .utf8)) != original {
+            return report(id, slug, false, "(addRemote wrote a value containing a line break)")
+        }
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L4-8 — the secret-injection helper (F3)
+
+    private static func testSecretInjectionHelper() -> Bool {
+        let id = "AC-L4-8", slug = "secret-injection-helper"
+        let dir = "\(selfTestRoot)/ac-l4-8"
+        try? FileManager.default.removeItem(atPath: dir)
+        let secret = "SEKRET-stub-9c1"
+        guard let stub = makeSecurityStub(in: dir, secret: secret) else {
+            return report(id, slug, false, "(fixture setup failed)")
+        }
+        let confPath = "\(dir)/rclone.conf"
+        try? """
+            [plain]
+            type = local
+
+            [ks3]
+            type = s3
+            provider = Mega
+            limpet_keychain = true
+
+            [kb2]
+            type = b2
+            account = KEYID
+            limpet_keychain = true
+            """.write(toFile: confPath, atomically: true, encoding: .utf8)
+        let keychainPath = "\(dir)/k.keychain-db"
+        let service = RcloneConfigService(
+            configPath: confPath, rclonePath: "/usr/bin/false",
+            keychain: KeychainSecretStore(securityPath: stub, keychainPath: keychainPath, timeout: 0.5, lockStatus: { _ in .unlocked }))
+        func setMode(_ mode: String) { try? mode.write(toFile: "\(dir)/mode", atomically: true, encoding: .utf8) }
+
+        // Non-keychain remote: empty env, security never runs.
+        var logs: [String] = []
+        guard service.secretEnvironment(forRemote: "plain:x", log: { logs.append($0) }) == [:], logs.isEmpty,
+              !FileManager.default.fileExists(atPath: "\(dir)/argv") else {
+            return report(id, slug, false, "(non-keychain remote did not get an empty env without a keychain read)")
+        }
+        // Found: s3 and b2 variable names, read through find-generic-password -w on the given keychain.
+        guard service.secretEnvironment(forRemote: "ks3:", log: { logs.append($0) })
+                == ["RCLONE_CONFIG_KS3_SECRET_ACCESS_KEY": secret],
+              service.secretEnvironment(forRemote: "kb2", log: { logs.append($0) }) == ["RCLONE_CONFIG_KB2_KEY": secret],
+              logs.isEmpty else {
+            return report(id, slug, false, "(s3/b2 variable names wrong, or a log line on success)")
+        }
+        let argv = (try? String(contentsOfFile: "\(dir)/argv", encoding: .utf8)) ?? ""
+        guard argv == ["find-generic-password", "-s", "limpet", "-a", "kb2", "-w", keychainPath].joined(separator: "\n") + "\n" else {
+            return report(id, slug, false, "(unexpected security argv: \(argv.debugDescription))")
+        }
+        // Failures: exactly one line each, no env, and the watcher spawns nothing.
+        for (mode, phrase) in [("missing", "not found"), ("error", "read failed"), ("hang", "timed out")] {
+            setMode(mode)
+            var lines: [String] = []
+            var spawned = 0
+            let code = SyncWatchDaemon.runSyncChild(
+                profile: SyncProfile(name: "p", rcloneRemote: "ks3:", remotePath: "b", localSyncPath: "/tmp/x"),
+                service: service, log: { lines.append($0) }, spawn: { _ in spawned += 1; return 0 })
+            guard code == SyncWatchDaemon.secretUnavailableExitCode, spawned == 0,
+                  lines.count == 1, lines[0].contains(phrase), !lines[0].contains(secret) else {
+                return report(id, slug, false, "(\(mode): code=\(code) spawned=\(spawned) lines=\(lines))")
+            }
+        }
+        // And on success the watcher's child gets the variable merged into its environment.
+        setMode("found")
+        var childEnvironment: [String: String] = [:]
+        _ = SyncWatchDaemon.runSyncChild(
+            profile: SyncProfile(name: "p", rcloneRemote: "kb2:", remotePath: "b", localSyncPath: "/tmp/x"),
+            service: service, log: { _ in }, spawn: { childEnvironment = $0; return 0 })
+        guard childEnvironment["RCLONE_CONFIG_KB2_KEY"] == secret, childEnvironment["PATH"] != nil else {
+            return report(id, slug, false, "(watcher child environment missing the secret or the inherited environment)")
+        }
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L4-9 — limpet remote add: secret from stdin only, same creation function
+
+    private static func testCLIRemoteAdd() -> Bool {
+        let id = "AC-L4-9", slug = "cli-remote-add"
+        let argv = ["remote", "add", "limpet_test_s4", "--type", "s3", "--provider", "Mega",
+                    "--region", "ap-tokyo-1", "--access-key-id", "AKID"]
+        guard case .success(.remoteAdd(let request)) = LimpetCLI.parse(argv),
+              request == RemoteAddRequest(name: "limpet_test_s4", type: "s3", values: [
+                "access_key_id": "AKID", "provider": "Mega", "region": "ap-tokyo-1"]) else {
+            return report(id, slug, false, "(remote add did not parse as expected)")
+        }
+        // Internal review F9: a known provider in another case is written canonically.
+        var lower = argv
+        lower[lower.firstIndex(of: "Mega")!] = "mega"
+        guard case .success(.remoteAdd(let lowered)) = LimpetCLI.parse(lower), lowered == request,
+              case .success(.remoteAdd(let unknown)) = LimpetCLI.parse(
+                ["remote", "add", "n", "--type", "s3", "--provider", "Wasabi", "--access-key-id", "k"]),
+              unknown.values["provider"] == "Wasabi" else {
+            return report(id, slug, false, "(--provider mega not normalized to Mega, or an unknown provider changed)")
+        }
+        for bad in [argv + ["--secret", "x"], argv + ["--secret-access-key=x"], ["remote", "add", "n", "--type", "s3"],
+                    ["remote", "add", "n", "--type", "b2", "--access-key-id", "k", "--endpoint", "e"]] {
+            guard case .failure = LimpetCLI.parse(bad) else {
+                return report(id, slug, false, "(accepted \(bad))")
+            }
+        }
+        let secret = "SEKRET-cli-5d2"
+        var output = "", created: (String, String, [String: String], String)?
+        let env = fakeCLIEnvironment(
+            readSecret: { _ in secret },
+            addKeychainRemote: { created = ($0, $1, $2, $3); return nil },
+            stdout: { output += $0 }, stderr: { output += $0 })
+        guard LimpetCLI.execute(argv, env: env) == 0, created?.0 == "limpet_test_s4", created?.1 == "s3",
+              created?.2 == request.values, created?.3 == secret, !output.contains(secret) else {
+            return report(id, slug, false, "(remote add did not hand the stdin secret to the creation function)")
+        }
+        var calledWithoutSecret = false
+        let noSecretEnv = fakeCLIEnvironment(readSecret: { _ in nil },
+                                             addKeychainRemote: { _, _, _, _ in calledWithoutSecret = true; return nil })
+        guard LimpetCLI.execute(argv, env: noSecretEnv) == 66, !calledWithoutSecret else {
+            return report(id, slug, false, "(remote add without a secret did not stop before creating)")
+        }
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L4-10 — s3/b2 providers: read back as themselves, wizard routes to the keychain path
+
+    private static func testWizardProvidersRemapAndRoute() -> Bool {
+        let id = "AC-L4-10", slug = "s3-b2-remap-and-wizard-route"
+        let dir = "\(selfTestRoot)/ac-l4-10"
+        try? FileManager.default.removeItem(atPath: dir)
+        guard let stub = makeSecurityStub(in: dir, secret: "unused", mode: "store") else {
+            return report(id, slug, false, "(fixture setup failed)")
+        }
+        let confPath = "\(dir)/rclone.conf"
+        let original = "[s4]\ntype = s3\naccess_key_id = AKID\nprovider = Mega\nlimpet_keychain = true\n\n"
+            + "[bb]\ntype = b2\naccount = KEYID\nlimpet_keychain = true\n"
+        let rcloneStub = "\(dir)/rclone-stub"
+        try? original.write(toFile: confPath, atomically: true, encoding: .utf8)
+        try? "#!/bin/sh\ntouch \"\(dir)/rclone-ran\"\nexit 0\n".write(toFile: rcloneStub, atomically: true, encoding: .utf8)
+        try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: rcloneStub)
+        let service = RcloneConfigService(
+            configPath: confPath, rclonePath: rcloneStub,
+            keychain: KeychainSecretStore(securityPath: stub, keychainPath: "\(dir)/k.keychain-db", lockStatus: { _ in .unlocked }))
+
+        // F5 remap: an existing s3/b2 remote edits as itself, never as webdav.
+        guard let s4 = service.readRemoteConfig(name: "s4"), s4.provider == .s3Compatible,
+              s4.generateConfigSection().contains("type = s3"),
+              let bb = service.readRemoteConfig(name: "bb"), bb.provider == .b2,
+              bb.generateConfigSection().contains("type = b2") else {
+            return report(id, slug, false, "(s3/b2 section was not read back as s3/b2)")
+        }
+
+        // Editing without re-entering the secret rewrites the section in place
+        // (here: to identical text), never runs rclone and never touches the keychain.
+        if (try? service.updateRemote(s4)) == nil ||
+            (try? String(contentsOfFile: confPath, encoding: .utf8)) != original ||
+            FileManager.default.fileExists(atPath: "\(dir)/rclone-ran") ||
+            FileManager.default.fileExists(atPath: "\(dir)/calls") {
+            return report(id, slug, false, "(an edit without a secret did not stay in place and off the keychain)")
+        }
+
+        // The wizard's addRemote takes the keychain path: secret out of rclone.conf,
+        // marker in, and the secret reaches security on stdin (hex), never in argv.
+        let secret = "SEKRET-wizard-41e"
+        var config = RemoteConfiguration(name: "wizard_s4", provider: .s3Compatible)
+        config.values["access_key_id"] = "AKIDW"
+        config.values["endpoint"] = "https://s3.ap-tokyo-1.megas4.com"
+        config.values["secret_access_key"] = secret
+        do { try service.addRemote(config) } catch {
+            return report(id, slug, false, "(wizard addRemote threw: \(error))")
+        }
+        let conf = (try? String(contentsOfFile: confPath, encoding: .utf8)) ?? ""
+        let hex = secret.utf8.map { String(format: "%02x", $0) }.joined()
+        let calls = (try? String(contentsOfFile: "\(dir)/calls", encoding: .utf8)) ?? ""
+        let argv = calls.components(separatedBy: "\n").contains("-i") && !calls.contains(secret) ? "-i\n" : calls
+        let stdin = (try? String(contentsOfFile: "\(dir)/add-stdin", encoding: .utf8)) ?? ""
+        guard conf.hasPrefix(original), !conf.contains(secret),
+              conf.hasSuffix("[wizard_s4]\ntype = s3\naccess_key_id = AKIDW\nendpoint = https://s3.ap-tokyo-1.megas4.com\n"
+                  + "provider = Mega\nlimpet_keychain = true\n"),
+              argv == "-i\n", !argv.contains(secret), !argv.contains(hex),
+              stdin.hasPrefix("add-generic-password -s limpet -a wizard_s4 -T /usr/bin/security -X \(hex) "),
+              !stdin.contains(secret) else {
+            return report(id, slug, false, "(wizard route: conf=\(conf.replacingOccurrences(of: secret, with: "<SECRET>").debugDescription) argv=\(argv.debugDescription))")
+        }
+        var badName = RemoteConfiguration(name: "bad-name", provider: .b2)
+        badName.values["account"] = "k"
+        badName.values["key"] = "s"
+        guard badName.validate().contains(where: { $0.contains("letters, digits") }) else {
+            return report(id, slug, false, "(wizard validate accepted a keychain name with '-')")
+        }
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L4-11 — exit 76 only when rclone's exit code AND its max-delete message match
+
+    private static func testScriptMapsMaxDeleteTo76() -> Bool {
+        let id = "AC-L4-11", slug = "script-maps-max-delete-to-76"
+        // The exact line rclone 1.75.1 logged per refused delete (measured 2026-09-26).
+        let tripped = "echo '{\"level\":\"error\",\"msg\":\"Got fatal error on delete: --max-delete threshold reached\",\"object\":\"f3.txt\"}' >&2\n"
+        let otherFatal = "echo '{\"level\":\"error\",\"msg\":\"Fatal error received - not attempting retries\"}' >&2\n"
+        let cases: [(String, String, Int32)] = [
+            ("ac-l4-11-a", tripped + "exit 7\n", 76),     // code + message → 76
+            ("ac-l4-11-b", otherFatal + "exit 7\n", 7),   // same code, no message → 7
+            ("ac-l4-11-c", tripped + "exit 1\n", 1),      // message, other code → 1
+        ]
+        for (name, tail, expected) in cases {
+            guard let result = runScriptFixture(name: name, overrides: ["maxDelete": 5], stubTail: tail) else {
+                return report(id, slug, false, "(fixture setup failed)")
+            }
+            guard result.status == expected,
+                  result.log.contains("Delete limit reached") == (expected == 76) else {
+                return report(id, slug, false, "(\(name): status \(result.status), expected \(expected))")
+            }
+        }
+        // --max-delete N reaches rclone when set, and is absent at 0.
+        guard let on = runScriptFixture(name: "ac-l4-11-on", overrides: ["maxDelete": 5]),
+              let off = runScriptFixture(name: "ac-l4-11-off", overrides: ["maxDelete": 0]),
+              let bad = runScriptFixture(name: "ac-l4-11-bad", overrides: ["maxDelete": "5 --dry-run"]) else {
+            return report(id, slug, false, "(fixture setup failed)")
+        }
+        guard let flag = on.argv.firstIndex(of: "--max-delete"), on.argv.indices.contains(flag + 1),
+              on.argv[flag + 1] == "5", !off.argv.contains("--max-delete") else {
+            return report(id, slug, false, "(--max-delete argv wrong: on=\(on.argv) off=\(off.argv))")
+        }
+        guard bad.status == 64, !bad.stubRan else {
+            return report(id, slug, false, "(a non-numeric maxDelete was not refused: \(bad.status))")
+        }
+        // Review finding 10: a large run keeps only the matching lines on disk.
+        // The stub prints ~1 MB, then the tripped line, then measures the
+        // script's temp file(s) while the script is still running.
+        let tmp = "\(selfTestRoot)/ac-l4-11-tmp"
+        try? FileManager.default.removeItem(atPath: tmp)
+        try? FileManager.default.createDirectory(atPath: tmp, withIntermediateDirectories: true)
+        let sizeFile = "\(selfTestRoot)/ac-l4-11-tmp-size"
+        let large = "i=0; while [ $i -lt 20000 ]; do echo '{\"level\":\"info\",\"msg\":\"Copied (new)\",\"object\":\"some/long/path/file-'$i'.dat\"}'; i=$((i+1)); done\n"
+            + tripped + "sleep 1\ncat \"\(tmp)\"/limpet-run.* | wc -c > \"\(sizeFile)\"\nexit 7\n"
+        guard let big = runScriptFixture(name: "ac-l4-11-large", overrides: ["maxDelete": 5], stubTail: large,
+                                         extraEnvironment: ["TMPDIR": tmp]),
+              let size = Int(((try? String(contentsOfFile: sizeFile, encoding: .utf8)) ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)) else {
+            return report(id, slug, false, "(large-output fixture failed)")
+        }
+        guard big.status == 76, size < 4096 else {
+            return report(id, slug, false, "(large output: status \(big.status), temp file \(size) bytes)")
+        }
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L4-12 — --max-delete only where a delete cannot be undone
+
+    private static func testMaxDeleteOnlyForNonVersionedProviders() -> Bool {
+        let id = "AC-L4-12", slug = "max-delete-only-non-versioned"
+        var profile = sampleProfile()
+        profile.maxDelete = 42
+        var versioned = profile
+        versioned.remoteVersioning = true
+        let matrix: [([String: String]?, SyncProfile, Int)] = [
+            (["type": "s3", "provider": "Mega"], profile, 42),
+            (["type": "s3", "provider": "Mega"], versioned, 42),        // S4 has no versioning
+            (["type": "s3", "provider": "mega"], versioned, 42),        // in any case (internal review F9)
+            (["type": "s3", "provider": "CLOUDFLARE"], versioned, 42),
+            (["type": "s3", "provider": "Cloudflare"], versioned, 42),  // nor has R2
+            (["type": "s3", "provider": "AWS"], profile, 42),
+            (["type": "s3", "provider": "AWS"], versioned, 0),
+            (["type": "s3", "provider": "Minio"], versioned, 0),
+            (["type": "s3", "provider": "Other"], profile, 42),
+            (["type": "b2"], profile, 0),
+            (["type": "webdav"], profile, 0),
+            (nil, profile, 0),
+        ]
+        for (section, candidate, expected) in matrix
+        where SyncSetupService.maxDeleteArgument(for: candidate, remoteSection: section) != expected {
+            return report(id, slug, false, "(\(String(describing: section)) versioning=\(candidate.remoteVersioning) expected \(expected))")
+        }
+        // A hand-edited `provider = mega` still gets the derived MEGA S4 endpoint.
+        guard RcloneConfigService.withDerivedEndpoint(
+                type: "s3", values: ["provider": "mega", "region": "ap-tokyo-1"])["endpoint"] == "s3.ap-tokyo-1.megas4.com" else {
+            return report(id, slug, false, "(provider = mega got no derived endpoint)")
+        }
+        // Wired into the derived config from the remote's rclone.conf section.
+        let confPath = "\(selfTestRoot)/ac-l4-12-rclone.conf"
+        try? "[s4]\ntype = s3\nprovider = Mega\n\n[bb]\ntype = b2\n".write(toFile: confPath, atomically: true, encoding: .utf8)
+        let service = RcloneConfigService(configPath: confPath)
+        func derivedMaxDelete(_ remote: String) -> Int? {
+            var p = profile
+            p.rcloneRemote = remote
+            let json = SyncSetupService.shared.generateProfileConfig(for: p, rcloneConfig: service)
+            let dict = (try? JSONSerialization.jsonObject(with: Data(json.utf8))) as? [String: Any]
+            return dict?["maxDelete"] as? Int
+        }
+        guard derivedMaxDelete("s4:") == 42, derivedMaxDelete("bb:") == 0, derivedMaxDelete("absent:") == 0 else {
+            return report(id, slug, false, "(derived maxDelete wrong)")
+        }
+        // maxDelete is at least 1 at decode, write and profile set.
+        var zero = profile
+        zero.maxDelete = 0
+        guard zero.validationError != nil,
+              LimpetCLI.applyProfileAssignment(&zero, key: "maxDelete", value: "0") != nil,
+              LimpetCLI.applyProfileAssignment(&zero, key: "maxDelete", value: "250") == nil, zero.maxDelete == 250,
+              LimpetCLI.applyProfileAssignment(&zero, key: "remoteVersioning", value: "true") == nil, zero.remoteVersioning,
+              SyncManager.reconcileAction(from: profile, to: versioned) == .reinstall else {
+            return report(id, slug, false, "(maxDelete/remoteVersioning validation or reconcile wrong)")
+        }
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L4-13 — the watcher stops for good at the delete limit
+
+    private static func testWatcherStopsAtDeleteLimit() -> Bool {
+        let id = "AC-L4-13", slug = "watcher-stops-at-delete-limit"
+        func scheduler(marker: @escaping () -> Bool, record: @escaping () -> Bool,
+                       clock: VirtualClock, runs: @escaping () -> Void) -> SyncWatchScheduler {
+            SyncWatchScheduler(runner: SchedulerRunner(
+                sourceExists: { true },
+                runChild: { _, completion in runs(); completion(SyncWatchScheduler.deleteLimitExitCode) },
+                now: { clock.now },
+                scheduleAfter: { s, a in clock.scheduleAfter(s, a) },
+                logSourceMissing: {},
+                refusalReason: { nil },
+                logRefusal: { _ in },
+                deleteLimitReached: marker,
+                recordDeleteLimit: record))
+        }
+        // A run exits 76 → marker written → no further run for any number of triggers.
+        let clock = VirtualClock()
+        var marker = false, runs = 0
+        let first = scheduler(marker: { marker }, record: { marker = true; return true }, clock: clock, runs: { runs += 1 })
+        first.trigger()
+        for _ in 0..<20 { first.trigger() }
+        clock.advance(by: 3600)
+        first.trigger()
+        guard runs == 1, marker, first.state == .idle else {
+            return report(id, slug, false, "(after a 76: runs=\(runs) marker=\(marker))")
+        }
+        // A new scheduler (a respawned watcher) with the marker present runs 0 times.
+        var respawnRuns = 0
+        let respawned = scheduler(marker: { marker }, record: { true }, clock: clock, runs: { respawnRuns += 1 })
+        for _ in 0..<5 { respawned.trigger() }
+        guard respawnRuns == 0 else {
+            return report(id, slug, false, "(respawned watcher ran \(respawnRuns) time(s) with the marker present)")
+        }
+        // Cleared (marker removed) + "sync now" → it runs again.
+        marker = false
+        respawned.trigger()
+        guard respawnRuns == 1 else {
+            return report(id, slug, false, "(did not run after the marker was cleared)")
+        }
+        // The marker cannot be written → still stopped for the life of the process.
+        var unwrittenRuns = 0
+        let unwritten = scheduler(marker: { false }, record: { false }, clock: clock, runs: { unwrittenRuns += 1 })
+        for _ in 0..<5 { unwritten.trigger() }
+        guard unwrittenRuns == 1 else {
+            return report(id, slug, false, "(ran \(unwrittenRuns) time(s) after a 76 whose marker could not be written)")
+        }
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L4-14 — limpet profile clear-delete-limit
+
+    private static func testCLIClearDeleteLimit() -> Bool {
+        let id = "AC-L4-14", slug = "cli-clear-delete-limit"
+        let profile = sampleProfile()
+        guard case .success(.profileClearDeleteLimit(profile.shortId)) =
+                LimpetCLI.parse(["profile", "clear-delete-limit", profile.shortId]) else {
+            return report(id, slug, false, "(did not parse)")
+        }
+        var removed: [String] = [], killed: [[String]] = []
+        func env(markerExists: Bool, removeSucceeds: Bool) -> CLIEnvironment {
+            fakeCLIEnvironment(
+                readProfiles: { [profile] },
+                fileExists: { $0 == profile.deleteLimitMarkerPath && markerExists },
+                runLaunchctl: { killed.append($0); return (0, "") },
+                removeFile: { removed.append($0); return removeSucceeds })
+        }
+        guard LimpetCLI.execute(["profile", "clear-delete-limit", profile.shortId], env: env(markerExists: true, removeSucceeds: true)) == 0,
+              removed == [profile.deleteLimitMarkerPath],
+              killed == [["kill", "SIGUSR1", "gui/\(getuid())/\(profile.launchdLabel)"]] else {
+            return report(id, slug, false, "(clear did not remove the marker and signal the watcher: \(removed) \(killed))")
+        }
+        removed = []; killed = []
+        guard LimpetCLI.execute(["profile", "clear-delete-limit", profile.shortId], env: env(markerExists: true, removeSucceeds: false)) == 1,
+              killed.isEmpty else {
+            return report(id, slug, false, "(a failed removal still signalled the watcher)")
+        }
+        removed = []; killed = []
+        guard LimpetCLI.execute(["profile", "clear-delete-limit", profile.shortId], env: env(markerExists: false, removeSucceeds: true)) == 0,
+              removed.isEmpty, killed.isEmpty else {
+            return report(id, slug, false, "(no marker: something was removed or signalled)")
+        }
+        guard profile.deleteLimitMarkerPath == "\(SyncProfile.configDirectory)/\(profile.shortId).delete-limit" else {
+            return report(id, slug, false, "(unexpected marker path \(profile.deleteLimitMarkerPath))")
+        }
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L4-15 — doctor warns (never fails) on a B2 bucket without daysFromHidingToDeleting
+
+    private static func testDoctorWarnsB2WithoutLifecycle() -> Bool {
+        let id = "AC-L4-15", slug = "doctor-warns-b2-without-lifecycle"
+        var profile = sampleProfile(isEnabled: false)
+        profile.rcloneRemote = "bb:"
+        profile.remotePath = "bucket/sub"
+        func checks(lifecycleOutput: String) -> ([DoctorCheck], [[String]]) {
+            var calls: [[String]] = []
+            let env = fakeCLIEnvironment(
+                runRclone: { args, _, _ in
+                    calls.append(args)
+                    if args.first == "version" { return (0, "rclone v1.75.1", "") }
+                    return args.first == "backend" ? (0, lifecycleOutput, "") : (0, "", "")
+                },
+                readProfiles: { [profile] },
+                fileExists: { $0 == profile.configPath },
+                remoteSection: { $0 == "bb" ? ["type": "b2"] : nil })
+            return (LimpetCLI.doctorChecks(env: env), calls)
+        }
+        let (noRule, calls) = checks(lifecycleOutput: "[]\n")
+        guard calls.contains(["backend", "lifecycle", "bb:bucket"]),
+              noRule.contains(where: { $0.status == .warn && $0.detail.contains("daysFromHidingToDeleting") }),
+              !noRule.contains(where: { $0.status == .fail }) else {
+            return report(id, slug, false, "(no warning for a bucket without a rule: \(noRule.map(\.line)))")
+        }
+        let (withRule, _) = checks(lifecycleOutput: "[\n    {\n        \"daysFromHidingToDeleting\": 1,\n        \"fileNamePrefix\": \"\"\n    }\n]\n")
+        guard !withRule.contains(where: { $0.detail.contains("daysFromHidingToDeleting") }) else {
+            return report(id, slug, false, "(warned although the rule exists)")
+        }
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L4-16 — transfers 1–64, no leading zero (carried from L4.0)
+
+    /// The companion carried item, RCLONE_BIN honoured only in Debug builds, has
+    /// no test here: the self-test itself only runs in Debug, and running the
+    /// Release script variant far enough to see which rclone it picks would run
+    /// the real rclone installed on the machine against the real rclone.conf.
+    private static func testTransfersRange() -> Bool {
+        let id = "AC-L4-16", slug = "transfers-range"
+        func decodes(_ transfers: Any) -> Bool {
+            let dict: [String: Any] = ["id": UUID().uuidString, "name": "t", "rcloneRemote": "r:",
+                                       "remotePath": "p", "localSyncPath": "/tmp/x", "transfers": transfers]
+            guard let data = try? JSONSerialization.data(withJSONObject: dict) else { return false }
+            return (try? JSONDecoder().decode(SyncProfile.self, from: data)) != nil
+        }
+        guard decodes(1), decodes(64), !decodes(0), !decodes(65), !decodes(-3) else {
+            return report(id, slug, false, "(decode range wrong)")
+        }
+        var profile = sampleProfile()
+        for bad in ["08", "0", "65", "+5", "5 ", "\u{0663}", ""] {
+            if LimpetCLI.applyProfileAssignment(&profile, key: "transfers", value: bad) == nil {
+                return report(id, slug, false, "(profile set accepted transfers \(bad.debugDescription))")
+            }
+        }
+        guard LimpetCLI.applyProfileAssignment(&profile, key: "transfers", value: "64") == nil, profile.transfers == 64 else {
+            return report(id, slug, false, "(profile set refused transfers 64)")
+        }
+        // The Release script variant (no RCLONE_BIN override) must at least be valid bash.
+        let releaseScript = "\(selfTestRoot)/ac-l4-16-release.sh"
+        try? SyncSetupService.shared.generateSyncScript(honorRcloneBinOverride: false)
+            .write(toFile: releaseScript, atomically: true, encoding: .utf8)
+        guard runTool("/bin/bash", ["-n", releaseScript]).0 == 0 else {
+            return report(id, slug, false, "(the Release script variant is not valid bash)")
+        }
+        var tooMany = sampleProfile()
+        tooMany.transfers = 100
+        guard ProfileStore.writeProfileFile(tooMany, in: "\(selfTestRoot)/ac-l4-16") == nil else {
+            return report(id, slug, false, "(a transfers value of 100 was written)")
+        }
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L4-17 — a refused dropped file is moved out of the scanned set
+
+    /// Review finding 3: a dropped profile refused for overlap used to stay in
+    /// profiles/, where the running profile's watcher (which re-reads every
+    /// file) and the next app launch saw it again.
+    private static func testRefusedDropQuarantined() -> Bool {
+        let id = "AC-L4-17", slug = "refused-drop-quarantined"
+        let dir = "\(selfTestRoot)/ac-l4-17/profiles"
+        try? FileManager.default.removeItem(atPath: "\(selfTestRoot)/ac-l4-17")
+        let a = sampleProfile(name: "A")
+        var b = sampleProfile(name: "B")
+        b.remotePath = a.remotePath + "/inside"
+        let dropPath = "\(dir)/b-drop.profile.json"
+        guard ProfileStore.writeProfileFile(a, in: dir) != nil,
+              let bData = try? JSONEncoder().encode(b), (try? bData.write(to: URL(fileURLWithPath: dropPath))) != nil else {
+            return report(id, slug, false, "(fixture setup failed)")
+        }
+        let aInstalled: (SyncProfile) -> Bool = { $0.id == a.id }
+        var movedTo: String?
+        let outcome = SyncManager.applyExternalCreateIfNeeded(
+            decoded: b, isKnownId: false, existing: [a], isInstalled: aInstalled,
+            persist: { _ in }, install: { _ in },
+            quarantine: { _ in movedTo = SyncManager.quarantineRefusedDrop(at: dropPath) })
+        guard outcome == .refusedOverlap, let movedTo,
+              FileManager.default.fileExists(atPath: movedTo), !FileManager.default.fileExists(atPath: dropPath),
+              movedTo.hasPrefix("\(dir)/refused/b-drop."), !movedTo.hasSuffix(".profile.json") else {
+            return report(id, slug, false, "(dropped file not moved aside: \(String(describing: movedTo)))")
+        }
+        guard ProfileStore.profilesOnDisk(in: dir).map(\.id) == [a.id] else {
+            return report(id, slug, false, "(the refused profile is still loaded from profiles/)")
+        }
+        // A's watcher still runs.
+        var runs = 0
+        let clock = VirtualClock()
+        let scheduler = SyncWatchScheduler(runner: SchedulerRunner(
+            sourceExists: { true },
+            runChild: { _, completion in runs += 1; completion(0) },
+            now: { clock.now },
+            scheduleAfter: { s, act in clock.scheduleAfter(s, act) },
+            logSourceMissing: {},
+            refusalReason: { SyncWatchDaemon.refusalReason(for: a, profilesDirectory: dir, isInstalled: aInstalled) },
+            logRefusal: { _ in },
+            deleteLimitReached: { false },
+            recordDeleteLimit: { true }))
+        scheduler.trigger()
+        guard runs == 1 else {
+            return report(id, slug, false, "(A's watcher did not run after B was refused)")
+        }
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L4-18 — only enabled (and installed) profiles take part in the overlap rule
+
+    /// Review finding 4: a disabled profile must not block an enabled one, and
+    /// enabling an overlapping disabled profile must be refused.
+    private static func testOverlapOnlyAmongEnabledInstalled() -> Bool {
+        let id = "AC-L4-18", slug = "overlap-only-enabled-installed"
+        let running = sampleProfile(name: "Running")                 // enabled, installed
+        let disabled = sampleProfile(name: "Disabled", isEnabled: false)
+        var fresh = sampleProfile(name: "Fresh")                      // enabled, same path
+        fresh.remotePath = running.remotePath
+        let installed: (SyncProfile) -> Bool = { $0.id == running.id }
+
+        // Disabled / never-installed profiles do not block.
+        guard SyncProfile.overlapError(fresh, among: [disabled], isInstalled: { _ in true }) == nil,
+              SyncProfile.overlapError(fresh, among: [running], isInstalled: { _ in false }) == nil,
+              SyncProfile.overlapError(disabled, among: [running], isInstalled: installed) == nil else {
+            return report(id, slug, false, "(a disabled or not-installed profile took part)")
+        }
+        var wrote = false
+        guard let freshJSON = try? JSONEncoder().encode(fresh) else {
+            return report(id, slug, false, "(could not encode fixture)")
+        }
+        let createEnv = fakeCLIEnvironment(
+            readProfiles: { [disabled] }, fileExists: { _ in true },
+            writeProfile: { _ in wrote = true; return true },
+            readStdin: { String(decoding: freshJSON, as: UTF8.self) })
+        guard LimpetCLI.execute(["profile", "create", "-"], env: createEnv) == 0, wrote else {
+            return report(id, slug, false, "(a disabled overlapping profile blocked create)")
+        }
+
+        // Enabling the overlapping disabled profile is refused before anything is written.
+        var enableWrote = false, enableInstalled = false
+        let enableEnv = fakeCLIEnvironment(
+            readProfiles: { [running, disabled] }, fileExists: { $0 == running.plistPath },
+            writeProfile: { _ in enableWrote = true; return true },
+            installProfile: { _ in enableInstalled = true; return nil })
+        guard LimpetCLI.execute(["profile", "enable", disabled.shortId], env: enableEnv) == 65,
+              !enableWrote, !enableInstalled else {
+            return report(id, slug, false, "(enabling an overlapping profile was not refused before writing)")
+        }
+        // And install (reached by every other enable path) refuses it too.
+        var enabledNow = disabled
+        enabledNow.isEnabled = true
+        do {
+            try SyncSetupService.shared.install(
+                profile: enabledNow, loadAgent: false, executablePath: translocatedExecutable,
+                otherProfiles: [running], isInstalled: installed)
+            return report(id, slug, false, "(install did not throw)")
+        } catch SyncSetupService.SetupError.refusedProfile {
+        } catch {
+            return report(id, slug, false, "(install threw \(error), not refusedProfile)")
+        }
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L4-19 — edits and enables are refused before anything is persisted
+
+    /// Review finding 6: the edit/enable path (`applyProfileChange`, used by
+    /// applyExternalProfileEdit and setProfileEnabled) must validate BEFORE
+    /// persisting, and report refusals and install errors instead of printing.
+    private static func testProfileChangeRefusedBeforePersist() -> Bool {
+        let id = "AC-L4-19", slug = "profile-change-refused-before-persist"
+        let running = sampleProfile(name: "Running")
+        var current = sampleProfile(name: "Mine")
+        current.remotePath = "Elsewhere"
+        struct Failed: Error {}
+        func apply(_ updated: SyncProfile, installThrows: Bool = false) -> ([String], [String]) {
+            var events: [String] = [], errors: [String] = []
+            SyncManager.applyProfileChange(
+                from: current, to: updated, others: [running, current],
+                isInstalled: { $0.id == running.id },
+                persist: { _ in events.append("persist") },
+                install: { _ in events.append("install"); if installThrows { throw Failed() } },
+                uninstall: { _ in events.append("uninstall") },
+                reportError: { errors.append($0) })
+            return (events, errors)
+        }
+        var overlapping = current
+        overlapping.remotePath = running.remotePath + "/sub"
+        var connectionString = current
+        connectionString.rcloneRemote = connectionStringRemote
+        for refused in [overlapping, connectionString] {
+            let (events, errors) = apply(refused)
+            guard events.isEmpty, errors.count == 1, errors[0].hasPrefix("Not saved"),
+                  !errors[0].contains(connectionStringSecret) else {
+                return report(id, slug, false, "(refused change: events=\(events) errors=\(errors))")
+            }
+        }
+        var moved = current
+        moved.remotePath = "Elsewhere2"
+        guard apply(moved).0 == ["persist", "uninstall", "install"], apply(moved).1.isEmpty else {
+            return report(id, slug, false, "(valid change not persisted then reinstalled: \(apply(moved)))")
+        }
+        let (events, errors) = apply(moved, installThrows: true)
+        guard events == ["persist", "uninstall", "install"], errors.count == 1, errors[0].hasPrefix("Saved, but") else {
+            return report(id, slug, false, "(install error not reported: \(events) \(errors))")
+        }
+        // install treats the profile it installs as enabled (the detail view
+        // installs before flipping the flag), so a disabled one is checked too.
+        var disabledOverlap = overlapping
+        disabledOverlap.isEnabled = false
+        do {
+            try SyncSetupService.shared.install(
+                profile: disabledOverlap, loadAgent: false, executablePath: translocatedExecutable,
+                otherProfiles: [running], isInstalled: { $0.id == running.id })
+            return report(id, slug, false, "(install of a disabled overlapping profile did not throw)")
+        } catch SyncSetupService.SetupError.refusedProfile {
+        } catch {
+            return report(id, slug, false, "(install threw \(error), not refusedProfile)")
+        }
+        // Likewise a running watcher, whatever the flag in its own copy says.
+        let dir = "\(selfTestRoot)/ac-l4-19-profiles"
+        try? FileManager.default.removeItem(atPath: dir)
+        guard ProfileStore.writeProfileFile(running, in: dir) != nil,
+              SyncWatchDaemon.refusalReason(
+                for: disabledOverlap, profilesDirectory: dir, isInstalled: { $0.id == running.id }) != nil else {
+            return report(id, slug, false, "(a watcher whose copy says disabled skipped the overlap rule)")
+        }
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L4-20 — keychain remote: edit in place, verified add, never half-deleted
+
+    /// Review findings 5, 7 and 9, all through the fake `security`.
+    private static func testKeychainRemoteEditDeleteConsistency() -> Bool {
+        let id = "AC-L4-20", slug = "keychain-remote-edit-delete-consistency"
+        let fm = FileManager.default
+        let dir = "\(selfTestRoot)/ac-l4-20"
+        try? fm.removeItem(atPath: dir)
+        guard let stub = makeSecurityStub(in: dir, secret: "unused", mode: "store") else {
+            return report(id, slug, false, "(fixture setup failed)")
+        }
+        let confPath = "\(dir)/rclone.conf", rcloneStub = "\(dir)/rclone-stub"
+        try? "[before]\ntype = local\n".write(toFile: confPath, atomically: true, encoding: .utf8)
+        try? "#!/bin/sh\n[ -f \"\(dir)/rclone-fail\" ] && exit 1\nexit 0\n".write(toFile: rcloneStub, atomically: true, encoding: .utf8)
+        try? fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: rcloneStub)
+        let store = KeychainSecretStore(securityPath: stub, keychainPath: "\(dir)/fake.keychain-db", lockStatus: { _ in .unlocked })
+        let service = RcloneConfigService(configPath: confPath, rclonePath: rcloneStub, keychain: store)
+        func conf() -> String { (try? String(contentsOfFile: confPath, encoding: .utf8)) ?? "" }
+        func flag(_ name: String, _ on: Bool) {
+            if on { fm.createFile(atPath: "\(dir)/\(name)", contents: nil) } else { try? fm.removeItem(atPath: "\(dir)/\(name)") }
+        }
+
+        // Finding 9: the shared creation function derives the MEGA S4 endpoint.
+        do {
+            try service.addKeychainRemote(name: "kr", type: "s3",
+                values: ["provider": "Mega", "region": "ap-tokyo-1", "access_key_id": "AKID1"], secret: "old-secret")
+        } catch { return report(id, slug, false, "(add threw \(error))") }
+        guard conf().hasSuffix("[kr]\ntype = s3\naccess_key_id = AKID1\nendpoint = s3.ap-tokyo-1.megas4.com\n"
+                + "provider = Mega\nregion = ap-tokyo-1\nlimpet_keychain = true\n") else {
+            return report(id, slug, false, "(MEGA S4 endpoint not derived by addKeychainRemote: \(conf().debugDescription))")
+        }
+        // A section in the middle of the file, to see the edit keep its place.
+        try? ("[before]\ntype = local\n\n[kr]\ntype = s3\naccess_key_id = AKID1\nendpoint = s3.ap-tokyo-1.megas4.com\n"
+            + "provider = Mega\nregion = ap-tokyo-1\nlimpet_keychain = true\n\n[after]\ntype = local\n")
+            .write(toFile: confPath, atomically: true, encoding: .utf8)
+        guard store.read(account: "kr") == .found("old-secret") else {
+            return report(id, slug, false, "(fixture secret not stored)")
+        }
+        var edit = RemoteConfiguration(name: "kr", provider: .s3Compatible)
+        edit.values = ["provider": "Mega", "region": "ap-tokyo-1", "access_key_id": "AKID2", "limpet_keychain": "true"]
+
+        // Finding 5: a non-secret edit rewrites the section where it stands and keeps the secret.
+        do { try service.updateRemote(edit) } catch { return report(id, slug, false, "(in-place edit threw \(error))") }
+        let edited = "[before]\ntype = local\n\n[kr]\ntype = s3\naccess_key_id = AKID2\nendpoint = s3.ap-tokyo-1.megas4.com\n"
+            + "provider = Mega\nregion = ap-tokyo-1\nlimpet_keychain = true\n\n[after]\ntype = local\n"
+        guard conf() == edited, store.read(account: "kr") == .found("old-secret") else {
+            return report(id, slug, false, "(in-place edit wrong: \(conf().debugDescription))")
+        }
+        // A new secret whose add fails, or whose read-back does not match (finding 7):
+        // rclone.conf untouched, the error says to re-enter the secret.
+        edit.values["secret_access_key"] = "new-secret"
+        edit.values["access_key_id"] = "AKID3"
+        for failure in ["fail--i", "corrupt-add"] {
+            flag(failure, true)
+            defer { flag(failure, false) }
+            do {
+                try service.updateRemote(edit)
+                return report(id, slug, false, "(\(failure): update did not fail)")
+            } catch {
+                guard "\(error)".contains("re-enter"), conf() == edited else {
+                    return report(id, slug, false, "(\(failure): \(error), conf changed=\(conf() != edited))")
+                }
+            }
+        }
+        do { try service.updateRemote(edit) } catch { return report(id, slug, false, "(rotation threw \(error))") }
+        guard store.read(account: "kr") == .found("new-secret"), conf().contains("access_key_id = AKID3") else {
+            return report(id, slug, false, "(rotation did not store the new secret and update the section)")
+        }
+
+        // deleteRemote is never half-done.
+        flag("fail-delete-generic-password", true)
+        let failedDelete = (try? service.deleteRemote("kr")) == nil
+        flag("fail-delete-generic-password", false)
+        guard failedDelete, store.read(account: "kr") == .found("new-secret"), conf().contains("[kr]") else {
+            return report(id, slug, false, "(a failed item delete left a half-deleted remote)")
+        }
+        flag("rclone-fail", true)
+        let failedSection = (try? service.deleteRemote("kr")) == nil
+        flag("rclone-fail", false)
+        guard failedSection, store.read(account: "kr") == .found("new-secret") else {
+            return report(id, slug, false, "(a failed section delete did not restore the secret)")
+        }
+        guard (try? service.deleteRemote("kr")) != nil, store.read(account: "kr") == .notFound else {
+            return report(id, slug, false, "(a clean delete did not remove the item)")
+        }
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L4-21 — a locked keychain is never read (no unprompted dialogs)
+
+    /// limpet-plan.md L4 "No unprompted keychain dialogs": with the injected
+    /// lock-status provider saying locked (or unknown), no `security` call is
+    /// made at all, no rclone starts, and each attempt logs exactly the one
+    /// fixed line. The production provider (SecKeychainGetStatus) is never
+    /// called here; that it cannot prompt is for the user to check live.
+    private static func testKeychainLockedNoRead() -> Bool {
+        let id = "AC-L4-21", slug = "keychain-locked-no-read"
+        let dir = "\(selfTestRoot)/ac-l4-21"
+        try? FileManager.default.removeItem(atPath: dir)
+        guard let stub = makeSecurityStub(in: dir, secret: "SEKRET-locked-2b7", mode: "found") else {
+            return report(id, slug, false, "(fixture setup failed)")
+        }
+        let confPath = "\(dir)/rclone.conf"
+        try? "[ks3]\ntype = s3\nprovider = Mega\nlimpet_keychain = true\n\n[plain]\ntype = local\n"
+            .write(toFile: confPath, atomically: true, encoding: .utf8)
+        let statusFile = "\(dir)/lock-status"
+        let store = KeychainSecretStore(
+            securityPath: stub, keychainPath: "\(dir)/fake.keychain-db",
+            lockStatus: { _ in
+                switch (try? String(contentsOfFile: statusFile, encoding: .utf8)) ?? "" {
+                case "unlocked": return .unlocked
+                case "locked": return .locked
+                default: return .unknown
+                }
+            })
+        let service = RcloneConfigService(configPath: confPath, rclonePath: "/usr/bin/false", keychain: store)
+        let profile = SyncProfile(name: "p", rcloneRemote: "ks3:", remotePath: "b", localSyncPath: "/tmp/x")
+        for status in ["locked", "unknown"] {
+            try? status.write(toFile: statusFile, atomically: true, encoding: .utf8)
+            var lines: [String] = [], spawned = 0
+            for _ in 0..<2 {
+                let code = SyncWatchDaemon.runSyncChild(
+                    profile: profile, service: service, log: { lines.append($0) }, spawn: { _ in spawned += 1; return 0 })
+                guard code == SyncWatchDaemon.secretUnavailableExitCode else {
+                    return report(id, slug, false, "(\(status): exit \(code))")
+                }
+            }
+            guard spawned == 0, lines == [KeychainSecretStore.lockedMessage, KeychainSecretStore.lockedMessage],
+                  lines[0] == "Keychain locked — open limpet and click \"Allow keychain access\"",
+                  !FileManager.default.fileExists(atPath: "\(dir)/calls") else {
+                return report(id, slug, false, "(\(status): spawned=\(spawned) lines=\(lines) security called=\(FileManager.default.fileExists(atPath: "\(dir)/calls")))")
+            }
+            // Writes are refused the same way, before any security call.
+            guard store.add(account: "ks3", secret: "x") == KeychainSecretStore.lockedMessage,
+                  store.delete(account: "ks3") == KeychainSecretStore.lockedMessage,
+                  !FileManager.default.fileExists(atPath: "\(dir)/calls") else {
+                return report(id, slug, false, "(\(status): a keychain write reached security)")
+            }
+        }
+        // A remote without the marker never asks the keychain at all.
+        guard service.secretEnvironment(forRemote: "plain:", log: { _ in }) == [:] else {
+            return report(id, slug, false, "(a non-keychain remote was affected by the lock)")
+        }
+        // Unlocked: normal read, the child starts with the secret.
+        try? "unlocked".write(toFile: statusFile, atomically: true, encoding: .utf8)
+        var childEnvironment: [String: String] = [:]
+        _ = SyncWatchDaemon.runSyncChild(
+            profile: profile, service: service, log: { _ in }, spawn: { childEnvironment = $0; return 0 })
+        guard childEnvironment["RCLONE_CONFIG_KS3_SECRET_ACCESS_KEY"] == "SEKRET-locked-2b7" else {
+            return report(id, slug, false, "(unlocked: the secret was not read)")
+        }
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L4-22 — doctor warns when the installed maxDelete is stale (review 2b, deferred)
+
+    private static func testDoctorWarnsStaleMaxDelete() -> Bool {
+        let id = "AC-L4-22", slug = "doctor-warns-stale-max-delete"
+        var profile = sampleProfile(isEnabled: false)
+        profile.rcloneRemote = "s4:"
+        func warnings(derivedMaxDelete: Int, provider: String) -> [DoctorCheck] {
+            let env = fakeCLIEnvironment(
+                runRclone: { args, _, _ in args.first == "version" ? (0, "rclone v1.75.1", "") : (0, "", "") },
+                readProfiles: { [profile] },
+                fileExists: { $0 == profile.configPath },
+                remoteSection: { $0 == "s4" ? ["type": "s3", "provider": provider] : nil },
+                readFile: { $0 == profile.configPath ? "{\"maxDelete\": \(derivedMaxDelete)}" : nil })
+            return LimpetCLI.doctorChecks(env: env).filter { $0.detail.contains("limpet reinstall") }
+        }
+        // Installed as Mega (100), now still Mega → quiet; changed to AWS with versioning
+        // → the current section gives 0 → warn; installed 0 while it is now Mega → warn.
+        profile.remoteVersioning = true
+        guard warnings(derivedMaxDelete: 100, provider: "Mega").isEmpty,
+              warnings(derivedMaxDelete: 100, provider: "AWS").first?.status == .warn,
+              warnings(derivedMaxDelete: 0, provider: "Mega").first?.status == .warn else {
+            return report(id, slug, false, "(stale maxDelete warning wrong)")
+        }
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L4-23 — a refused external edit is rolled back, its content kept aside
+
+    /// Second review, finding 1: an external edit making A overlap B, or one
+    /// that no longer decodes, must not stay in A's file.
+    private static func testRefusedExternalEditRestored() -> Bool {
+        let id = "AC-L4-23", slug = "refused-external-edit-restored"
+        let fm = FileManager.default
+        let dir = "\(selfTestRoot)/ac-l4-23/profiles"
+        try? fm.removeItem(atPath: "\(selfTestRoot)/ac-l4-23")
+        var a = sampleProfile(name: "A")
+        a.remotePath = "PathA"
+        var b = sampleProfile(name: "B")
+        b.remotePath = "PathB"
+        let derivedA = "\(dir)/\(a.shortId).json"
+        guard ProfileStore.writeProfileFile(a, in: dir) != nil, ProfileStore.writeProfileFile(b, in: dir) != nil,
+              fm.createFile(atPath: derivedA, contents: Data("{\"remotePath\":\"PathA\"}".utf8)) else {
+            return report(id, slug, false, "(fixture setup failed)")
+        }
+        let aPath = "\(dir)/\(a.shortId).profile.json"
+        var events: [String] = [], errors: [(UUID, String)] = []
+        func apply(_ data: Data) -> SyncManager.ExternalEditOutcome {
+            SyncManager.applyExternalEdit(
+                data: data, path: aPath, known: { $0 == a.id ? a : ($0 == b.id ? b : nil) },
+                others: [a, b], isInstalled: { _ in true },
+                persist: { _ in events.append("persist") }, install: { _ in events.append("install") },
+                uninstall: { _ in events.append("uninstall") }, reportError: { errors.append(($0, $1)) })
+        }
+        func fileProfile() -> SyncProfile? {
+            fm.contents(atPath: aPath).flatMap { try? JSONDecoder().decode(SyncProfile.self, from: $0) }
+        }
+
+        // A edited to overlap B.
+        var overlapping = a
+        overlapping.remotePath = "PathB/inside"
+        guard let edit = try? JSONEncoder().encode(overlapping), (try? edit.write(to: URL(fileURLWithPath: aPath))) != nil,
+              case .restored(let copy?) = apply(edit) else {
+            return report(id, slug, false, "(overlapping edit was not restored)")
+        }
+        guard events.isEmpty, fileProfile() == a, fileProfile()?.remotePath == "PathA",
+              fm.contents(atPath: copy) == edit, copy.hasPrefix("\(dir)/refused/"),
+              fm.contents(atPath: derivedA) == Data("{\"remotePath\":\"PathA\"}".utf8),
+              errors.count == 1, errors[0].0 == a.id, errors[0].1.contains("Restored"), errors[0].1.contains(copy) else {
+            return report(id, slug, false, "(overlap: events=\(events) errors=\(errors.map(\.1)))")
+        }
+        // B's watcher still runs: A's file no longer overlaps it.
+        guard SyncWatchDaemon.refusalReason(for: b, profilesDirectory: dir, isInstalled: { _ in true }) == nil else {
+            return report(id, slug, false, "(B's watcher still refuses)")
+        }
+
+        // An edit that no longer decodes (F4 value) is rolled back the same way.
+        errors = []
+        let undecodable = Data(profileJSON(a, rcloneRemote: connectionStringRemote).utf8)
+        try? undecodable.write(to: URL(fileURLWithPath: aPath))
+        guard case .restored(let copy2?) = apply(undecodable), fileProfile() == a,
+              fm.contents(atPath: copy2) == undecodable, events.isEmpty,
+              errors.count == 1, errors[0].1.contains("no longer decodes"),
+              !errors[0].1.contains(connectionStringSecret) else {
+            return report(id, slug, false, "(undecodable edit not restored: \(errors.map(\.1)))")
+        }
+        // A half-written file is left alone; an acceptable edit applies.
+        let partial = Data("{\"id\": \"\(a.id.uuidString)\", \"na".utf8)
+        guard apply(partial) == .ignored else {
+            return report(id, slug, false, "(a half-written file was not ignored)")
+        }
+        var renamed = a
+        renamed.name = "A renamed"
+        guard let ok = try? JSONEncoder().encode(renamed), apply(ok) == .applied, events == ["persist"] else {
+            return report(id, slug, false, "(an acceptable edit was not applied: \(events))")
+        }
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L4-24 — a wizard retry installs the same profile, never a second one
+
+    private static func testWizardRetryKeepsProfileId() -> Bool {
+        let id = "AC-L4-24", slug = "wizard-retry-keeps-profile-id"
+        func build(_ existing: SyncProfile?) -> SyncProfile {
+            SetupWizardView.profileToSave(
+                existing: existing, name: "W", remote: "r", remotePath: "p", localPath: "/tmp/w",
+                drivePath: "", interval: 5, direction: .localToRemote)
+        }
+        let first = build(nil)
+        let retry = build(first)
+        guard first.isEnabled, retry.id == first.id, retry.isEnabled else {
+            return report(id, slug, false, "(retry got id \(retry.id), first \(first.id))")
+        }
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L4-25 — a full save moves an undecodable profile file aside, never deletes it
+
+    /// Internal review F1: `profilesOnDisk` skips a file that does not decode,
+    /// so the orphan prune of a full `save()` used to delete it while its
+    /// launchd agent stayed installed. A genuine (decodable) orphan is still removed.
+    private static func testPruneKeepsUndecodableFile() -> Bool {
+        let id = "AC-L4-25", slug = "prune-moves-undecodable-aside"
+        let fm = FileManager.default
+        let dir = "\(selfTestRoot)/ac-l4-25/profiles"
+        try? fm.removeItem(atPath: "\(selfTestRoot)/ac-l4-25")
+        let valid = sampleProfile(name: "Valid")
+        let doomed = sampleProfile(name: "Doomed")
+        let invalidDict: [String: Any] = [
+            "id": UUID().uuidString, "name": "Invalid", "rcloneRemote": "selftest-fixture-remote:",
+            "remotePath": "Invalid", "localSyncPath": "/tmp/limpet-selftest-local", "transfers": 128,
+        ]
+        let invalidPath = "\(dir)/invalid.profile.json"
+        guard ProfileStore.writeProfileFile(valid, in: dir) != nil, ProfileStore.writeProfileFile(doomed, in: dir) != nil,
+              let invalid = try? JSONSerialization.data(withJSONObject: invalidDict),
+              (try? invalid.write(to: URL(fileURLWithPath: invalidPath))) != nil,
+              (try? JSONDecoder().decode(SyncProfile.self, from: invalid)) == nil else {
+            return report(id, slug, false, "(fixture setup failed)")
+        }
+        let store = ProfileStore(
+            profilesDirectory: dir,
+            defaults: UserDefaults(suiteName: "com.nanako.limpet.selftest.l4-25.\(UUID().uuidString)")!)
+        guard Set(store.profiles.map(\.id)) == [valid.id, doomed.id] else {
+            return report(id, slug, false, "(fixture load: \(store.profiles.map(\.name)))")
+        }
+        store.delete(id: doomed.id)  // a full save(): writes Valid, prunes the rest
+        store.save()                 // and once more with nothing to delete
+        let refused = (try? fm.contentsOfDirectory(atPath: "\(dir)/refused")) ?? []
+        guard !fm.fileExists(atPath: invalidPath), refused.count == 1, refused[0].hasPrefix("invalid."),
+              fm.contents(atPath: "\(dir)/refused/\(refused[0])") == invalid else {
+            return report(id, slug, false, "(undecodable file not kept under refused/: refused=\(refused))")
+        }
+        guard fm.fileExists(atPath: "\(dir)/\(valid.shortId).profile.json"),
+              !fm.fileExists(atPath: "\(dir)/\(doomed.shortId).profile.json") else {
+            return report(id, slug, false, "(valid file lost or genuine orphan not removed)")
+        }
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L4-26 — editing a keychain remote drops only the secret's own "is required"
+
+    /// Internal review F2: the edit-mode filter matched the secret label by
+    /// prefix, and b2's "Application Key" is a prefix of "Application Key ID
+    /// is required", so a b2 section without `account` could be saved.
+    private static func testEditKeepsNonSecretRequiredErrors() -> Bool {
+        let id = "AC-L4-26", slug = "edit-remote-secret-filter-exact"
+        var b2 = RemoteConfiguration(name: "kb", provider: .b2)
+        guard AddRemoteSheet.editBlockingErrors(b2) == ["Application Key ID is required"] else {
+            return report(id, slug, false, "(b2 without account: \(AddRemoteSheet.editBlockingErrors(b2)))")
+        }
+        b2.values["account"] = "KEYID"
+        var s3 = RemoteConfiguration(name: "ks", provider: .s3Compatible)
+        s3.values["access_key_id"] = "AKID"
+        guard AddRemoteSheet.editBlockingErrors(b2).isEmpty, AddRemoteSheet.editBlockingErrors(s3).isEmpty else {
+            return report(id, slug, false, "(an empty secret blocked an edit: b2=\(AddRemoteSheet.editBlockingErrors(b2)) s3=\(AddRemoteSheet.editBlockingErrors(s3)))")
+        }
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L4-27 — a locked keychain logs once per throttle window, not once per trigger
+
+    /// Internal review F6: `secretEnvironment`'s lines were written on every
+    /// trigger (~5 s while files change), unlike refusal and source-missing
+    /// lines. The run now asks the scheduler's `mayLog`, throttled per kind.
+    /// Wired as in `SyncWatchDaemon.productionRunner`, minus its main-queue hop.
+    private static func testKeychainLockedLogThrottled() -> Bool {
+        let id = "AC-L4-27", slug = "keychain-locked-log-throttled"
+        let dir = "\(selfTestRoot)/ac-l4-27"
+        try? FileManager.default.removeItem(atPath: dir)
+        guard let stub = makeSecurityStub(in: dir, secret: "unused", mode: "found") else {
+            return report(id, slug, false, "(fixture setup failed)")
+        }
+        let confPath = "\(dir)/rclone.conf"
+        try? "[ks3]\ntype = s3\nprovider = Mega\nlimpet_keychain = true\n"
+            .write(toFile: confPath, atomically: true, encoding: .utf8)
+        let store = KeychainSecretStore(
+            securityPath: stub, keychainPath: "\(dir)/fake.keychain-db", lockStatus: { _ in .locked })
+        let service = RcloneConfigService(configPath: confPath, rclonePath: "/usr/bin/false", keychain: store)
+        let profile = SyncProfile(name: "p", rcloneRemote: "ks3:", remotePath: "b", localSyncPath: "/tmp/x")
+        var lines: [String] = [], refusals = 0, spawned = 0
+        let clock = VirtualClock()
+        let scheduler = SyncWatchScheduler(runner: SchedulerRunner(
+            sourceExists: { true },
+            runChild: { mayLog, completion in
+                completion(SyncWatchDaemon.runSyncChild(
+                    profile: profile, service: service,
+                    log: { if mayLog() { lines.append($0) } },
+                    spawn: { _ in spawned += 1; return 0 }))
+            },
+            now: { clock.now },
+            scheduleAfter: { s, a in clock.scheduleAfter(s, a) },
+            logSourceMissing: {},
+            refusalReason: { nil },
+            logRefusal: { _ in refusals += 1 },
+            deleteLimitReached: { false },
+            recordDeleteLimit: { true }))
+        for _ in 0..<4 {              // four debounced triggers, 5 s apart
+            scheduler.trigger()
+            clock.advance(by: 5)
+        }
+        guard scheduler.runCount == 4, lines == [KeychainSecretStore.lockedMessage], spawned == 0 else {
+            return report(id, slug, false, "(within the window: runs=\(scheduler.runCount) lines=\(lines.count) spawned=\(spawned))")
+        }
+        clock.advance(by: 30)
+        scheduler.trigger()
+        guard lines.count == 2, spawned == 0, refusals == 0, scheduler.state == .idle,
+              !FileManager.default.fileExists(atPath: "\(dir)/calls") else {
+            return report(id, slug, false, "(after the window: lines=\(lines.count) spawned=\(spawned) state=\(scheduler.state))")
+        }
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L4-28 — output larger than the pipe buffer is drained, not timed out
+
+    /// CodeRabbit PR #6: stdout was read only after `security` exited, so an
+    /// output over the ~64 KB pipe buffer blocked the child until the timeout.
+    private static func testKeychainLargeOutputDrained() -> Bool {
+        let id = "AC-L4-28", slug = "keychain-large-output-drained"
+        let dir = "\(selfTestRoot)/ac-l4-28"
+        try? FileManager.default.removeItem(atPath: dir)
+        let big = String(repeating: "a", count: 200_000)
+        guard let stub = makeSecurityStub(in: dir, secret: big, mode: "found") else {
+            return report(id, slug, false, "(fixture setup failed)")
+        }
+        let store = KeychainSecretStore(
+            securityPath: stub, keychainPath: "\(dir)/fake.keychain-db", timeout: 3, lockStatus: { _ in .unlocked })
+        let result = store.read(account: "big")
+        guard result == .found(big) else {
+            let shape: String
+            if case .found(let s) = result { shape = "found(\(s.count) chars)" } else { shape = "\(result)" }
+            return report(id, slug, false, "(read returned \(shape))")
+        }
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L4-5 — the watcher refuses before every run (catch-up, trigger, SIGUSR1, retry)
+
+    /// Drives `SyncWatchScheduler` with the PRODUCTION refusal closure
+    /// (`SyncWatchDaemon.refusalReason`) over a scratch profiles directory: the
+    /// overlapping profile file appears only after a first, allowed run, so the
+    /// gate must be re-evaluated per attempt, not once at start.
+    private static func testWatcherRefusesBeforeEveryRun() -> Bool {
+        let id = "AC-L4-5", slug = "watcher-refuses-before-every-run"
+        let dir = "\(selfTestRoot)/ac-l4-5-profiles"
+        try? FileManager.default.removeItem(atPath: dir)
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let mine = sampleProfile(name: "Mine")
+
+        var childRuns = 0, refusalLogs = 0, exitCode: Int32 = 75
+        let clock = VirtualClock()
+        let runner = SchedulerRunner(
+            sourceExists: { true },
+            runChild: { _, completion in childRuns += 1; completion(exitCode) },
+            now: { clock.now },
+            scheduleAfter: { s, a in clock.scheduleAfter(s, a) },
+            logSourceMissing: {},
+            refusalReason: { SyncWatchDaemon.refusalReason(for: mine, profilesDirectory: dir, isInstalled: { _ in true }) },
+            logRefusal: { _ in refusalLogs += 1 },
+            deleteLimitReached: { false },
+            recordDeleteLimit: { true }
+        )
+        let scheduler = SyncWatchScheduler(runner: runner)
+        scheduler.trigger()  // catch-up: allowed, exits 75 → backoff
+        guard childRuns == 1 else {
+            return report(id, slug, false, "(catch-up run did not start: \(childRuns))")
+        }
+        // Another profile on the same remote path appears on disk.
+        var twin = sampleProfile(name: "Twin")
+        twin.remotePath = mine.remotePath
+        guard ProfileStore.writeProfileFile(twin, in: dir) != nil else {
+            return report(id, slug, false, "(fixture write failed)")
+        }
+        exitCode = 0
+        clock.advance(by: 11)          // post-backoff retry
+        scheduler.trigger()            // FSEvents / periodic
+        scheduler.trigger()            // SIGUSR1 goes through the same trigger()
+        clock.advance(by: 60)
+        guard childRuns == 1, refusalLogs >= 1, scheduler.state == .idle else {
+            return report(id, slug, false, "(overlap: childRuns=\(childRuns) logs=\(refusalLogs) state=\(scheduler.state))")
+        }
+
+        // A refused field value (built in memory; decode would never produce it).
+        var bad = sampleProfile(name: "Bad")
+        bad.rcloneRemote = connectionStringRemote
+        var badRuns = 0
+        let badScheduler = SyncWatchScheduler(runner: SchedulerRunner(
+            sourceExists: { true },
+            runChild: { _, completion in badRuns += 1; completion(0) },
+            now: { clock.now },
+            scheduleAfter: { s, a in clock.scheduleAfter(s, a) },
+            logSourceMissing: {},
+            refusalReason: { SyncWatchDaemon.refusalReason(for: bad, profilesDirectory: "\(dir)-empty", isInstalled: { _ in true }) },
+            logRefusal: { _ in },
+            deleteLimitReached: { false },
+            recordDeleteLimit: { true }
+        ))
+        badScheduler.trigger()
+        badScheduler.trigger()
+        guard badRuns == 0 else {
+            return report(id, slug, false, "(connection-string profile ran \(badRuns) time(s))")
+        }
+
+        // Regression: a pending rerun that finds the source gone must leave the
+        // scheduler idle, so the next trigger (source back) runs again.
+        var present = true, pendingCompletion: ((Int32) -> Void)?, runs = 0
+        let stuckScheduler = SyncWatchScheduler(runner: SchedulerRunner(
+            sourceExists: { present },
+            runChild: { _, completion in runs += 1; pendingCompletion = completion },
+            now: { clock.now },
+            scheduleAfter: { s, a in clock.scheduleAfter(s, a) },
+            logSourceMissing: {},
+            refusalReason: { nil },
+            logRefusal: { _ in },
+            deleteLimitReached: { false },
+            recordDeleteLimit: { true }
+        ))
+        stuckScheduler.trigger()
+        stuckScheduler.trigger()       // pending
+        present = false
+        pendingCompletion?(0)          // pending rerun finds no source
+        present = true
+        stuckScheduler.trigger()
+        guard runs == 2 else {
+            return report(id, slug, false, "(scheduler stuck after a missing-source rerun: runs=\(runs), state=\(stuckScheduler.state))")
+        }
+        return report(id, slug, true)
     }
 
 }

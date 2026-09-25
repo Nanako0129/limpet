@@ -40,6 +40,7 @@
 		D1AA48876BFD939152611C3A /* RemoteProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = A50EAC070BD6E49AA1131944 /* RemoteProvider.swift */; };
 		D347B9A6D156102131579DED /* SetupWizardView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8DF29F3BB633D9E3DD12136A /* SetupWizardView.swift */; };
 		E912A1B4B43D4029246920EE /* RcloneLocator.swift in Sources */ = {isa = PBXBuildFile; fileRef = D767944E8289869D576524AC /* RcloneLocator.swift */; };
+		A1C4E0000000000000000001 /* KeychainSecretStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1C4E0000000000000000002 /* KeychainSecretStore.swift */; };
 		E98B9E367273424F260154CC /* ConfigReconciler.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5AD2D42E871A6CC074379689 /* ConfigReconciler.swift */; };
 		F2B3C4D5E6F7089012AB0001 /* MigrationRunner.swift in Sources */ = {isa = PBXBuildFile; fileRef = F2B3C4D5E6F7089012AB0002 /* MigrationRunner.swift */; };
 		F9268603C9EA887930F58C52 /* ConfigSchemaInstaller.swift in Sources */ = {isa = PBXBuildFile; fileRef = C537381AA63EEF38035C8CA0 /* ConfigSchemaInstaller.swift */; };
@@ -96,6 +97,7 @@
 		C0DC6141FBB853681643F593 /* RcloneConfigService.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = RcloneConfigService.swift; sourceTree = "<group>"; };
 		C537381AA63EEF38035C8CA0 /* ConfigSchemaInstaller.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = ConfigSchemaInstaller.swift; sourceTree = "<group>"; };
 		D767944E8289869D576524AC /* RcloneLocator.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = RcloneLocator.swift; sourceTree = "<group>"; };
+		A1C4E0000000000000000002 /* KeychainSecretStore.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = KeychainSecretStore.swift; sourceTree = "<group>"; };
 		F2B3C4D5E6F7089012AB0002 /* MigrationRunner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MigrationRunner.swift; sourceTree = "<group>"; };
 		FSCFG00000000000000000001 /* Signing.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Config/Signing.xcconfig; sourceTree = SOURCE_ROOT; };
 /* End PBXFileReference section */
@@ -194,6 +196,7 @@
 				C0DC6141FBB853681643F593 /* RcloneConfigService.swift */,
 				F2B3C4D5E6F7089012AB0002 /* MigrationRunner.swift */,
 				D767944E8289869D576524AC /* RcloneLocator.swift */,
+				A1C4E0000000000000000002 /* KeychainSecretStore.swift */,
 				48C81844C44AA7C559B6730B /* AppSettingsFileStore.swift */,
 				75E6545555EB74D6B9B97A02 /* ConfigFileWatcher.swift */,
 				C537381AA63EEF38035C8CA0 /* ConfigSchemaInstaller.swift */,
@@ -352,6 +355,7 @@
 				AB12CD34EF56789012340001 /* AddRemoteSheet.swift in Sources */,
 				F2B3C4D5E6F7089012AB0001 /* MigrationRunner.swift in Sources */,
 				E912A1B4B43D4029246920EE /* RcloneLocator.swift in Sources */,
+				A1C4E0000000000000000001 /* KeychainSecretStore.swift in Sources */,
 				FC42AD91FD4C3FCBE784DE4F /* AppSettingsFileStore.swift in Sources */,
 				A8048FF52AC46AD7139A2000 /* ConfigFileWatcher.swift in Sources */,
 				F9268603C9EA887930F58C52 /* ConfigSchemaInstaller.swift in Sources */,

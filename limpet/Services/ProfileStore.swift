@@ -155,6 +155,11 @@ final class ProfileStore: ObservableObject {
     /// same byte format the app does — the write counterpart to
     /// `profilesOnDisk(in:)`, keeping one source of truth for the on-disk shape.
     nonisolated static func writeProfileFile(_ profile: SyncProfile, in directory: String) -> String? {
+        // F4: a refused value is never written (limpet-plan.md L4).
+        if let error = profile.validationError {
+            print("Refusing to write profile \(profile.shortId): \(error)")
+            return nil
+        }
         let fm = FileManager.default
         guard (try? fm.createDirectory(
             atPath: directory, withIntermediateDirectories: true)) != nil else { return nil }
@@ -182,12 +187,24 @@ final class ProfileStore: ObservableObject {
     /// Remove any `*.profile.json` in `profilesDirectory` not in `keep`
     /// (self-healing against orphans left by an interrupted delete or an
     /// externally-dropped file). Only files matching the `.profile.json`
-    /// suffix are ever removed.
+    /// suffix are ever touched. Only a file that decodes to a `SyncProfile` is
+    /// a genuine orphan and removed. One that does not decode (an F4-refused
+    /// value, a `transfers` out of range, garbage) never reached `profiles`
+    /// because `profilesOnDisk` skipped it, so it is not an orphan: it may be
+    /// the only copy of a profile whose agent is still installed. It is moved
+    /// to `profiles/refused/` (`SyncManager.quarantineRefusedDrop`), never
+    /// deleted; if that move fails it stays where it is.
     private func pruneOrphanProfileFiles(keeping keep: Set<String>) {
         let fm = FileManager.default
         guard let files = try? fm.contentsOfDirectory(atPath: profilesDirectory) else { return }
         for file in files where file.hasSuffix(".profile.json") && !keep.contains(file) {
-            try? fm.removeItem(atPath: "\(profilesDirectory)/\(file)")
+            let path = "\(profilesDirectory)/\(file)"
+            if let data = fm.contents(atPath: path),
+               (try? JSONDecoder().decode(SyncProfile.self, from: data)) != nil {
+                try? fm.removeItem(atPath: path)
+            } else if SyncManager.quarantineRefusedDrop(at: path) == nil {
+                print("Could not move undecodable profile file \(file) to refused/; left in place")
+            }
         }
     }
 
@@ -206,6 +223,9 @@ final class ProfileStore: ObservableObject {
     /// Add a new profile. Only the new profile's `.profile.json` is written
     /// (existing profiles' files are untouched — see `save(only:)`).
     func add(_ profile: SyncProfile) {
+        // F4: never held in memory either, or `save()` would put it in the
+        // UserDefaults blob mirror.
+        guard profile.validationError == nil else { return }
         profiles.append(profile)
         save(only: profile)
     }
@@ -213,7 +233,8 @@ final class ProfileStore: ObservableObject {
     /// Update an existing profile. Only the edited profile's `.profile.json`
     /// is written (existing profiles' files are untouched — see `save(only:)`).
     func update(_ profile: SyncProfile) {
-        guard let index = profiles.firstIndex(where: { $0.id == profile.id }) else {
+        guard profile.validationError == nil,
+              let index = profiles.firstIndex(where: { $0.id == profile.id }) else {
             return
         }
         profiles[index] = profile

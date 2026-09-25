@@ -25,6 +25,8 @@ struct SetupWizardView: View {
     // UI state
     @State private var isLoading: Bool = false
     @State private var errorMessage: String?
+    /// Set once a save has persisted a NEW profile, so a retry updates it.
+    @State private var savedProfile: SyncProfile?
     @State private var isOAuthInProgress: Bool = false
 
     // Non-empty local folder confirmation (warns about local/remote merge on first sync)
@@ -538,7 +540,7 @@ struct SetupWizardView: View {
                     advanceToNextStep(nextStep)
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(!canAdvance)
+                .disabled(!canAdvance || isLoading)
             }
         }
     }
@@ -637,14 +639,24 @@ struct SetupWizardView: View {
         isLoading = true
         errorMessage = nil
 
-        do {
-            try configService.addRemote(remoteConfig)
-            selectedRemote = "\(remoteConfig.name):"
-            isLoading = false
-            completion()
-        } catch {
-            isLoading = false
-            errorMessage = error.localizedDescription
+        // Off the main thread, as AddRemoteSheet.createRemote does: for s3/b2,
+        // addRemote runs addKeychainRemote, which spawns /usr/bin/security.
+        let capturedConfig = remoteConfig
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                try configService.addRemote(capturedConfig)
+                let remoteName = "\(capturedConfig.name):"
+                DispatchQueue.main.async {
+                    isLoading = false
+                    selectedRemote = remoteName
+                    completion()
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    isLoading = false
+                    errorMessage = error.localizedDescription
+                }
+            }
         }
     }
 
@@ -701,6 +713,26 @@ struct SetupWizardView: View {
         """
     }
 
+    /// The profile the wizard saves: `existing` (the profile being edited, or
+    /// the one an earlier failed attempt already saved) updated in place, or a
+    /// new one. Always enabled: the wizard installs what it saves, and an
+    /// installed-but-disabled profile would escape the F6 overlap rule.
+    static func profileToSave(
+        existing: SyncProfile?, name: String, remote: String, remotePath: String, localPath: String,
+        drivePath: String, interval: Int, direction: SyncDirection
+    ) -> SyncProfile {
+        var profile = existing ?? SyncProfile(name: "New Profile")
+        if !name.isEmpty { profile.name = name }
+        profile.rcloneRemote = remote
+        profile.remotePath = remotePath
+        profile.localSyncPath = localPath
+        profile.drivePathToMonitor = drivePath
+        profile.syncIntervalMinutes = interval
+        profile.syncDirection = direction
+        profile.isEnabled = true
+        return profile
+    }
+
     private func saveProfile() {
         isLoading = true
         errorMessage = nil
@@ -716,43 +748,41 @@ struct SetupWizardView: View {
             }
         }
 
-        var profileToInstall: SyncProfile
+        // A retry after "Saved, but … could not be installed" updates the
+        // profile the first attempt created (same id) instead of adding a
+        // second one (second review, finding 3).
+        let existing = editingProfile ?? savedProfile
+        let profileToInstall = Self.profileToSave(
+            existing: existing, name: profileName, remote: remoteName, remotePath: remotePath,
+            localPath: localPath, drivePath: drivePath, interval: syncInterval, direction: syncDirection)
 
-        if let existingProfile = editingProfile {
-            // Update existing profile
-            var updatedProfile = existingProfile
-            updatedProfile.name = profileName.isEmpty ? existingProfile.name : profileName
-            updatedProfile.rcloneRemote = remoteName
-            updatedProfile.remotePath = remotePath
-            updatedProfile.localSyncPath = localPath
-            updatedProfile.drivePathToMonitor = drivePath
-            updatedProfile.syncIntervalMinutes = syncInterval
-            updatedProfile.syncDirection = syncDirection
-
-            profileStore.update(updatedProfile)
-            profileToInstall = updatedProfile
-        } else {
-            // Create new profile
-            let profile = SyncProfile(
-                name: profileName.isEmpty ? "New Profile" : profileName,
-                rcloneRemote: remoteName,
-                remotePath: remotePath,
-                localSyncPath: localPath,
-                drivePathToMonitor: drivePath,
-                syncIntervalMinutes: syncInterval,
-                syncDirection: syncDirection
-            )
-
-            profileStore.add(profile)
-            profileToInstall = profile
+        // Refuse BEFORE persisting anything (review finding 6).
+        if let reason = SyncManager.profileChangeRefusal(
+            profileToInstall, others: profileStore.profiles, isInstalled: SyncProfile.agentInstalled) {
+            isLoading = false
+            errorMessage = "Not saved: \(reason)"
+            return
         }
+        if existing != nil {
+            profileStore.update(profileToInstall)
+        } else {
+            profileStore.add(profileToInstall)
+        }
+        savedProfile = profileToInstall
 
         // Automatically install the scheduled sync
         do {
             try SyncSetupService.shared.install(profile: profileToInstall)
         } catch {
-            print("Failed to install scheduled sync: \(error)")
-            // Don't block - the user can manually install from settings
+            // Saved, but not running: keep it disabled so it never shows as an
+            // enabled profile with no agent; a retry re-enables it (profileToSave).
+            var disabled = profileToInstall
+            disabled.isEnabled = false
+            profileStore.update(disabled)
+            savedProfile = disabled
+            isLoading = false
+            errorMessage = "Saved as disabled: the background sync could not be installed: \(error.localizedDescription)"
+            return
         }
 
         isLoading = false

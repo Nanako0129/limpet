@@ -2,22 +2,33 @@ import Foundation
 import AppKit
 
 /// Service for managing rclone configuration (remotes)
-final class RcloneConfigService {
+final class RcloneConfigService: Sendable {  // every stored property is an immutable Sendable value
     static let shared = RcloneConfigService()
 
-    private init() {}
-
-    // MARK: - Constants
-
     /// Path to rclone configuration file
-    private var configPath: String {
-        "\(NSHomeDirectory())/.config/rclone/rclone.conf"
+    private let configPath: String
+    /// `nil` = locate rclone as usual. Set only by `ConfigSelfTest` (a stub).
+    private let rclonePath: String?
+    /// Where keychain-backed remotes keep their secret (limpet-plan.md L4 F2).
+    let keychain: KeychainSecretStore
+
+    /// Everything is injectable so `ConfigSelfTest` works on a scratch
+    /// rclone.conf, a stub rclone and a fake `security` — never the
+    /// user's real ones.
+    init(
+        configPath: String = "\(NSHomeDirectory())/.config/rclone/rclone.conf",
+        rclonePath: String? = nil,
+        keychain: KeychainSecretStore = KeychainSecretStore()
+    ) {
+        self.configPath = configPath
+        self.rclonePath = rclonePath
+        self.keychain = keychain
     }
 
     // MARK: - Rclone Path
 
     private func findRclonePath() -> String? {
-        RcloneLocator.resolve()
+        rclonePath ?? RcloneLocator.resolve()
     }
 
     /// Check if rclone is installed
@@ -90,8 +101,24 @@ final class RcloneConfigService {
         return listRemotes().contains(remoteName)
     }
 
+    /// F4 (limpet-plan.md L4): a line break in a name or value would start a
+    /// new rclone.conf line — an injected key or a whole injected section.
+    private static func refuseLineBreaks(_ config: RemoteConfiguration) throws {
+        let fields = [config.name, config.oauthToken ?? ""] + config.values.flatMap { [$0.key, $0.value] }
+        if fields.contains(where: { $0.contains("\n") || $0.contains("\r") }) {
+            throw ConfigError.invalidRemote("names and values must not contain line breaks")
+        }
+    }
+
     /// Add a new remote to rclone config
     func addRemote(_ config: RemoteConfiguration) throws {
+        try Self.refuseLineBreaks(config)
+        if config.provider.isKeychainBacked {
+            // The wizard's s3/b2 remotes take the same creation path as `limpet remote add`.
+            let (values, secret) = Self.splitKeychainSecret(config)
+            try addKeychainRemote(name: config.name, type: config.provider.rcloneType, values: values, secret: secret)
+            return
+        }
         // Ensure config directory exists
         let configDir = (configPath as NSString).deletingLastPathComponent
         try FileManager.default.createDirectory(
@@ -128,45 +155,9 @@ final class RcloneConfigService {
     /// Read configuration for an existing remote from rclone.conf
     /// Returns a RemoteConfiguration pre-populated with the remote's current settings.
     func readRemoteConfig(name: String) -> RemoteConfiguration? {
-        guard FileManager.default.fileExists(atPath: configPath),
-              let content = try? String(contentsOfFile: configPath, encoding: .utf8) else {
+        guard var values = section(named: name), let type = values.removeValue(forKey: "type") else {
             return nil
         }
-
-        // Parse INI-style config file
-        let lines = content.components(separatedBy: "\n")
-        var inSection = false
-        var values: [String: String] = [:]
-        var rcloneType: String?
-
-        for line in lines {
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
-
-            if trimmed == "[\(name)]" {
-                inSection = true
-                continue
-            }
-
-            if inSection {
-                // Stop at next section
-                if trimmed.hasPrefix("[") && trimmed.hasSuffix("]") {
-                    break
-                }
-
-                // Parse key = value
-                if let eqRange = trimmed.range(of: " = ") {
-                    let key = String(trimmed[trimmed.startIndex..<eqRange.lowerBound])
-                    let value = String(trimmed[eqRange.upperBound...])
-                    if key == "type" {
-                        rcloneType = value
-                    } else {
-                        values[key] = value
-                    }
-                }
-            }
-        }
-
-        guard inSection, let type = rcloneType else { return nil }
 
         let provider = providerFromRcloneType(type, values: values)
         var config = RemoteConfiguration(name: name, provider: provider)
@@ -183,6 +174,38 @@ final class RcloneConfigService {
         }
 
         return config
+    }
+
+    /// Every `key = value` of the `[name]` section of this service's rclone.conf,
+    /// `type` included, or `nil` when there is no such section.
+    func section(named name: String) -> [String: String]? {
+        guard let content = try? String(contentsOfFile: configPath, encoding: .utf8) else { return nil }
+        return Self.section(named: name, in: content)
+    }
+
+    static func section(named name: String, in content: String) -> [String: String]? {
+        var inSection = false
+        var values: [String: String] = [:]
+        for line in content.components(separatedBy: "\n") {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.hasPrefix("[") && trimmed.hasSuffix("]") {
+                if inSection { break }
+                inSection = trimmed == "[\(name)]"
+                continue
+            }
+            if inSection, let eqRange = trimmed.range(of: " = ") {
+                values[String(trimmed[..<eqRange.lowerBound])] = String(trimmed[eqRange.upperBound...])
+            }
+        }
+        return inSection ? values : nil
+    }
+
+    static func sectionNames(in content: String) -> [String] {
+        content.components(separatedBy: "\n").compactMap { line in
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            guard trimmed.hasPrefix("["), trimmed.hasSuffix("]"), trimmed.count > 2 else { return nil }
+            return String(trimmed.dropFirst().dropLast())
+        }
     }
 
     /// Map rclone type string to RemoteProvider
@@ -203,6 +226,10 @@ final class RcloneConfigService {
             return .sftp
         case "smb":
             return .smb
+        case "s3":
+            return .s3Compatible  // F5: never rewritten as webdav on edit
+        case "b2":
+            return .b2
         default:
             return .webdav
         }
@@ -231,6 +258,11 @@ final class RcloneConfigService {
 
     /// Update an existing remote (delete old config section, write new one)
     func updateRemote(_ config: RemoteConfiguration) throws {
+        try Self.refuseLineBreaks(config)
+        if config.provider.isKeychainBacked {
+            try updateKeychainRemote(config)
+            return
+        }
         // Delete the existing remote first
         try deleteRemote(config.name)
 
@@ -262,12 +294,43 @@ final class RcloneConfigService {
         try newConfig.write(toFile: configPath, atomically: true, encoding: .utf8)
     }
 
-    /// Delete a remote from rclone config
+    /// Delete a remote from rclone config, and its keychain item when it is
+    /// keychain-backed (F7: no secret is left behind for a remote that is gone).
+    ///
+    /// Never half-deleted (review finding 5): for a keychain-backed remote the
+    /// secret is read first, the item is deleted before the section, and if
+    /// the section delete then fails the item is put back. A failure before
+    /// that point changes nothing.
     func deleteRemote(_ name: String) throws {
         guard let rclonePath = findRclonePath() else {
             throw ConfigError.rcloneNotFound
         }
+        guard section(named: name)?[Self.keychainMarker] == "true" else {
+            try runConfigDelete(name, rclonePath: rclonePath)
+            return
+        }
+        let savedSecret: String?
+        switch keychain.read(account: name) {
+        case .found(let secret): savedSecret = secret
+        case .notFound: savedSecret = nil
+        default:
+            throw ConfigError.keychainFailed("could not read the keychain item of \(name); nothing was deleted")
+        }
+        if let error = keychain.delete(account: name) {
+            throw ConfigError.keychainFailed("\(error); nothing was deleted")
+        }
+        do {
+            try runConfigDelete(name, rclonePath: rclonePath)
+        } catch {
+            if let savedSecret, let restoreError = keychain.add(account: name, secret: savedSecret) {
+                throw ConfigError.keychainFailed(
+                    "rclone.conf still has \(name), but its secret could not be restored (\(restoreError)); re-enter it")
+            }
+            throw error
+        }
+    }
 
+    private func runConfigDelete(_ name: String, rclonePath: String) throws {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: rclonePath)
         process.arguments = ["config", "delete", name]
@@ -278,6 +341,219 @@ final class RcloneConfigService {
         if process.terminationStatus != 0 {
             throw ConfigError.deleteFailed(name)
         }
+    }
+
+    // MARK: - Keychain-backed remotes (limpet-plan.md L4)
+
+    /// rclone.conf marker of a keychain-backed remote. Measured 2026-09-26 with
+    /// rclone 1.75.1 on a scratch --config: an unknown `limpet_keychain = true`
+    /// key in a `type = local` and a `type = s3` section produced no error and
+    /// no warning at default verbosity or -vv (`lsf`, `backend features`).
+    static let keychainMarker = "limpet_keychain"
+
+    /// The only options each keychain-backed type may carry in rclone.conf.
+    /// Anything else (the secret itself, `no_check_certificate`, `hard_delete`,
+    /// …) is refused rather than written.
+    static let keychainRemoteOptions: [String: Set<String>] = [
+        "s3": ["provider", "access_key_id", "endpoint", "region"],
+        "b2": ["account"],
+    ]
+
+    /// F3: the variable rclone reads the secret from. rclone upper-cases the
+    /// remote name (measured 2026-09-26, rclone 1.75.1 -vv: remote `m_low`
+    /// took an option from `RCLONE_CONFIG_M_LOW_…`; remote `m-dash` did NOT
+    /// take one from `RCLONE_CONFIG_M_DASH_…`), and keychain-backed names are
+    /// `[A-Za-z0-9_]+`, so the mapping is unambiguous.
+    static func secretVariable(remote: String, type: String) -> String? {
+        switch type {
+        case "s3": return "RCLONE_CONFIG_\(remote.uppercased())_SECRET_ACCESS_KEY"
+        case "b2": return "RCLONE_CONFIG_\(remote.uppercased())_KEY"
+        default: return nil
+        }
+    }
+
+    /// F3 — THE secret-injection helper every rclone invocation that touches a
+    /// remote goes through. `remoteSpec` is `name`, `name:` or `name:path`.
+    /// Returns the variables to merge into the child's environment — empty for
+    /// a remote without the marker, which then runs exactly as before — or
+    /// `nil` after logging exactly one fixed-format line, in which case the
+    /// caller must not start rclone. The sync script never touches the keychain.
+    func secretEnvironment(forRemote remoteSpec: String, log: (String) -> Void) -> [String: String]? {
+        let name = String(remoteSpec.prefix { $0 != ":" })
+        guard let values = section(named: name), values[Self.keychainMarker] == "true" else { return [:] }
+        guard KeychainSecretStore.isValidAccount(name),
+              let variable = Self.secretVariable(remote: name, type: values["type"] ?? "") else {
+            log("Keychain-backed remote \"\(name)\" is not a supported s3/b2 remote; rclone was not started")
+            return nil
+        }
+        switch keychain.read(account: name) {
+        case .found(let secret):
+            return [variable: secret]
+        case .notFound:
+            log("Keychain secret not found for remote \"\(name)\" (service \(KeychainSecretStore.service)); rclone was not started")
+        case .failed(let status):
+            log("Keychain read failed for remote \"\(name)\" (security exit \(status)); rclone was not started")
+        case .timedOut:
+            log("Keychain read timed out after \(Int(keychain.timeout))s for remote \"\(name)\"; rclone was not started")
+        case .locked:
+            // No read was attempted; the next trigger checks again.
+            log(KeychainSecretStore.lockedMessage)
+        }
+        return nil
+    }
+
+    /// `secretEnvironment` merged over this process's environment — what a
+    /// call site assigns to `Process.environment`. `nil` = do not start rclone.
+    func processEnvironment(forRemote remoteSpec: String, log: (String) -> Void) -> [String: String]? {
+        secretEnvironment(forRemote: remoteSpec, log: log).map {
+            ProcessInfo.processInfo.environment.merging($0) { _, secret in secret }
+        }
+    }
+
+    /// F2/F4/F5/F7 — the ONE creation path for keychain-backed remotes, shared
+    /// by the wizard (through `addRemote`) and `limpet remote add`. Writes a
+    /// non-secret section plus the `limpet_keychain = true` marker, and puts the
+    /// secret only in the keychain (via `KeychainSecretStore`, i.e.
+    /// `/usr/bin/security -i`). https endpoints only, never
+    /// `no_check_certificate` (F7). The section is APPENDED, so no other
+    /// section of rclone.conf is rewritten and the file keeps its permissions.
+    func addKeychainRemote(name: String, type: String, values: [String: String], secret: String) throws {
+        let values = Self.withDerivedEndpoint(type: type, values: values)
+        if let reason = Self.keychainRemoteError(name: name, type: type, values: values, secret: secret) {
+            throw ConfigError.invalidRemote(reason)
+        }
+
+        let existing = (try? String(contentsOfFile: configPath, encoding: .utf8)) ?? ""
+        // Case-insensitive: rclone upper-cases the name into the variable name.
+        if Self.sectionNames(in: existing).contains(where: { $0.lowercased() == name.lowercased() }) {
+            throw ConfigError.remoteAlreadyExists(name)
+        }
+
+        if let error = keychain.store(account: name, secret: secret) {
+            throw ConfigError.keychainFailed(error)
+        }
+        do {
+            try appendSection(Self.keychainSection(name: name, type: type, values: values), existing: existing)
+        } catch {
+            _ = keychain.delete(account: name)  // no orphaned secret
+            throw error
+        }
+    }
+
+    /// Edit a keychain-backed remote IN PLACE (review finding 5): the section
+    /// is rewritten where it stands and never removed, and the secret is
+    /// replaced only when a new one was entered — delete old, add new, read
+    /// back (KeychainSecretStore.store). If that fails, rclone.conf is not
+    /// touched and the error says the secret is missing and must be re-entered.
+    private func updateKeychainRemote(_ config: RemoteConfiguration) throws {
+        let name = config.name, type = config.provider.rcloneType
+        let (split, secret) = Self.splitKeychainSecret(config)
+        let values = Self.withDerivedEndpoint(type: type, values: split)
+        if let reason = Self.keychainRemoteError(
+            name: name, type: type, values: values, secret: secret.isEmpty ? nil : secret) {
+            throw ConfigError.invalidRemote(reason)
+        }
+        guard let content = try? String(contentsOfFile: configPath, encoding: .utf8),
+              Self.section(named: name, in: content)?[Self.keychainMarker] == "true",
+              let updated = Self.replacingSection(
+                name, with: Self.keychainSection(name: name, type: type, values: values), in: content) else {
+            throw ConfigError.invalidRemote("\(name) is not a keychain-backed remote in rclone.conf")
+        }
+        if !secret.isEmpty, let error = keychain.store(account: name, secret: secret) {
+            throw ConfigError.keychainFailed(
+                "secret missing — re-enter it (\(error)); rclone.conf was not changed")
+        }
+        let fm = FileManager.default
+        let permissions = (try? fm.attributesOfItem(atPath: configPath))?[.posixPermissions]
+        try Data(updated.utf8).write(to: URL(fileURLWithPath: configPath), options: .atomic)
+        if let permissions {
+            try? fm.setAttributes([.posixPermissions: permissions], ofItemAtPath: configPath)
+        }
+    }
+
+    /// The rclone.conf section of a keychain-backed remote: options sorted, marker last.
+    private static func keychainSection(name: String, type: String, values: [String: String]) -> String {
+        (["[\(name)]", "type = \(type)"]
+            + values.filter { !$0.value.isEmpty }.sorted { $0.key < $1.key }.map { "\($0.key) = \($0.value)" }
+            + ["\(keychainMarker) = true"]).joined(separator: "\n")
+    }
+
+    /// `content` with the `[name]` section (header to the next header) replaced
+    /// by `section` plus one blank line; `nil` when there is no such section.
+    static func replacingSection(_ name: String, with section: String, in content: String) -> String? {
+        var lines = content.components(separatedBy: "\n")
+        let isHeader = { (line: String) -> Bool in
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            return trimmed.hasPrefix("[") && trimmed.hasSuffix("]")
+        }
+        guard let start = lines.firstIndex(where: { $0.trimmingCharacters(in: .whitespaces) == "[\(name)]" }) else {
+            return nil
+        }
+        let end = lines[(start + 1)...].firstIndex(where: isHeader) ?? lines.count
+        lines.replaceSubrange(start..<end, with: section.components(separatedBy: "\n") + [""])
+        return lines.joined(separator: "\n")
+    }
+
+    /// MEGA S4 endpoints are `s3.<region>.megas4.com` (rclone 1.75.1's own
+    /// endpoint list). Derived here, in the shared creation path, so the wizard
+    /// and `limpet remote add` both get it (review finding 9).
+    static func withDerivedEndpoint(type: String, values: [String: String]) -> [String: String] {
+        var values = values
+        if type == "s3", values["provider"]?.lowercased() == "mega", (values["endpoint"] ?? "").isEmpty,
+           let region = values["region"], !region.isEmpty {
+            values["endpoint"] = "s3.\(region).megas4.com"
+        }
+        return values
+    }
+
+    /// Every check on a keychain-backed remote that needs no rclone.conf read.
+    /// `secret == nil` means "unchanged" (an in-place edit).
+    private static func keychainRemoteError(
+        name: String, type: String, values: [String: String], secret: String?
+    ) -> String? {
+        guard KeychainSecretStore.isValidAccount(name) else {
+            return "a keychain-backed remote name may only contain letters, digits and _"
+        }
+        guard let allowed = keychainRemoteOptions[type] else { return "type must be s3 or b2" }
+        for (key, value) in values {
+            guard allowed.contains(key) else { return "option \(key) is not supported for a \(type) remote" }
+            guard !value.contains("\n"), !value.contains("\r") else {
+                return "option \(key) must not contain a line break"
+            }
+        }
+        if let endpoint = values["endpoint"], endpoint.contains("://"),
+           !endpoint.lowercased().hasPrefix("https://") {
+            return "endpoint must use https"
+        }
+        if let secret, secret.isEmpty || secret.contains("\n") || secret.contains("\r") {
+            return "the secret must be one non-empty line"
+        }
+        return nil
+    }
+
+    /// The wizard keeps the secret in `values` like any password field; pull it
+    /// out (and the marker read back on edit) so it can only go to the keychain.
+    private static func splitKeychainSecret(_ config: RemoteConfiguration) -> (values: [String: String], secret: String) {
+        var values = config.values.filter { !$0.value.isEmpty }
+        let secret = config.provider.secretKey.flatMap { values.removeValue(forKey: $0) } ?? ""
+        values.removeValue(forKey: keychainMarker)
+        return (values, secret)
+    }
+
+    private func appendSection(_ section: String, existing: String) throws {
+        let fm = FileManager.default
+        try fm.createDirectory(
+            atPath: (configPath as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
+        if !fm.fileExists(atPath: configPath) {
+            guard fm.createFile(atPath: configPath, contents: nil, attributes: [.posixPermissions: 0o600]) else {
+                throw ConfigError.configWriteFailed
+            }
+        }
+        let separator = existing.isEmpty ? "" : (existing.hasSuffix("\n") ? "\n" : "\n\n")
+        guard let handle = FileHandle(forWritingAtPath: configPath) else { throw ConfigError.configWriteFailed }
+        defer { try? handle.close() }
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data((separator + section + "\n").utf8))
     }
 
     /// Test connection to a remote path (e.g. "synology:" or "synology:Kaiju")
@@ -297,6 +573,12 @@ final class RcloneConfigService {
 
                 process.executableURL = URL(fileURLWithPath: rclonePath)
                 let remote = remotePath.contains(":") ? remotePath : "\(remotePath):"
+                var keychainError = ""
+                guard let environment = self.processEnvironment(forRemote: remote, log: { keychainError = $0 }) else {
+                    continuation.resume(returning: .failure(.connectionFailed(keychainError)))
+                    return
+                }
+                process.environment = environment
                 var args = ["lsd", remote, "--contimeout", "10s"]
                 if skipCert {
                     args.append("--no-check-certificate")
@@ -504,6 +786,12 @@ final class RcloneConfigService {
 
                 process.executableURL = URL(fileURLWithPath: rclonePath)
                 let remotePath = remote.hasSuffix(":") ? remote : "\(remote):"
+                var keychainError = ""
+                guard let environment = self.processEnvironment(forRemote: remotePath, log: { keychainError = $0 }) else {
+                    continuation.resume(returning: .failure(.connectionFailed(keychainError)))
+                    return
+                }
+                process.environment = environment
                 let remoteName = remote.replacingOccurrences(of: ":", with: "")
                 let skipCert = self.readRemoteConfig(name: remoteName)?.values["no_check_certificate"] == "true"
                 var args = ["lsd", remotePath]
@@ -563,6 +851,8 @@ final class RcloneConfigService {
         case oauthFailed(String)
         case tokenExtractionFailed
         case configWriteFailed
+        case invalidRemote(String)
+        case keychainFailed(String)
 
         var errorDescription: String? {
             switch self {
@@ -580,6 +870,10 @@ final class RcloneConfigService {
                 return "Failed to extract authentication token"
             case .configWriteFailed:
                 return "Failed to write rclone configuration"
+            case .invalidRemote(let reason):
+                return "Invalid remote: \(reason)"
+            case .keychainFailed(let reason):
+                return "Keychain: \(reason)"
             }
         }
     }

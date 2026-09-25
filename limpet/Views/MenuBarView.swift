@@ -42,6 +42,16 @@ struct MenuBarView: View {
                 .font(.caption)
                 .foregroundColor(.secondary)
 
+            // A keychain-backed profile is waiting for the login keychain to be
+            // unlocked; only this button may raise the unlock dialog.
+            if syncManager.isKeychainAccessNeeded {
+                Button(action: { syncManager.allowKeychainAccess() }) {
+                    Label("Allow keychain access", systemImage: "lock.fill")
+                        .font(.system(size: 11))
+                }
+                .help(KeychainSecretStore.lockedMessage)
+            }
+
             ForEach(syncManager.profileStore.profiles) { profile in
                 HStack(spacing: 8) {
                     // Status indicator - show pause icon when paused
@@ -81,6 +91,17 @@ struct MenuBarView: View {
 
                     // Action buttons (order: settings, mute, folder, pause/play)
                     HStack(spacing: 4) {
+                        // Delete limit reached: this profile is stopped until cleared.
+                        if syncManager.isDeleteLimitReached(for: profile) {
+                            Button(action: { syncManager.clearDeleteLimit(for: profile) }) {
+                                Image(systemName: "exclamationmark.octagon.fill")
+                                    .font(.system(size: 10))
+                                    .foregroundColor(.red)
+                            }
+                            .buttonStyle(.plain)
+                            .help("Delete limit reached: sync stopped. Check the remote, then click to clear the limit and sync again. Each clear allows one more batch of deletions up to the limit")
+                        }
+
                         // Settings button - opens profile settings
                         Button(action: { openSettingsForProfile(profile.id) }) {
                             Image(systemName: "gearshape")
