@@ -66,6 +66,7 @@ enum ConfigSelfTest {
             testGeneratedScriptText,
             testGeneratedPlistShape,
             testMissingSourceIsNotCreated,
+            testShimQuotesHostilePath,
             testTransfersChangeReinstalls,
             testTranslocatedAppRefused,
             testInstallRefusesNonOwnedShim,
@@ -1185,7 +1186,7 @@ enum ConfigSelfTest {
             return report("AC-CLI4", "shim-install-idempotent-nonclobber", false, "(install failed on an absent shim path)")
         }
         guard let contents = try? String(contentsOfFile: shimPath, encoding: .utf8),
-              contents.contains("exec \"/tmp/fake-limpet-binary\" \"$@\"") else {
+              contents.contains("exec '/tmp/fake-limpet-binary' \"$@\"") else {
             return report("AC-CLI4", "shim-install-idempotent-nonclobber", false, "(shim content missing exec line)")
         }
         guard let attrs = try? FileManager.default.attributesOfItem(atPath: shimPath),
@@ -1425,6 +1426,49 @@ enum ConfigSelfTest {
     }
 
     // MARK: - AC-W3 — generated launchd plist shape (limpet-plan.md L3(c))
+
+    // MARK: - AC-W8 — the shim passes a hostile executable path through literally
+
+    /// The shim is what every LaunchAgent executes, so a path containing shell
+    /// metacharacters must neither break it nor be expanded. Runs the generated shim
+    /// with /bin/sh against a fake executable inside such a directory.
+    private static func testShimQuotesHostilePath() -> Bool {
+        let fm = FileManager.default
+        let root = (selfTestRoot as NSString).appendingPathComponent("shim-quote")
+        try? fm.removeItem(atPath: root)
+        let marker = (root as NSString).appendingPathComponent("expanded")
+        let hostileDir = (root as NSString).appendingPathComponent("a\"b$(touch \(marker))`x`c'd")
+        let fakeExe = (hostileDir as NSString).appendingPathComponent("limpet")
+        let shim = (root as NSString).appendingPathComponent("limpet-shim")
+        do {
+            try fm.createDirectory(atPath: hostileDir, withIntermediateDirectories: true)
+            try "#!/bin/sh\nprintf '%s|' \"$@\"\n".write(toFile: fakeExe, atomically: true, encoding: .utf8)
+            try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeExe)
+        } catch {
+            return report("AC-W8", "shim-quotes-hostile-path", false, "(fixture setup failed: \(error))")
+        }
+        guard CLIShimInstaller.install(executablePath: fakeExe, shimPath: shim) else {
+            return report("AC-W8", "shim-quotes-hostile-path", false, "(shim was not written)")
+        }
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/sh")
+        process.arguments = [shim, "watch", "ab12cd34"]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        do { try process.run() } catch {
+            return report("AC-W8", "shim-quotes-hostile-path", false, "(could not run shim: \(error))")
+        }
+        process.waitUntilExit()
+        let output = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        guard process.terminationStatus == 0, output == "watch|ab12cd34|" else {
+            return report("AC-W8", "shim-quotes-hostile-path", false,
+                          "(status \(process.terminationStatus), output \(output.debugDescription))")
+        }
+        guard !fm.fileExists(atPath: marker) else {
+            return report("AC-W8", "shim-quotes-hostile-path", false, "(command substitution in the path was executed)")
+        }
+        return report("AC-W8", "shim-quotes-hostile-path", true)
+    }
 
     // MARK: - AC-W4 — a missing localToRemote source is refused, never created
 

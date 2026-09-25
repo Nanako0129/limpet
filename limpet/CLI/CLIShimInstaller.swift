@@ -67,12 +67,16 @@ enum CLIShimInstaller {
         // bare — a bare launch starts the GUI/menu-bar app, which is surprising
         // for a command typed in a terminal. `open -a limpet` remains the way
         // to launch the app. Any subcommand is forwarded verbatim.
+        // Single-quoted for the shell: inside '...' nothing is special, so a path with
+        // `"`, `$` or backticks is passed through literally instead of breaking the
+        // shim or being expanded. The shim is what each LaunchAgent executes.
+        let quoted = shellSingleQuoted(executablePath)
         let script = """
         \(ownershipMarker)
         if [ "$#" -eq 0 ]; then
-          exec "\(executablePath)" help
+          exec \(quoted) help
         fi
-        exec "\(executablePath)" "$@"
+        exec \(quoted) "$@"
         """
 
         do {
@@ -83,6 +87,11 @@ enum CLIShimInstaller {
             LimpetSettings.debugLog("[CLIShimInstaller] Failed to write shim at \(shimPath): \(error)")
             return false
         }
+    }
+
+    /// POSIX single-quoting: wrap in '...' and turn each embedded `'` into `'\\''`.
+    static func shellSingleQuoted(_ value: String) -> String {
+        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 
     /// Whether the file at `path` carries limpet's ownership marker as its
