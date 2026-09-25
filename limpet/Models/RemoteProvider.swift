@@ -193,7 +193,7 @@ enum RemoteProvider: String, Codable, CaseIterable, Identifiable {
                 ProviderField(key: "access_key_id", label: "Access Key ID", type: .text),
                 ProviderField(key: "secret_access_key", label: "Secret Access Key", type: .password,
                               helpText: "Stored in your login keychain, never in rclone.conf. "
-                                + "When editing, enter it again."),
+                                + "When editing, leave it empty to keep the stored one."),
                 ProviderField(key: "endpoint", label: "Endpoint", type: .text,
                               placeholder: "s3.ap-tokyo-1.megas4.com",
                               helpText: "https only. Leave empty for Amazon S3.",
@@ -205,8 +205,9 @@ enum RemoteProvider: String, Codable, CaseIterable, Identifiable {
             return [
                 ProviderField(key: "account", label: "Application Key ID", type: .text),
                 ProviderField(key: "key", label: "Application Key", type: .password,
-                              helpText: "Stored in your login keychain, never in rclone.conf. Use a "
-                                + "bucket-scoped key without the deleteFiles capability.")
+                              helpText: "Stored in your login keychain, never in rclone.conf; when editing, "
+                                + "leave it empty to keep the stored one. Use a bucket-scoped key without "
+                                + "the deleteFiles capability.")
             ]
         }
     }

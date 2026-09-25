@@ -99,6 +99,7 @@ enum ConfigSelfTest {
             testRefusedDropQuarantined,
             testOverlapOnlyAmongEnabledInstalled,
             testProfileChangeRefusedBeforePersist,
+            testKeychainRemoteEditDeleteConsistency,
         ]
 
         for check in checks {
@@ -2672,8 +2673,7 @@ enum ConfigSelfTest {
                     "--region", "ap-tokyo-1", "--access-key-id", "AKID"]
         guard case .success(.remoteAdd(let request)) = LimpetCLI.parse(argv),
               request == RemoteAddRequest(name: "limpet_test_s4", type: "s3", values: [
-                "access_key_id": "AKID", "provider": "Mega", "region": "ap-tokyo-1",
-                "endpoint": "s3.ap-tokyo-1.megas4.com"]) else {
+                "access_key_id": "AKID", "provider": "Mega", "region": "ap-tokyo-1"]) else {
             return report(id, slug, false, "(remote add did not parse as expected)")
         }
         for bad in [argv + ["--secret", "x"], argv + ["--secret-access-key=x"], ["remote", "add", "n", "--type", "s3"],
@@ -2711,7 +2711,7 @@ enum ConfigSelfTest {
             return report(id, slug, false, "(fixture setup failed)")
         }
         let confPath = "\(dir)/rclone.conf"
-        let original = "[s4]\ntype = s3\nprovider = Mega\naccess_key_id = AKID\nlimpet_keychain = true\n\n"
+        let original = "[s4]\ntype = s3\naccess_key_id = AKID\nprovider = Mega\nlimpet_keychain = true\n\n"
             + "[bb]\ntype = b2\naccount = KEYID\nlimpet_keychain = true\n"
         let rcloneStub = "\(dir)/rclone-stub"
         try? original.write(toFile: confPath, atomically: true, encoding: .utf8)
@@ -2729,12 +2729,13 @@ enum ConfigSelfTest {
             return report(id, slug, false, "(s3/b2 section was not read back as s3/b2)")
         }
 
-        // Editing without re-entering the secret changes nothing (checked before the delete).
-        if (try? service.updateRemote(s4)) != nil ||
+        // Editing without re-entering the secret rewrites the section in place
+        // (here: to identical text), never runs rclone and never touches the keychain.
+        if (try? service.updateRemote(s4)) == nil ||
             (try? String(contentsOfFile: confPath, encoding: .utf8)) != original ||
             FileManager.default.fileExists(atPath: "\(dir)/rclone-ran") ||
-            FileManager.default.fileExists(atPath: "\(dir)/argv") {
-            return report(id, slug, false, "(update without a secret was not refused before touching rclone.conf)")
+            FileManager.default.fileExists(atPath: "\(dir)/calls") {
+            return report(id, slug, false, "(an edit without a secret did not stay in place and off the keychain)")
         }
 
         // The wizard's addRemote takes the keychain path: secret out of rclone.conf,
@@ -3188,6 +3189,94 @@ enum ConfigSelfTest {
               SyncWatchDaemon.refusalReason(
                 for: disabledOverlap, profilesDirectory: dir, isInstalled: { $0.id == running.id }) != nil else {
             return report(id, slug, false, "(a watcher whose copy says disabled skipped the overlap rule)")
+        }
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L4-20 — keychain remote: edit in place, verified add, never half-deleted
+
+    /// Review findings 5, 7 and 9, all through the fake `security`.
+    private static func testKeychainRemoteEditDeleteConsistency() -> Bool {
+        let id = "AC-L4-20", slug = "keychain-remote-edit-delete-consistency"
+        let fm = FileManager.default
+        let dir = "\(selfTestRoot)/ac-l4-20"
+        try? fm.removeItem(atPath: dir)
+        guard let stub = makeSecurityStub(in: dir, secret: "unused", mode: "store") else {
+            return report(id, slug, false, "(fixture setup failed)")
+        }
+        let confPath = "\(dir)/rclone.conf", rcloneStub = "\(dir)/rclone-stub"
+        try? "[before]\ntype = local\n".write(toFile: confPath, atomically: true, encoding: .utf8)
+        try? "#!/bin/sh\n[ -f \"\(dir)/rclone-fail\" ] && exit 1\nexit 0\n".write(toFile: rcloneStub, atomically: true, encoding: .utf8)
+        try? fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: rcloneStub)
+        let store = KeychainSecretStore(securityPath: stub, keychainPath: "\(dir)/fake.keychain-db")
+        let service = RcloneConfigService(configPath: confPath, rclonePath: rcloneStub, keychain: store)
+        func conf() -> String { (try? String(contentsOfFile: confPath, encoding: .utf8)) ?? "" }
+        func flag(_ name: String, _ on: Bool) {
+            if on { fm.createFile(atPath: "\(dir)/\(name)", contents: nil) } else { try? fm.removeItem(atPath: "\(dir)/\(name)") }
+        }
+
+        // Finding 9: the shared creation function derives the MEGA S4 endpoint.
+        do {
+            try service.addKeychainRemote(name: "kr", type: "s3",
+                values: ["provider": "Mega", "region": "ap-tokyo-1", "access_key_id": "AKID1"], secret: "old-secret")
+        } catch { return report(id, slug, false, "(add threw \(error))") }
+        guard conf().hasSuffix("[kr]\ntype = s3\naccess_key_id = AKID1\nendpoint = s3.ap-tokyo-1.megas4.com\n"
+                + "provider = Mega\nregion = ap-tokyo-1\nlimpet_keychain = true\n") else {
+            return report(id, slug, false, "(MEGA S4 endpoint not derived by addKeychainRemote: \(conf().debugDescription))")
+        }
+        // A section in the middle of the file, to see the edit keep its place.
+        try? ("[before]\ntype = local\n\n[kr]\ntype = s3\naccess_key_id = AKID1\nendpoint = s3.ap-tokyo-1.megas4.com\n"
+            + "provider = Mega\nregion = ap-tokyo-1\nlimpet_keychain = true\n\n[after]\ntype = local\n")
+            .write(toFile: confPath, atomically: true, encoding: .utf8)
+        guard store.read(account: "kr") == .found("old-secret") else {
+            return report(id, slug, false, "(fixture secret not stored)")
+        }
+        var edit = RemoteConfiguration(name: "kr", provider: .s3Compatible)
+        edit.values = ["provider": "Mega", "region": "ap-tokyo-1", "access_key_id": "AKID2", "limpet_keychain": "true"]
+
+        // Finding 5: a non-secret edit rewrites the section where it stands and keeps the secret.
+        do { try service.updateRemote(edit) } catch { return report(id, slug, false, "(in-place edit threw \(error))") }
+        let edited = "[before]\ntype = local\n\n[kr]\ntype = s3\naccess_key_id = AKID2\nendpoint = s3.ap-tokyo-1.megas4.com\n"
+            + "provider = Mega\nregion = ap-tokyo-1\nlimpet_keychain = true\n\n[after]\ntype = local\n"
+        guard conf() == edited, store.read(account: "kr") == .found("old-secret") else {
+            return report(id, slug, false, "(in-place edit wrong: \(conf().debugDescription))")
+        }
+        // A new secret whose add fails, or whose read-back does not match (finding 7):
+        // rclone.conf untouched, the error says to re-enter the secret.
+        edit.values["secret_access_key"] = "new-secret"
+        edit.values["access_key_id"] = "AKID3"
+        for failure in ["fail--i", "corrupt-add"] {
+            flag(failure, true)
+            defer { flag(failure, false) }
+            do {
+                try service.updateRemote(edit)
+                return report(id, slug, false, "(\(failure): update did not fail)")
+            } catch {
+                guard "\(error)".contains("re-enter"), conf() == edited else {
+                    return report(id, slug, false, "(\(failure): \(error), conf changed=\(conf() != edited))")
+                }
+            }
+        }
+        do { try service.updateRemote(edit) } catch { return report(id, slug, false, "(rotation threw \(error))") }
+        guard store.read(account: "kr") == .found("new-secret"), conf().contains("access_key_id = AKID3") else {
+            return report(id, slug, false, "(rotation did not store the new secret and update the section)")
+        }
+
+        // deleteRemote is never half-done.
+        flag("fail-delete-generic-password", true)
+        let failedDelete = (try? service.deleteRemote("kr")) == nil
+        flag("fail-delete-generic-password", false)
+        guard failedDelete, store.read(account: "kr") == .found("new-secret"), conf().contains("[kr]") else {
+            return report(id, slug, false, "(a failed item delete left a half-deleted remote)")
+        }
+        flag("rclone-fail", true)
+        let failedSection = (try? service.deleteRemote("kr")) == nil
+        flag("rclone-fail", false)
+        guard failedSection, store.read(account: "kr") == .found("new-secret") else {
+            return report(id, slug, false, "(a failed section delete did not restore the secret)")
+        }
+        guard (try? service.deleteRemote("kr")) != nil, store.read(account: "kr") == .notFound else {
+            return report(id, slug, false, "(a clean delete did not remove the item)")
         }
         return report(id, slug, true)
     }

@@ -61,10 +61,20 @@ struct KeychainSecretStore {
         let command = "add-generic-password -s \(Self.service) -a \(account) "
             + "-T \(Self.trustedApplication) -X \(hex) \"\(keychainPath)\"\n"
         switch run(["-i"], stdin: command) {
-        case .exited(0, _): return nil
+        case .exited(0, _): break
         case .exited(let status, _): return "security add-generic-password failed (exit \(status))"
         case .timedOut: return "security add-generic-password timed out"
         }
+        // `security -i`'s exit status is not trusted as proof of success (review
+        // finding 7). Its failure semantics were NOT measured beyond two cases on
+        // a throwaway keychain before keychain measurements stopped on
+        // 2026-09-26: a duplicate add exited 45, and two commands whose FIRST
+        // failed exited 0. So the item is read back and compared; the secret is
+        // never printed.
+        guard read(account: account) == .found(secret) else {
+            return "the keychain item could not be read back after adding it"
+        }
+        return nil
     }
 
     /// Rotation is delete then add (F2): an existing item's ACL is never edited.

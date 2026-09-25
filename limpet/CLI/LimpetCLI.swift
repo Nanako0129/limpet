@@ -347,10 +347,8 @@ enum LimpetCLI {
             values["provider"] = flags["--provider"]
             values["region"] = flags["--region"]
             values["endpoint"] = flags["--endpoint"]
-            // MEGA S4's endpoints are s3.<region>.megas4.com (rclone 1.75.1's own list).
-            if flags["--provider"] == "Mega", values["endpoint"] == nil, let region = flags["--region"] {
-                values["endpoint"] = "s3.\(region).megas4.com"
-            }
+            // A MEGA S4 endpoint is derived from --region by the shared creation
+            // function (RcloneConfigService.withDerivedEndpoint).
         case "b2":
             guard flags["--provider"] == nil, flags["--endpoint"] == nil, flags["--region"] == nil else {
                 return .failure(CLIUsageError(message: "error: --provider/--endpoint/--region apply to --type s3 only"))

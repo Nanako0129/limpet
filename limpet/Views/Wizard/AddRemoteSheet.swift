@@ -325,7 +325,12 @@ struct AddRemoteSheet: View {
     private var canSave: Bool {
         if isEditMode {
             guard !remoteConfig.name.isEmpty else { return false }
-            return remoteConfig.validate().filter { !$0.localizedCaseInsensitiveContains("name") }.isEmpty
+            // A keychain-backed remote keeps its stored secret when the field is left empty.
+            let secretLabel = remoteConfig.provider.requiredFields
+                .first { $0.key == remoteConfig.provider.secretKey }?.label
+            return remoteConfig.validate().filter {
+                !$0.localizedCaseInsensitiveContains("name") && !(secretLabel.map($0.hasPrefix) ?? false)
+            }.isEmpty
         }
         return remoteConfig.validate().isEmpty
     }
