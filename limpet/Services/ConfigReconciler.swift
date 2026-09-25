@@ -109,7 +109,7 @@ extension SyncManager {
             case .uninstall:
                 try uninstall(updated)
             case .reinstall:
-                try? uninstall(updated)  // cleanup; the install below regenerates everything
+                try? uninstall(current)  // cleanup; the install below regenerates everything
                 try install(updated)
             }
         } catch {
