@@ -86,10 +86,16 @@ enum SyncWatchDaemon {
             sourceExists: { FileManager.default.fileExists(atPath: profile.localSyncPath) },
             runChild: { completion in
                 DispatchQueue.global(qos: .utility).async {
-                    let code = runChildProcess(
-                        scriptPath: SyncProfile.sharedScriptPath,
-                        configPath: profile.configPath
-                    )
+                    let code = runSyncChild(
+                        profile: profile,
+                        service: .shared,
+                        log: { appendProfileLogLine($0, profile: profile) },
+                        spawn: { environment in
+                            runChildProcess(
+                                scriptPath: SyncProfile.sharedScriptPath,
+                                configPath: profile.configPath,
+                                environment: environment)
+                        })
                     DispatchQueue.main.async { completion(code) }
                 }
             },
@@ -112,15 +118,35 @@ enum SyncWatchDaemon {
             profile, among: ProfileStore.profilesOnDisk(in: profilesDirectory))
     }
 
+    /// What `runSyncChild` returns when the remote's secret could not be read.
+    static let secretUnavailableExitCode: Int32 = 78  // EX_CONFIG
+
+    /// F3 (limpet-plan.md L4): the sync script child — and therefore rclone —
+    /// starts only with the environment the secret-injection helper returns.
+    /// On a keychain failure the helper has already logged its one line and
+    /// nothing is spawned. The script itself never touches the keychain.
+    static func runSyncChild(
+        profile: SyncProfile,
+        service: RcloneConfigService,
+        log: (String) -> Void,
+        spawn: ([String: String]) -> Int32
+    ) -> Int32 {
+        guard let environment = service.processEnvironment(forRemote: profile.rcloneRemote, log: log) else {
+            return secretUnavailableExitCode
+        }
+        return spawn(environment)
+    }
+
     /// Run the shared sync script as a child. stdout/stderr go to
     /// `/dev/null` — the script already tees rclone's output into the
     /// profile log itself (`tee -a "$LOG_FILE"`), so piping the child's
     /// stdout through here too would duplicate every line (limpet-plan.md
     /// v2→v3 disposition #6).
-    private static func runChildProcess(scriptPath: String, configPath: String) -> Int32 {
+    private static func runChildProcess(scriptPath: String, configPath: String, environment: [String: String]) -> Int32 {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/bash")
         process.arguments = [scriptPath, configPath]
+        process.environment = environment
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
         do {

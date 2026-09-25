@@ -14,6 +14,14 @@ struct ProfileAssignment: Equatable {
     let value: String
 }
 
+/// `limpet remote add` arguments. The secret is deliberately NOT here: it is
+/// never an argument, only read from stdin (limpet-plan.md L4 F2).
+struct RemoteAddRequest: Equatable {
+    let name: String
+    let type: String
+    let values: [String: String]
+}
+
 /// Parsed CLI subcommand — the pure, testable result of `LimpetCLI.parse`.
 enum CLICommand: Equatable {
     case doctor
@@ -31,6 +39,7 @@ enum CLICommand: Equatable {
     case profileDelete(String)
     case profileSet(target: String, assignments: [ProfileAssignment])
     case profileSetEnabled(target: String, enabled: Bool)
+    case remoteAdd(RemoteAddRequest)
     case help
 }
 
@@ -58,8 +67,10 @@ struct DoctorCheck: Equatable {
 /// no real `Process`, `FileManager`, or stdio needed to test dispatch logic.
 struct CLIEnvironment {
     /// Run rclone with `args`, hard-killed after `timeout` seconds if still
-    /// running. Returns `(exitCode, stdout, stderr)`.
-    var runRclone: (_ args: [String], _ timeout: TimeInterval) -> (Int32, String, String)
+    /// running. Returns `(exitCode, stdout, stderr)`. `remote` names the remote
+    /// the command touches, so a keychain-backed one gets its secret through
+    /// the F3 helper (`nil` for `version`/`listremotes`).
+    var runRclone: (_ args: [String], _ remote: String?, _ timeout: TimeInterval) -> (Int32, String, String)
     /// Read every profile from the file-authoritative profiles directory.
     var readProfiles: () -> [SyncProfile]
     var fileExists: (String) -> Bool
@@ -82,6 +93,12 @@ struct CLIEnvironment {
     var readStdin: () -> String?
     /// Read a file's contents as UTF-8 text. `nil` if missing/unreadable.
     var readFile: (String) -> String?
+    /// Read a secret: a no-echo prompt on a TTY, else one line of stdin.
+    /// Never from argv (limpet-plan.md L4 F2).
+    var readSecret: (_ prompt: String) -> String?
+    /// `RcloneConfigService.addKeychainRemote` — the one creation path shared
+    /// with the wizard. Returns an error message or `nil`.
+    var addKeychainRemote: (_ name: String, _ type: String, _ values: [String: String], _ secret: String) -> String?
     var stdout: (String) -> Void
     var stderr: (String) -> Void
 }
@@ -119,6 +136,9 @@ enum LimpetCLI {
                                    Edit fields on an existing profile and reconcile
       install <name|id>            Install an enabled profile's launchd agent (idempotent)
       reinstall <name|id>          Regenerate script+plist and reinstall the agent
+      remote add <name> --type s3|b2 --access-key-id <id> [--provider <p>] [--endpoint <https url>] [--region <r>]
+                                   Add a remote whose secret lives in the login keychain;
+                                   the secret is read from stdin (no-echo prompt on a terminal)
 
     Operate:
       sync <name|id>                          Ask the profile's watcher to sync now (returns immediately)
@@ -211,6 +231,9 @@ enum LimpetCLI {
         case "profile":
             return parseProfile(rest)
 
+        case "remote":
+            return parseRemote(rest)
+
         case "help", "-h", "--help":
             return .success(.help)
 
@@ -281,6 +304,50 @@ enum LimpetCLI {
         }
     }
 
+    /// Parse `remote add <name> --type s3|b2 --access-key-id <id> [--provider
+    /// <p>] [--endpoint <e>] [--region <r>]`. There is no flag for the secret,
+    /// and a flag that looks like one is refused with a pointer to stdin.
+    private static func parseRemote(_ rest: [String]) -> Result<CLICommand, CLIUsageError> {
+        let usage = CLIUsageError(message: "usage: limpet remote add <name> --type s3|b2 --access-key-id <id> "
+            + "[--provider <p>] [--endpoint <https url>] [--region <r>]  (the secret is read from stdin)")
+        guard rest.first == "add", rest.count >= 2, !rest[1].hasPrefix("-") else { return .failure(usage) }
+        let name = rest[1]
+        var flags: [String: String] = [:]
+        var idx = 2
+        while idx < rest.count {
+            let flag = rest[idx]
+            if flag.lowercased().contains("secret") || flag == "--key" || flag == "--password" {
+                return .failure(CLIUsageError(
+                    message: "error: the secret is never an argument; pipe it on stdin or type it at the prompt"))
+            }
+            guard ["--type", "--provider", "--endpoint", "--region", "--access-key-id"].contains(flag),
+                  idx + 1 < rest.count, flags[flag] == nil else { return .failure(usage) }
+            flags[flag] = rest[idx + 1]
+            idx += 2
+        }
+        guard let type = flags["--type"], let keyId = flags["--access-key-id"] else { return .failure(usage) }
+        var values: [String: String] = [:]
+        switch type {
+        case "s3":
+            values["access_key_id"] = keyId
+            values["provider"] = flags["--provider"]
+            values["region"] = flags["--region"]
+            values["endpoint"] = flags["--endpoint"]
+            // MEGA S4's endpoints are s3.<region>.megas4.com (rclone 1.75.1's own list).
+            if flags["--provider"] == "Mega", values["endpoint"] == nil, let region = flags["--region"] {
+                values["endpoint"] = "s3.\(region).megas4.com"
+            }
+        case "b2":
+            guard flags["--provider"] == nil, flags["--endpoint"] == nil, flags["--region"] == nil else {
+                return .failure(CLIUsageError(message: "error: --provider/--endpoint/--region apply to --type s3 only"))
+            }
+            values["account"] = keyId
+        default:
+            return .failure(usage)
+        }
+        return .success(.remoteAdd(RemoteAddRequest(name: name, type: type, values: values)))
+    }
+
     /// Parse + dispatch, printing usage via `env.stderr` on a parse failure.
     /// The single entry point both `dispatch` (real env) and the self-test
     /// (fake env) exercise for the unknown/absent-subcommand case.
@@ -326,6 +393,8 @@ enum LimpetCLI {
             return runProfileSet(target, assignments: assignments, env: env)
         case .profileSetEnabled(let target, let enabled):
             return runProfileSetEnabled(target, enabled: enabled, env: env)
+        case .remoteAdd(let request):
+            return runRemoteAdd(request, env: env)
         case .help:
             env.stdout(Self.usage + "\n")
             return 0
@@ -358,7 +427,7 @@ enum LimpetCLI {
     static func doctorChecks(env: CLIEnvironment) -> [DoctorCheck] {
         var checks: [DoctorCheck] = []
 
-        let (rcloneExit, rcloneOut, _) = env.runRclone(["version"], 5)
+        let (rcloneExit, rcloneOut, _) = env.runRclone(["version"], nil, 5)
         if rcloneExit == 0 {
             let version = rcloneOut.split(separator: "\n").first.map(String.init) ?? "unknown"
             checks.append(DoctorCheck(name: "rclone", status: .ok, detail: version))
@@ -408,7 +477,7 @@ enum LimpetCLI {
                 : DoctorCheck(name: label, status: .ok, detail: "no stale lock")
         )
 
-        let (remoteExit, _, remoteErr) = env.runRclone(["lsd", profile.fullRemotePath], 5)
+        let (remoteExit, _, remoteErr) = env.runRclone(["lsd", profile.fullRemotePath], profile.fullRemotePath, 5)
         checks.append(
             remoteExit == 0
                 ? DoctorCheck(name: label, status: .ok, detail: "remote reachable")
@@ -427,7 +496,7 @@ enum LimpetCLI {
         }
 
         // Prints the remote name to the user's own terminal — fine.
-        let (exit, _, err) = env.runRclone(["lsd", profile.fullRemotePath], 10)
+        let (exit, _, err) = env.runRclone(["lsd", profile.fullRemotePath], profile.fullRemotePath, 10)
         if exit == 0 {
             env.stdout("reachable: \(profile.fullRemotePath)\n")
             return 0
@@ -470,7 +539,7 @@ enum LimpetCLI {
     // MARK: - listremotes
 
     private static func runListRemotes(env: CLIEnvironment) -> Int32 {
-        let (exit, out, err) = env.runRclone(["listremotes"], 10)
+        let (exit, out, err) = env.runRclone(["listremotes"], nil, 10)
         if exit == 0 {
             env.stdout(out)
             return 0
@@ -909,6 +978,27 @@ enum LimpetCLI {
         return nil
     }
 
+    // MARK: - remote add
+
+    /// Create a keychain-backed remote through the SAME function the wizard
+    /// uses (`RcloneConfigService.addKeychainRemote`). The secret comes from
+    /// `readSecret` only and is never printed.
+    private static func runRemoteAdd(_ request: RemoteAddRequest, env: CLIEnvironment) -> Int32 {
+        guard let secret = env.readSecret("Secret for \(request.name): "), !secret.isEmpty else {
+            env.stderr("error: no secret given (type it at the prompt, or pipe one line on stdin)\n")
+            return 66  // EX_NOINPUT
+        }
+        if let error = env.addKeychainRemote(request.name, request.type, request.values, secret) {
+            env.stderr("error: \(error)\n")
+            return 1
+        }
+        env.stdout("added \(request.type) remote \(request.name): secret stored in the login keychain "
+            + "(service \(KeychainSecretStore.service)), rclone.conf has no secret\n")
+        if request.type == "b2" {
+            env.stdout("note: use a bucket-scoped application key without the deleteFiles capability\n")
+        }
+        return 0
+    }
 }
 
 // MARK: - Production environment
@@ -920,7 +1010,19 @@ extension CLIEnvironment {
     /// `ProfileStore.profilesOnDisk(in:)` file read.
     static func production() -> CLIEnvironment {
         CLIEnvironment(
-            runRclone: { args, timeout in CLIEnvironment.runRcloneProcess(args: args, timeout: timeout) },
+            runRclone: { args, remote, timeout in
+                var environment = ProcessInfo.processInfo.environment
+                if let remote {
+                    // F3: never start rclone without the remote's secret.
+                    var keychainError = ""
+                    guard let merged = RcloneConfigService.shared.processEnvironment(
+                        forRemote: remote, log: { keychainError = $0 }) else {
+                        return (78, "", keychainError)  // EX_CONFIG
+                    }
+                    environment = merged
+                }
+                return CLIEnvironment.runRcloneProcess(args: args, environment: environment, timeout: timeout)
+            },
             readProfiles: { ProfileStore.profilesOnDisk(in: SyncProfile.configDirectory) },
             fileExists: { FileManager.default.fileExists(atPath: $0) },
             runLaunchctl: { args in CLIEnvironment.runProcess(launchPath: "/bin/launchctl", args: args) },
@@ -949,6 +1051,21 @@ extension CLIEnvironment {
                 return String(data: data, encoding: .utf8)
             },
             readFile: { try? String(contentsOfFile: $0, encoding: .utf8) },
+            readSecret: { prompt in
+                guard isatty(STDIN_FILENO) != 0 else { return readLine(strippingNewline: true) }
+                var buffer = [CChar](repeating: 0, count: 1024)
+                defer { for i in buffer.indices { buffer[i] = 0 } }
+                guard readpassphrase(prompt, &buffer, buffer.count, RPP_ECHO_OFF) != nil else { return nil }
+                return String(cString: buffer)
+            },
+            addKeychainRemote: { name, type, values, secret in
+                do {
+                    try RcloneConfigService.shared.addKeychainRemote(name: name, type: type, values: values, secret: secret)
+                    return nil
+                } catch {
+                    return error.localizedDescription
+                }
+            },
             stdout: { FileHandle.standardOutput.write(Data($0.utf8)) },
             stderr: { FileHandle.standardError.write(Data($0.utf8)) }
         )
@@ -957,7 +1074,9 @@ extension CLIEnvironment {
     /// Run rclone at its located path with a hard process-level watchdog —
     /// mirrors `RcloneLocator.resolveViaLoginShell`'s timeout pattern, since
     /// SMB/WebDAV remotes can hang past rclone's own `--timeout`.
-    fileprivate static func runRcloneProcess(args: [String], timeout: TimeInterval) -> (Int32, String, String) {
+    fileprivate static func runRcloneProcess(
+        args: [String], environment: [String: String], timeout: TimeInterval
+    ) -> (Int32, String, String) {
         guard let rclonePath = RcloneLocator.resolve() else {
             return (127, "", "rclone not found")
         }
@@ -965,6 +1084,7 @@ extension CLIEnvironment {
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: rclonePath)
         proc.arguments = args
+        proc.environment = environment
         let stdoutPipe = Pipe()
         let stderrPipe = Pipe()
         proc.standardOutput = stdoutPipe

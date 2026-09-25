@@ -1069,6 +1069,8 @@ struct ProfileDetailView: View {
         foldersError = nil
         availableFolders = []
 
+        // Captured on the main thread (CLAUDE.md Critical Rule #1).
+        let capturedRemote = rcloneRemote
         DispatchQueue.global(qos: .userInitiated).async {
             let process = Process()
             let pipe = Pipe()
@@ -1084,9 +1086,19 @@ struct ProfileDetailView: View {
             }
 
             process.executableURL = URL(fileURLWithPath: path)
-            let remoteName = rcloneRemote.replacingOccurrences(of: ":", with: "")
+            var keychainError = ""
+            guard let environment = RcloneConfigService.shared.processEnvironment(
+                forRemote: capturedRemote, log: { keychainError = $0 }) else {
+                DispatchQueue.main.async {
+                    isLoadingFolders = false
+                    foldersError = keychainError
+                }
+                return
+            }
+            process.environment = environment
+            let remoteName = capturedRemote.replacingOccurrences(of: ":", with: "")
             let skipCert = RcloneConfigService.shared.readRemoteConfig(name: remoteName)?.values["no_check_certificate"] == "true"
-            var args = ["lsd", "\(rcloneRemote):"]
+            var args = ["lsd", "\(capturedRemote):"]
             if skipCert {
                 args.append("--no-check-certificate")
             }
@@ -1514,8 +1526,15 @@ struct RemoteFolderBrowserSheet: View {
                 DispatchQueue.main.async { self.isLoading = false; self.errorMessage = "rclone not found" }
                 return
             }
+            var keychainError = ""
+            guard let environment = RcloneConfigService.shared.processEnvironment(
+                forRemote: remote, log: { keychainError = $0 }) else {
+                DispatchQueue.main.async { self.isLoading = false; self.errorMessage = keychainError }
+                return
+            }
             let proc = Process()
             proc.executableURL = URL(fileURLWithPath: rclone)
+            proc.environment = environment
             let skipCert = RcloneConfigService.shared.readRemoteConfig(name: remote)?.values["no_check_certificate"] == "true"
             var args = ["lsf", "\(remote):\(path)", "--dirs-only", "--contimeout", "5s", "--timeout", "15s"]
             if skipCert { args.append("--no-check-certificate") }

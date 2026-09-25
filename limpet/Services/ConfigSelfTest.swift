@@ -82,6 +82,10 @@ enum ConfigSelfTest {
             testRefusedAtInstall,
             testOverlapRefused,
             testWatcherRefusesBeforeEveryRun,
+            testKeychainRemoteCreatedThroughSecurityOnly,
+            testKeychainRemoteRefusals,
+            testSecretInjectionHelper,
+            testCLIRemoteAdd,
         ]
 
         for check in checks {
@@ -718,7 +722,7 @@ enum ConfigSelfTest {
     /// Build a `CLIEnvironment` with inert defaults, overridable per test —
     /// mirrors `sampleProfile`'s role for the Enabler-1 tests above.
     private static func fakeCLIEnvironment(
-        runRclone: @escaping (_ args: [String], _ timeout: TimeInterval) -> (Int32, String, String) = { _, _ in (0, "", "") },
+        runRclone: @escaping (_ args: [String], _ remote: String?, _ timeout: TimeInterval) -> (Int32, String, String) = { _, _, _ in (0, "", "") },
         readProfiles: @escaping () -> [SyncProfile] = { [] },
         fileExists: @escaping (String) -> Bool = { _ in false },
         runLaunchctl: @escaping (_ args: [String]) -> (Int32, String) = { _ in (0, "") },
@@ -729,6 +733,8 @@ enum ConfigSelfTest {
         deleteProfileFile: @escaping (SyncProfile) -> Void = { _ in },
         readStdin: @escaping () -> String? = { nil },
         readFile: @escaping (String) -> String? = { _ in nil },
+        readSecret: @escaping (String) -> String? = { _ in nil },
+        addKeychainRemote: @escaping (String, String, [String: String], String) -> String? = { _, _, _, _ in nil },
         stdout: @escaping (String) -> Void = { _ in },
         stderr: @escaping (String) -> Void = { _ in }
     ) -> CLIEnvironment {
@@ -744,6 +750,8 @@ enum ConfigSelfTest {
             deleteProfileFile: deleteProfileFile,
             readStdin: readStdin,
             readFile: readFile,
+            readSecret: readSecret,
+            addKeychainRemote: addKeychainRemote,
             stdout: stdout,
             stderr: stderr
         )
@@ -1053,7 +1061,7 @@ enum ConfigSelfTest {
         }
 
         var capturedArgs: [String] = []
-        let listEnv = fakeCLIEnvironment(runRclone: { args, _ in
+        let listEnv = fakeCLIEnvironment(runRclone: { args, _, _ in
             capturedArgs = args
             return (0, "remote1:\nremote2:\n", "")
         })
@@ -1070,7 +1078,7 @@ enum ConfigSelfTest {
     private static func testDoctorPureChecks() -> Bool {
         // rclone present + schema present + no profiles → no .fail check.
         let healthyEnv = fakeCLIEnvironment(
-            runRclone: { args, _ in args.first == "version" ? (0, "rclone v1.66.0", "") : (0, "", "") },
+            runRclone: { args, _, _ in args.first == "version" ? (0, "rclone v1.66.0", "") : (0, "", "") },
             readProfiles: { [] },
             schemaFilesPresent: { true }
         )
@@ -1083,7 +1091,7 @@ enum ConfigSelfTest {
         }
 
         // rclone absent → .fail, exit non-zero.
-        let noRcloneEnv = fakeCLIEnvironment(runRclone: { _, _ in (127, "", "not found") })
+        let noRcloneEnv = fakeCLIEnvironment(runRclone: { _, _, _ in (127, "", "not found") })
         let noRcloneChecks = LimpetCLI.doctorChecks(env: noRcloneEnv)
         guard noRcloneChecks.contains(where: { $0.name == "rclone" && $0.status == .fail }) else {
             return report("AC-CLI2", "doctor-pure-checks", false, "(rclone-absent env did not produce a .fail rclone check)")
@@ -1094,7 +1102,7 @@ enum ConfigSelfTest {
 
         // schema missing → .warn only, exit still 0.
         let noSchemaEnv = fakeCLIEnvironment(
-            runRclone: { args, _ in args.first == "version" ? (0, "rclone v1.66.0", "") : (0, "", "") },
+            runRclone: { args, _, _ in args.first == "version" ? (0, "rclone v1.66.0", "") : (0, "", "") },
             schemaFilesPresent: { false }
         )
         let noSchemaChecks = LimpetCLI.doctorChecks(env: noSchemaEnv)
@@ -1108,7 +1116,7 @@ enum ConfigSelfTest {
         // Per-profile: derived config missing → .fail, exit non-zero.
         let profile = sampleProfile(isEnabled: false)
         let missingConfigEnv = fakeCLIEnvironment(
-            runRclone: { args, _ in args.first == "version" ? (0, "rclone v1.66.0", "") : (0, "", "") },
+            runRclone: { args, _, _ in args.first == "version" ? (0, "rclone v1.66.0", "") : (0, "", "") },
             readProfiles: { [profile] },
             fileExists: { _ in false },
             schemaFilesPresent: { true }
@@ -1123,7 +1131,7 @@ enum ConfigSelfTest {
 
         // Derived config present → no .fail for that profile.
         let presentConfigEnv = fakeCLIEnvironment(
-            runRclone: { args, _ in args.first == "version" ? (0, "rclone v1.66.0", "") : (0, "", "") },
+            runRclone: { args, _, _ in args.first == "version" ? (0, "rclone v1.66.0", "") : (0, "", "") },
             readProfiles: { [profile] },
             fileExists: { path in path == profile.configPath },
             schemaFilesPresent: { true }
@@ -1137,7 +1145,7 @@ enum ConfigSelfTest {
 
         // Stale lock present → .warn only, exit still 0.
         let staleLockEnv = fakeCLIEnvironment(
-            runRclone: { args, _ in args.first == "version" ? (0, "rclone v1.66.0", "") : (0, "", "") },
+            runRclone: { args, _, _ in args.first == "version" ? (0, "rclone v1.66.0", "") : (0, "", "") },
             readProfiles: { [profile] },
             fileExists: { path in path == profile.configPath || path == profile.lockFilePath },
             schemaFilesPresent: { true }
@@ -2307,6 +2315,315 @@ enum ConfigSelfTest {
             persist: { _ in persisted += 1 }, install: { _ in dropInstalled += 1 })
         guard outcome == .refusedOverlap, persisted == 0, dropInstalled == 0 else {
             return report(id, slug, false, "(file drop: \(outcome), persist=\(persisted) install=\(dropInstalled))")
+        }
+        return report(id, slug, true)
+    }
+
+    // MARK: - L4 keychain fixtures (limpet-plan.md L4 F2/F3/F5/F7)
+
+    /// Run a tool with a hard timeout; returns (status, stdout). Status -9 = timed out.
+    private static func runTool(_ path: String, _ args: [String], timeout: TimeInterval = 20) -> (Int32, String) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: path)
+        process.arguments = args
+        let out = Pipe()
+        process.standardOutput = out
+        process.standardError = FileHandle.nullDevice
+        process.standardInput = Pipe()
+        let done = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in done.signal() }
+        guard (try? process.run()) != nil else { return (-1, "") }
+        guard done.wait(timeout: .now() + timeout) == .success else { process.terminate(); return (-9, "") }
+        return (process.terminationStatus, String(decoding: out.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self))
+    }
+
+    /// A stub `security` whose behaviour is read from `<dir>/mode` (found /
+    /// missing / error / hang) and which records its argv to `<dir>/argv`.
+    private static func makeSecurityStub(in dir: String, secret: String) -> String? {
+        let stub = "\(dir)/security-stub"
+        let body = """
+            #!/bin/sh
+            printf '%s\\n' "$@" > "\(dir)/argv"
+            case "$(cat "\(dir)/mode")" in
+              found) printf '%s\\n' '\(secret)'; exit 0 ;;
+              missing) exit 44 ;;
+              error) exit 51 ;;
+              hang) sleep 5; exit 0 ;;
+            esac
+            exit 0
+            """
+        do {
+            try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+            try body.write(toFile: stub, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: stub)
+            try "found".write(toFile: "\(dir)/mode", atomically: true, encoding: .utf8)
+        } catch { return nil }
+        return stub
+    }
+
+    /// The `applications` of the keychain item's decrypt ACL entry, parsed from
+    /// `security dump-keychain -a` (which prints ACLs, never secrets).
+    private static func decryptApplications(dump: String) -> [String]? {
+        let lines = dump.components(separatedBy: "\n")
+        guard let entry = lines.firstIndex(where: { $0.contains("authorizations") && $0.contains("decrypt") }),
+              let header = lines[entry...].firstIndex(where: { $0.contains("applications") }) else { return nil }
+        // Each application is an `N: <path> (OK)` line, followed by its own
+        // `requirement:` line; the entry ends at the next `entry N:` header.
+        var apps: [String] = []
+        for line in lines[(header + 1)...] {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.hasPrefix("entry ") { break }
+            guard let colon = trimmed.firstIndex(of: ":"), !trimmed[..<colon].isEmpty,
+                  trimmed[..<colon].allSatisfy(\.isNumber) else { continue }
+            apps.append(trimmed[trimmed.index(after: colon)...]
+                .trimmingCharacters(in: .whitespaces).replacingOccurrences(of: " (OK)", with: ""))
+        }
+        return apps
+    }
+
+    // MARK: - AC-L4-6 — keychain remote: created through /usr/bin/security only, secret nowhere else
+
+    /// Uses the REAL `/usr/bin/security` against a THROWAWAY keychain created
+    /// (and deleted) under the self-test root — never the login keychain.
+    private static func testKeychainRemoteCreatedThroughSecurityOnly() -> Bool {
+        let id = "AC-L4-6", slug = "keychain-remote-created-through-security-only"
+        let fm = FileManager.default
+        let dir = "\(selfTestRoot)/ac-l4-6"
+        try? fm.removeItem(atPath: dir)
+        try? fm.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let keychainPath = "\(dir)/selftest.keychain-db"
+        guard runTool("/usr/bin/security", ["create-keychain", "-p", UUID().uuidString, keychainPath]).0 == 0 else {
+            return report(id, slug, false, "(could not create the throwaway keychain)")
+        }
+        defer { _ = runTool("/usr/bin/security", ["delete-keychain", keychainPath]) }
+
+        let confPath = "\(dir)/rclone.conf"
+        let existingSection = "[existing]\ntype = local\n"
+        let rcloneStub = "\(dir)/rclone-stub"
+        do {
+            try existingSection.write(toFile: confPath, atomically: true, encoding: .utf8)
+            try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: confPath)
+            try "#!/bin/sh\nexit 0\n".write(toFile: rcloneStub, atomically: true, encoding: .utf8)
+            try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: rcloneStub)
+        } catch {
+            return report(id, slug, false, "(fixture setup failed: \(error))")
+        }
+        let store = KeychainSecretStore(keychainPath: keychainPath)
+        let service = RcloneConfigService(configPath: confPath, rclonePath: rcloneStub, keychain: store)
+        let secret = "SEKRET-l4-6 \"q'$x"
+        do {
+            try service.addKeychainRemote(
+                name: "limpet_test_st", type: "s3",
+                values: ["provider": "Mega", "access_key_id": "AKIDSELFTEST",
+                         "endpoint": "s3.ap-tokyo-1.megas4.com", "region": "ap-tokyo-1"],
+                secret: secret)
+        } catch {
+            return report(id, slug, false, "(addKeychainRemote threw: \(error))")
+        }
+
+        // rclone.conf: the non-secret section + marker, appended; nothing else changed.
+        let conf = (try? String(contentsOfFile: confPath, encoding: .utf8)) ?? ""
+        let expected = existingSection + "\n[limpet_test_st]\ntype = s3\naccess_key_id = AKIDSELFTEST\n"
+            + "endpoint = s3.ap-tokyo-1.megas4.com\nprovider = Mega\nregion = ap-tokyo-1\nlimpet_keychain = true\n"
+        guard conf == expected else {
+            return report(id, slug, false, "(unexpected rclone.conf: \(conf.replacingOccurrences(of: secret, with: "<SECRET>").debugDescription))")
+        }
+        let perms = (try? fm.attributesOfItem(atPath: confPath)[.posixPermissions] as? NSNumber)?.intValue
+        guard perms == 0o600 else {
+            return report(id, slug, false, "(rclone.conf permissions changed to \(String(describing: perms)))")
+        }
+
+        // The keychain holds it, and only /usr/bin/security may read it without a prompt.
+        guard store.read(account: "limpet_test_st") == .found(secret) else {
+            return report(id, slug, false, "(keychain read-back did not return the secret)")
+        }
+        let dump = runTool("/usr/bin/security", ["dump-keychain", "-a", keychainPath])
+        guard dump.0 == 0, !dump.1.contains(secret),
+              decryptApplications(dump: dump.1) == [KeychainSecretStore.trustedApplication] else {
+            return report(id, slug, false, "(decrypt ACL applications: \(String(describing: decryptApplications(dump: dump.1))))")
+        }
+
+        // F3: the helper maps it to the s3 variable.
+        guard service.secretEnvironment(forRemote: "limpet_test_st:bucket/path", log: { _ in })
+                == ["RCLONE_CONFIG_LIMPET_TEST_ST_SECRET_ACCESS_KEY": secret] else {
+            return report(id, slug, false, "(helper did not return the s3 secret variable)")
+        }
+
+        // F5: the secret is in no profile JSON and no script; the script never touches the keychain.
+        var profile = sampleProfile()
+        profile.rcloneRemote = "limpet_test_st:"
+        let profileJSON = (try? JSONEncoder().encode(profile)).map { String(decoding: $0, as: UTF8.self) } ?? secret
+        let script = SyncSetupService.shared.generateSyncScript()
+        guard !profileJSON.contains(secret), !script.contains(secret),
+              !script.contains("security"), !script.lowercased().contains("keychain"),
+              !script.contains("eval") else {
+            return report(id, slug, false, "(secret, keychain access or eval found in profile JSON / script)")
+        }
+
+        // F7: deleting the remote deletes its keychain item.
+        do { try service.deleteRemote("limpet_test_st") } catch {
+            return report(id, slug, false, "(deleteRemote threw: \(error))")
+        }
+        guard store.read(account: "limpet_test_st") == .notFound else {
+            return report(id, slug, false, "(keychain item survived deleteRemote)")
+        }
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L4-7 — keychain remote refusals: nothing written, no keychain item
+
+    private static func testKeychainRemoteRefusals() -> Bool {
+        let id = "AC-L4-7", slug = "keychain-remote-refusals"
+        let dir = "\(selfTestRoot)/ac-l4-7"
+        try? FileManager.default.removeItem(atPath: dir)
+        guard let stub = makeSecurityStub(in: dir, secret: "unused") else {
+            return report(id, slug, false, "(fixture setup failed)")
+        }
+        let confPath = "\(dir)/rclone.conf"
+        let original = "[Limpet_Taken]\ntype = local\n"
+        try? original.write(toFile: confPath, atomically: true, encoding: .utf8)
+        let service = RcloneConfigService(
+            configPath: confPath, rclonePath: "/usr/bin/false",
+            keychain: KeychainSecretStore(securityPath: stub, keychainPath: "\(dir)/unused.keychain-db"))
+        let good: [String: String] = ["provider": "Mega", "access_key_id": "AKID"]
+        let refused: [(String, String, [String: String], String)] = [
+            ("bad-name", "s3", good, "s"),                                          // name charset
+            ("limpet_taken", "s3", good, "s"),                                      // case-insensitive collision
+            ("ok_name", "webdav", [:], "s"),                                        // type
+            ("ok_name", "s3", good.merging(["no_check_certificate": "true"]) { $1 }, "s"),  // F7
+            ("ok_name", "s3", good.merging(["secret_access_key": "x"]) { $1 }, "s"),        // secret in conf
+            ("ok_name", "s3", good.merging(["endpoint": "http://s3.example.com"]) { $1 }, "s"),  // F7 https
+            ("ok_name", "s3", good.merging(["region": "x\ntype = local"]) { $1 }, "s"),       // F4 newline
+            ("ok_name", "s3", good, ""),                                            // empty secret
+            ("ok_name", "s3", good, "two\nlines"),
+        ]
+        for (name, type, values, secret) in refused {
+            if (try? service.addKeychainRemote(name: name, type: type, values: values, secret: secret)) != nil {
+                return report(id, slug, false, "(accepted name=\(name) type=\(type) values=\(values.keys.sorted()))")
+            }
+        }
+        let conf = (try? String(contentsOfFile: confPath, encoding: .utf8)) ?? ""
+        guard conf == original, !FileManager.default.fileExists(atPath: "\(dir)/argv") else {
+            return report(id, slug, false, "(a refused remote still wrote rclone.conf or ran security)")
+        }
+
+        // The existing (non-keychain) addRemote path refuses line breaks too (F4).
+        var webdav = RemoteConfiguration(name: "plain_webdav", provider: .webdav)
+        webdav.values["url"] = "https://dav.example.com"
+        webdav.values["user"] = "me\n[injected]\ntype = local"
+        if (try? service.addRemote(webdav)) != nil ||
+            (try? String(contentsOfFile: confPath, encoding: .utf8)) != original {
+            return report(id, slug, false, "(addRemote wrote a value containing a line break)")
+        }
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L4-8 — the secret-injection helper (F3)
+
+    private static func testSecretInjectionHelper() -> Bool {
+        let id = "AC-L4-8", slug = "secret-injection-helper"
+        let dir = "\(selfTestRoot)/ac-l4-8"
+        try? FileManager.default.removeItem(atPath: dir)
+        let secret = "SEKRET-stub-9c1"
+        guard let stub = makeSecurityStub(in: dir, secret: secret) else {
+            return report(id, slug, false, "(fixture setup failed)")
+        }
+        let confPath = "\(dir)/rclone.conf"
+        try? """
+            [plain]
+            type = local
+
+            [ks3]
+            type = s3
+            provider = Mega
+            limpet_keychain = true
+
+            [kb2]
+            type = b2
+            account = KEYID
+            limpet_keychain = true
+            """.write(toFile: confPath, atomically: true, encoding: .utf8)
+        let keychainPath = "\(dir)/k.keychain-db"
+        let service = RcloneConfigService(
+            configPath: confPath, rclonePath: "/usr/bin/false",
+            keychain: KeychainSecretStore(securityPath: stub, keychainPath: keychainPath, timeout: 0.5))
+        func setMode(_ mode: String) { try? mode.write(toFile: "\(dir)/mode", atomically: true, encoding: .utf8) }
+
+        // Non-keychain remote: empty env, security never runs.
+        var logs: [String] = []
+        guard service.secretEnvironment(forRemote: "plain:x", log: { logs.append($0) }) == [:], logs.isEmpty,
+              !FileManager.default.fileExists(atPath: "\(dir)/argv") else {
+            return report(id, slug, false, "(non-keychain remote did not get an empty env without a keychain read)")
+        }
+        // Found: s3 and b2 variable names, read through find-generic-password -w on the given keychain.
+        guard service.secretEnvironment(forRemote: "ks3:", log: { logs.append($0) })
+                == ["RCLONE_CONFIG_KS3_SECRET_ACCESS_KEY": secret],
+              service.secretEnvironment(forRemote: "kb2", log: { logs.append($0) }) == ["RCLONE_CONFIG_KB2_KEY": secret],
+              logs.isEmpty else {
+            return report(id, slug, false, "(s3/b2 variable names wrong, or a log line on success)")
+        }
+        let argv = (try? String(contentsOfFile: "\(dir)/argv", encoding: .utf8)) ?? ""
+        guard argv == ["find-generic-password", "-s", "limpet", "-a", "kb2", "-w", keychainPath].joined(separator: "\n") + "\n" else {
+            return report(id, slug, false, "(unexpected security argv: \(argv.debugDescription))")
+        }
+        // Failures: exactly one line each, no env, and the watcher spawns nothing.
+        for (mode, phrase) in [("missing", "not found"), ("error", "read failed"), ("hang", "timed out")] {
+            setMode(mode)
+            var lines: [String] = []
+            var spawned = 0
+            let code = SyncWatchDaemon.runSyncChild(
+                profile: SyncProfile(name: "p", rcloneRemote: "ks3:", remotePath: "b", localSyncPath: "/tmp/x"),
+                service: service, log: { lines.append($0) }, spawn: { _ in spawned += 1; return 0 })
+            guard code == SyncWatchDaemon.secretUnavailableExitCode, spawned == 0,
+                  lines.count == 1, lines[0].contains(phrase), !lines[0].contains(secret) else {
+                return report(id, slug, false, "(\(mode): code=\(code) spawned=\(spawned) lines=\(lines))")
+            }
+        }
+        // And on success the watcher's child gets the variable merged into its environment.
+        setMode("found")
+        var childEnvironment: [String: String] = [:]
+        _ = SyncWatchDaemon.runSyncChild(
+            profile: SyncProfile(name: "p", rcloneRemote: "kb2:", remotePath: "b", localSyncPath: "/tmp/x"),
+            service: service, log: { _ in }, spawn: { childEnvironment = $0; return 0 })
+        guard childEnvironment["RCLONE_CONFIG_KB2_KEY"] == secret, childEnvironment["PATH"] != nil else {
+            return report(id, slug, false, "(watcher child environment missing the secret or the inherited environment)")
+        }
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L4-9 — limpet remote add: secret from stdin only, same creation function
+
+    private static func testCLIRemoteAdd() -> Bool {
+        let id = "AC-L4-9", slug = "cli-remote-add"
+        let argv = ["remote", "add", "limpet_test_s4", "--type", "s3", "--provider", "Mega",
+                    "--region", "ap-tokyo-1", "--access-key-id", "AKID"]
+        guard case .success(.remoteAdd(let request)) = LimpetCLI.parse(argv),
+              request == RemoteAddRequest(name: "limpet_test_s4", type: "s3", values: [
+                "access_key_id": "AKID", "provider": "Mega", "region": "ap-tokyo-1",
+                "endpoint": "s3.ap-tokyo-1.megas4.com"]) else {
+            return report(id, slug, false, "(remote add did not parse as expected)")
+        }
+        for bad in [argv + ["--secret", "x"], argv + ["--secret-access-key=x"], ["remote", "add", "n", "--type", "s3"],
+                    ["remote", "add", "n", "--type", "b2", "--access-key-id", "k", "--endpoint", "e"]] {
+            guard case .failure = LimpetCLI.parse(bad) else {
+                return report(id, slug, false, "(accepted \(bad))")
+            }
+        }
+        let secret = "SEKRET-cli-5d2"
+        var output = "", created: (String, String, [String: String], String)?
+        let env = fakeCLIEnvironment(
+            readSecret: { _ in secret },
+            addKeychainRemote: { created = ($0, $1, $2, $3); return nil },
+            stdout: { output += $0 }, stderr: { output += $0 })
+        guard LimpetCLI.execute(argv, env: env) == 0, created?.0 == "limpet_test_s4", created?.1 == "s3",
+              created?.2 == request.values, created?.3 == secret, !output.contains(secret) else {
+            return report(id, slug, false, "(remote add did not hand the stdin secret to the creation function)")
+        }
+        var calledWithoutSecret = false
+        let noSecretEnv = fakeCLIEnvironment(readSecret: { _ in nil },
+                                             addKeychainRemote: { _, _, _, _ in calledWithoutSecret = true; return nil })
+        guard LimpetCLI.execute(argv, env: noSecretEnv) == 66, !calledWithoutSecret else {
+            return report(id, slug, false, "(remote add without a secret did not stop before creating)")
         }
         return report(id, slug, true)
     }

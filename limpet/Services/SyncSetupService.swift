@@ -310,17 +310,22 @@ final class SyncSetupService {
 
         let remoteRoot = "\(profile.rcloneRemote):\(profile.remotePath)"
         let skipCert = RcloneConfigService.shared.readRemoteConfig(name: profile.rcloneRemote)?.values["no_check_certificate"] == "true"
+        // F3: best-effort cleanup — a keychain read failure just skips it.
+        guard let environment = RcloneConfigService.shared.processEnvironment(
+            forRemote: profile.rcloneRemote, log: { LimpetSettings.debugLog($0) }) else { return }
         _ = runRcloneSimple(
             rclonePath: rclonePath,
             args: ["delete", remoteRoot, "--include", Self.checkFileName],
-            skipCert: skipCert)
+            skipCert: skipCert,
+            environment: environment)
     }
 
     /// Run rclone with given args, return exit code (or -1 on launch failure).
     /// Adds connection/operation timeouts so unreachable remotes fail within ~15s.
-    private func runRcloneSimple(rclonePath: String, args: [String], skipCert: Bool) -> Int32 {
+    private func runRcloneSimple(rclonePath: String, args: [String], skipCert: Bool, environment: [String: String]) -> Int32 {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: rclonePath)
+        process.environment = environment
         var fullArgs = args + ["--contimeout", "5s", "--timeout", "15s", "--retries", "1", "--low-level-retries", "1"]
         if skipCert { fullArgs.append("--no-check-certificate") }
         process.arguments = fullArgs
