@@ -105,6 +105,7 @@ enum ConfigSelfTest {
             testRefusedExternalEditRestored,
             testWizardRetryKeepsProfileId,
             testPruneKeepsUndecodableFile,
+            testEditKeepsNonSecretRequiredErrors,
         ]
 
         for check in checks {
@@ -3525,6 +3526,26 @@ enum ConfigSelfTest {
         guard fm.fileExists(atPath: "\(dir)/\(valid.shortId).profile.json"),
               !fm.fileExists(atPath: "\(dir)/\(doomed.shortId).profile.json") else {
             return report(id, slug, false, "(valid file lost or genuine orphan not removed)")
+        }
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L4-26 — editing a keychain remote drops only the secret's own "is required"
+
+    /// Internal review F2: the edit-mode filter matched the secret label by
+    /// prefix, and b2's "Application Key" is a prefix of "Application Key ID
+    /// is required", so a b2 section without `account` could be saved.
+    private static func testEditKeepsNonSecretRequiredErrors() -> Bool {
+        let id = "AC-L4-26", slug = "edit-remote-secret-filter-exact"
+        var b2 = RemoteConfiguration(name: "kb", provider: .b2)
+        guard AddRemoteSheet.editBlockingErrors(b2) == ["Application Key ID is required"] else {
+            return report(id, slug, false, "(b2 without account: \(AddRemoteSheet.editBlockingErrors(b2)))")
+        }
+        b2.values["account"] = "KEYID"
+        var s3 = RemoteConfiguration(name: "ks", provider: .s3Compatible)
+        s3.values["access_key_id"] = "AKID"
+        guard AddRemoteSheet.editBlockingErrors(b2).isEmpty, AddRemoteSheet.editBlockingErrors(s3).isEmpty else {
+            return report(id, slug, false, "(an empty secret blocked an edit: b2=\(AddRemoteSheet.editBlockingErrors(b2)) s3=\(AddRemoteSheet.editBlockingErrors(s3)))")
         }
         return report(id, slug, true)
     }

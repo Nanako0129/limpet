@@ -325,14 +325,23 @@ struct AddRemoteSheet: View {
     private var canSave: Bool {
         if isEditMode {
             guard !remoteConfig.name.isEmpty else { return false }
-            // A keychain-backed remote keeps its stored secret when the field is left empty.
-            let secretLabel = remoteConfig.provider.requiredFields
-                .first { $0.key == remoteConfig.provider.secretKey }?.label
-            return remoteConfig.validate().filter {
-                !$0.localizedCaseInsensitiveContains("name") && !(secretLabel.map($0.hasPrefix) ?? false)
-            }.isEmpty
+            return Self.editBlockingErrors(remoteConfig).isEmpty
         }
         return remoteConfig.validate().isEmpty
+    }
+
+    /// The `validate()` errors that block saving an edit. A keychain-backed
+    /// remote keeps its stored secret when the field is left empty, so only
+    /// the secret field's own "<label> is required" is dropped — matched
+    /// exactly, because b2's "Application Key" is a prefix of "Application
+    /// Key ID is required", which must still block.
+    static func editBlockingErrors(_ config: RemoteConfiguration) -> [String] {
+        let secretRequired = config.provider.requiredFields
+            .first { $0.key == config.provider.secretKey }
+            .map { "\($0.label) is required" }
+        return config.validate().filter {
+            !$0.localizedCaseInsensitiveContains("name") && $0 != secretRequired
+        }
     }
 
     // MARK: - Actions
