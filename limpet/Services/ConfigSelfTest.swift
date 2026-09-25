@@ -1467,6 +1467,16 @@ enum ConfigSelfTest {
         guard plist.range(of: #"<key>RunAtLoad</key>\s*<true/>"#, options: .regularExpression) != nil else {
             return report("AC-W3", "watch-plist-shape", false, "(missing RunAtLoad)")
         }
+        // An app path with XML-special characters must still yield a valid plist that
+        // round-trips to the exact path (the plist is serialized, not templated).
+        let oddPath = "/tmp/a&b<c>/limpet.app/Contents/MacOS/limpet"
+        let oddXML = SyncSetupService.shared.generateLaunchdPlist(for: profile, appExecutablePath: oddPath)
+        guard let parsed = try? PropertyListSerialization.propertyList(
+                  from: Data(oddXML.utf8), options: [], format: nil) as? [String: Any],
+              let args = parsed["ProgramArguments"] as? [String],
+              args == [oddPath, "watch", profile.shortId] else {
+            return report("AC-W3", "watch-plist-shape", false, "(plist with an XML-special app path did not round-trip)")
+        }
         guard !plist.contains("StartInterval") else {
             return report("AC-W3", "watch-plist-shape", false, "(still has StartInterval)")
         }

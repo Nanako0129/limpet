@@ -546,46 +546,33 @@ final class SyncSetupService {
     /// stdout/stderr go to a separate `limpet-launchd-*.log`, never the
     /// profile log the GUI reads — the watcher's child processes already tee
     /// their own output into the profile log themselves.
-    func generateLaunchdPlist(for profile: SyncProfile) -> String {
-        let appExecutablePath = Bundle.main.executablePath ?? "/Applications/limpet.app/Contents/MacOS/limpet"
+    func generateLaunchdPlist(
+        for profile: SyncProfile,
+        appExecutablePath: String = Bundle.main.executablePath ?? "/Applications/limpet.app/Contents/MacOS/limpet"
+    ) -> String {
         let logDir = (profile.logPath as NSString).deletingLastPathComponent
         let launchdLogPath = logDir + "/limpet-launchd-\(profile.shortId).log"
+        let path = "/opt/homebrew/bin:/usr/local/bin:/run/current-system/sw/bin:"
+            + "/etc/profiles/per-user/\(NSUserName())/bin:\(NSHomeDirectory())/.nix-profile/bin:/usr/bin:/bin"
 
-        return """
-            <?xml version="1.0" encoding="UTF-8"?>
-            <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-            <plist version="1.0">
-            <dict>
-                <key>Label</key>
-                <string>\(profile.launchdLabel)</string>
-
-                <key>ProgramArguments</key>
-                <array>
-                    <string>\(appExecutablePath)</string>
-                    <string>watch</string>
-                    <string>\(profile.shortId)</string>
-                </array>
-
-                <key>KeepAlive</key>
-                <true/>
-
-                <key>RunAtLoad</key>
-                <true/>
-
-                <key>StandardOutPath</key>
-                <string>\(launchdLogPath)</string>
-
-                <key>StandardErrorPath</key>
-                <string>\(launchdLogPath)</string>
-
-                <key>EnvironmentVariables</key>
-                <dict>
-                    <key>PATH</key>
-                    <string>/opt/homebrew/bin:/usr/local/bin:/run/current-system/sw/bin:/etc/profiles/per-user/\(NSUserName())/bin:\(NSHomeDirectory())/.nix-profile/bin:/usr/bin:/bin</string>
-                </dict>
-            </dict>
-            </plist>
-            """
+        // Serialized rather than templated, so every string value (the app path in
+        // particular, which may contain `&` or `<`) is XML-escaped and the plist stays
+        // loadable wherever the app lives.
+        let plist: [String: Any] = [
+            "Label": profile.launchdLabel,
+            "ProgramArguments": [appExecutablePath, "watch", profile.shortId],
+            "KeepAlive": true,
+            "RunAtLoad": true,
+            "StandardOutPath": launchdLogPath,
+            "StandardErrorPath": launchdLogPath,
+            "EnvironmentVariables": ["PATH": path],
+        ]
+        guard let data = try? PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0),
+              let xml = String(data: data, encoding: .utf8) else {
+            // Only reachable if the dictionary above held a non-plist type.
+            preconditionFailure("launchd plist for \(profile.shortId) failed to serialize")
+        }
+        return xml
     }
 
     // MARK: - Helpers
