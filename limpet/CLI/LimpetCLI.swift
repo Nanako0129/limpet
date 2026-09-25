@@ -988,7 +988,11 @@ enum LimpetCLI {
             guard let n = int(value), n >= 1 else { return "syncIntervalMinutes must be an integer ≥ 1" }
             profile.syncIntervalMinutes = n
         case "transfers":
-            guard let n = int(value), n >= 1 else { return "transfers must be an integer ≥ 1" }
+            // 1–64, digits only, no leading zero (bash reads `08` as octal).
+            guard let first = value.first, first != "0", value.allSatisfy(\.isASCII),
+                  value.allSatisfy(\.isNumber), let n = int(value), (1...64).contains(n) else {
+                return "transfers must be a whole number from 1 to 64 without a leading zero"
+            }
             profile.transfers = n
         case "maxDelete":
             guard let n = int(value), n >= 1 else { return "maxDelete must be an integer ≥ 1" }

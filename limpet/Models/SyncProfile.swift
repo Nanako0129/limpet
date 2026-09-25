@@ -118,6 +118,10 @@ struct SyncProfile: Identifiable, Codable, Equatable {
     var validationError: String? {
         if let error = Self.remoteSpecError(rcloneRemote) { return error }
         if maxDelete < 1 { return "maxDelete must be at least 1" }
+        // Carried from L4.0: 1–64. A leading zero never survives JSON decoding
+        // (measured: JSONDecoder rejects `08` and `010`), and `profile set`
+        // refuses one itself, because bash reads `08` as octal.
+        if !(1...64).contains(transfers) { return "transfers must be between 1 and 64" }
         return nil
     }
 

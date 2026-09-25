@@ -92,6 +92,7 @@ enum ConfigSelfTest {
             testWatcherStopsAtDeleteLimit,
             testCLIClearDeleteLimit,
             testDoctorWarnsB2WithoutLifecycle,
+            testTransfersRange,
         ]
 
         for check in checks {
@@ -2926,6 +2927,47 @@ enum ConfigSelfTest {
         let (withRule, _) = checks(lifecycleOutput: "[\n    {\n        \"daysFromHidingToDeleting\": 1,\n        \"fileNamePrefix\": \"\"\n    }\n]\n")
         guard !withRule.contains(where: { $0.detail.contains("daysFromHidingToDeleting") }) else {
             return report(id, slug, false, "(warned although the rule exists)")
+        }
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L4-16 — transfers 1–64, no leading zero (carried from L4.0)
+
+    /// The companion carried item, RCLONE_BIN honoured only in Debug builds, has
+    /// no test here: the self-test itself only runs in Debug, and running the
+    /// Release script variant far enough to see which rclone it picks would run
+    /// the real rclone installed on the machine against the real rclone.conf.
+    private static func testTransfersRange() -> Bool {
+        let id = "AC-L4-16", slug = "transfers-range"
+        func decodes(_ transfers: Any) -> Bool {
+            let dict: [String: Any] = ["id": UUID().uuidString, "name": "t", "rcloneRemote": "r:",
+                                       "remotePath": "p", "localSyncPath": "/tmp/x", "transfers": transfers]
+            guard let data = try? JSONSerialization.data(withJSONObject: dict) else { return false }
+            return (try? JSONDecoder().decode(SyncProfile.self, from: data)) != nil
+        }
+        guard decodes(1), decodes(64), !decodes(0), !decodes(65), !decodes(-3) else {
+            return report(id, slug, false, "(decode range wrong)")
+        }
+        var profile = sampleProfile()
+        for bad in ["08", "0", "65", "+5", "5 ", "\u{0663}", ""] {
+            if LimpetCLI.applyProfileAssignment(&profile, key: "transfers", value: bad) == nil {
+                return report(id, slug, false, "(profile set accepted transfers \(bad.debugDescription))")
+            }
+        }
+        guard LimpetCLI.applyProfileAssignment(&profile, key: "transfers", value: "64") == nil, profile.transfers == 64 else {
+            return report(id, slug, false, "(profile set refused transfers 64)")
+        }
+        // The Release script variant (no RCLONE_BIN override) must at least be valid bash.
+        let releaseScript = "\(selfTestRoot)/ac-l4-16-release.sh"
+        try? SyncSetupService.shared.generateSyncScript(honorRcloneBinOverride: false)
+            .write(toFile: releaseScript, atomically: true, encoding: .utf8)
+        guard runTool("/bin/bash", ["-n", releaseScript]).0 == 0 else {
+            return report(id, slug, false, "(the Release script variant is not valid bash)")
+        }
+        var tooMany = sampleProfile()
+        tooMany.transfers = 100
+        guard ProfileStore.writeProfileFile(tooMany, in: "\(selfTestRoot)/ac-l4-16") == nil else {
+            return report(id, slug, false, "(a transfers value of 100 was written)")
         }
         return report(id, slug, true)
     }

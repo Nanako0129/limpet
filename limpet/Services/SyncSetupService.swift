@@ -374,11 +374,30 @@ final class SyncSetupService {
 
     // MARK: - Script Generation
 
+    /// Whether generated scripts honour `RCLONE_BIN` from the environment: Debug
+    /// builds only. The self-test runs only in Debug, so it can exercise the
+    /// Release variant through `generateSyncScript(honorRcloneBinOverride:
+    /// false)` but cannot observe this constant's Release value itself.
+    static let honorsRcloneBinOverride: Bool = {
+        #if DEBUG
+        return true
+        #else
+        return false
+        #endif
+    }()
+
     /// Generate the shared sync script that reads config from JSON
     /// Generate the shared sync script. Not private — `ConfigSelfTest` reads
     /// this text directly to assert its exit-code/flag shape (limpet-plan.md
     /// L3(b)) without writing it to disk.
-    func generateSyncScript() -> String {
+    func generateSyncScript(honorRcloneBinOverride: Bool = SyncSetupService.honorsRcloneBinOverride) -> String {
+        // Carried from L4.0 (limpet-plan.md L4): an RCLONE_BIN from the
+        // environment exists only for the self-test's stub rclone. A shipped
+        // script must never run whatever binary an environment variable names,
+        // so outside Debug builds the variable is cleared before the search.
+        let rcloneBinSelection = honorRcloneBinOverride
+            ? #"if [[ -z "${RCLONE_BIN:-}" || ! -x "$RCLONE_BIN" ]]; then"#
+            : #"RCLONE_BIN=""; if true; then"#
         return """
             #!/bin/bash
             # limpet Sync Script
@@ -466,10 +485,9 @@ final class SyncSetupService {
             # Homebrew's dirs (issue #53). $USER can be unset under launchd, so derive
             # it. Fall back to a PATH lookup for any other install layout.
             RCLONE_USER="${USER:-$(id -un)}"
-            # Honor an RCLONE_BIN already set in the environment (e.g. a test
-            # harness injecting a stub) before falling back to the hardcoded
-            # candidates below.
-            if [[ -z "${RCLONE_BIN:-}" || ! -x "$RCLONE_BIN" ]]; then
+            # Debug builds honor an RCLONE_BIN already set in the environment (the
+            # self-test's stub); other builds always search the candidates below.
+            \(rcloneBinSelection)
                 RCLONE_BIN=""
                 RCLONE_CANDIDATES=(
                     /opt/homebrew/bin/rclone

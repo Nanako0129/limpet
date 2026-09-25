@@ -59,6 +59,7 @@
     "transfers": {
       "type": "integer",
       "minimum": 1,
+      "maximum": 64,
       "description": "rclone --transfers for this profile's sync (--checkers is 2x this value). Default 16."
     },
     "maxDelete": {
