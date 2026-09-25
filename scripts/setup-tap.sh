@@ -1,7 +1,7 @@
 #!/bin/bash
 # =============================================================================
 # Homebrew Tap Setup Script
-# Creates the homebrew-synctray tap repository for distribution
+# Creates the homebrew-limpet tap repository for distribution
 # =============================================================================
 
 set -e
@@ -19,7 +19,7 @@ log_warning() { echo -e "${YELLOW}⚠${NC} $1"; }
 log_error() { echo -e "${RED}✗${NC} $1"; exit 1; }
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-TAP_DIR="${1:-$PROJECT_DIR/../homebrew-synctray}"
+TAP_DIR="${1:-$PROJECT_DIR/../homebrew-limpet}"
 
 echo ""
 echo "🍺 Homebrew Tap Setup"
@@ -51,33 +51,33 @@ cd "$TAP_DIR"
 mkdir -p Casks
 
 # Copy cask file
-cp "$PROJECT_DIR/Casks/synctray.rb" Casks/
-log_success "Copied synctray.rb to Casks/"
+cp "$PROJECT_DIR/Casks/limpet.rb" Casks/
+log_success "Copied limpet.rb to Casks/"
 
 # Create README
 cat > README.md << 'EOF'
-# Homebrew Tap for SyncTray
+# Homebrew Tap for limpet
 
-This is the official Homebrew tap for [SyncTray](https://github.com/mthines/sync-tray), a macOS menu bar app for Google Drive-style folder sync using rclone.
+This is the official Homebrew tap for [limpet](https://github.com/mthines/sync-tray), a macOS menu bar app for Google Drive-style folder sync using rclone.
 
 ## Installation
 
 ```bash
-brew tap mthines/synctray
-brew install --cask synctray
+brew tap mthines/limpet
+brew install --cask limpet
 ```
 
 ## Updating
 
 ```bash
-brew upgrade --cask synctray
+brew upgrade --cask limpet
 ```
 
 ## Uninstalling
 
 ```bash
-brew uninstall --cask synctray
-brew untap mthines/synctray
+brew uninstall --cask limpet
+brew untap mthines/limpet
 ```
 
 ## Requirements
@@ -87,7 +87,7 @@ brew untap mthines/synctray
 
 ## About
 
-SyncTray turns rclone into a seamless, automated sync experience with:
+limpet turns rclone into a seamless, automated sync experience with:
 - Menu bar status indicator
 - Automatic scheduled syncing
 - Real-time notifications
@@ -103,17 +103,17 @@ log_success "Tap setup complete!"
 echo ""
 echo "📋 Next steps:"
 echo ""
-echo "1. Create a GitHub repository named 'homebrew-synctray'"
+echo "1. Create a GitHub repository named 'homebrew-limpet'"
 echo "   https://github.com/new"
 echo ""
 echo "2. Push the tap:"
 echo "   cd $TAP_DIR"
 echo "   git add ."
 echo "   git commit -m 'Initial tap setup'"
-echo "   git remote add origin https://github.com/mthines/homebrew-synctray.git"
+echo "   git remote add origin https://github.com/mthines/homebrew-limpet.git"
 echo "   git push -u origin main"
 echo ""
 echo "3. Users can then install with:"
-echo "   brew tap mthines/synctray"
-echo "   brew install --cask synctray"
+echo "   brew tap mthines/limpet"
+echo "   brew install --cask limpet"
 echo ""

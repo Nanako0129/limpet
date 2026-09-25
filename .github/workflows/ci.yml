@@ -179,7 +179,7 @@ jobs:
             -f content=eyes >/dev/null 2>&1 || true
 
   # ===========================================================================
-  # test — compile the Debug build as a smoke test. SyncTray has no XCTest
+  # test — compile the Debug build as a smoke test. limpet has no XCTest
   # target in its scheme (see project.json `test` target), so the build itself
   # is the gate. Single-arch (ONLY_ACTIVE_ARCH=YES) — a smoke build only needs
   # to prove it compiles; the universal binary is built in release-macos.
@@ -217,8 +217,8 @@ jobs:
           # leaving a compile failure undiagnosable from CI alone.
           set -o pipefail
           rc=0
-          xcodebuild -project SyncTray.xcodeproj \
-            -scheme SyncTray \
+          xcodebuild -project limpet.xcodeproj \
+            -scheme limpet \
             -destination 'platform=macOS' \
             -configuration Debug \
             -clonedSourcePackagesDirPath .spm \
@@ -240,16 +240,16 @@ jobs:
 
           tail -30 "$RUNNER_TEMP/xcodebuild.log"
 
-      # SyncTray has no XCTest target (see the job comment above), so the
+      # limpet has no XCTest target (see the job comment above), so the
       # `#if DEBUG` ConfigSelfTest suite IS the test suite — round-trip,
       # migration, reconcile-delta, self-write, external-create, CLI and
       # cache-migration assertions. It only ever ran when someone typed
-      # `SyncTray --self-test` by hand, which meant a broken assertion could
+      # `limpet --self-test` by hand, which meant a broken assertion could
       # (and did) sit on a branch through a green CI run. Run it here, where
       # the Debug binary the previous step just produced is sitting.
       - name: Self-test
         run: |
-          APP="$RUNNER_TEMP/DerivedData/Build/Products/Debug/SyncTray.app/Contents/MacOS/SyncTray"
+          APP="$RUNNER_TEMP/DerivedData/Build/Products/Debug/limpet.app/Contents/MacOS/limpet"
           if [ ! -x "$APP" ]; then
             echo "Debug binary not found at $APP — the build layout changed."
             exit 1
@@ -299,7 +299,7 @@ jobs:
           BASE_REF: ${{ needs.detect-changes.outputs.base_ref }}
           FORCE_RELEASE: ${{ inputs.force_release }}
         run: |
-          PLIST="SyncTray/Info.plist"
+          PLIST="limpet/Info.plist"
           # Version source of truth: latest non-beta git tag, falling back to Info.plist
           LAST_STABLE_TAG=$(git tag -l "v*" --sort=-version:refname | grep -E "^v[0-9]" | grep -v "beta" | head -n 1 || echo "")
           if [ -n "$LAST_STABLE_TAG" ]; then
@@ -384,7 +384,7 @@ jobs:
             # Stable: bump Info.plist, commit, tag, push both.
             # Portable sed edit (Linux runner) — replaces the <string> on the
             # line after the CFBundleShortVersionString key.
-            PLIST="SyncTray/Info.plist"
+            PLIST="limpet/Info.plist"
             sed -i "/<key>CFBundleShortVersionString<\/key>/{n;s|<string>.*</string>|<string>$VERSION</string>|;}" "$PLIST"
             git add "$PLIST"
             git commit -m "chore(release): bump version to $TAG"
@@ -398,7 +398,7 @@ jobs:
 
   # ===========================================================================
   # release-macos — build the Release .app, zip it, create the GitHub release,
-  # update the homebrew tap, and (stable only) sync Casks/synctray.rb back to
+  # update the homebrew tap, and (stable only) sync Casks/limpet.rb back to
   # the source repo so it stays in lockstep with the tap. macOS is required
   # here for xcodebuild + codesign + notarytool.
   # ===========================================================================
@@ -447,16 +447,16 @@ jobs:
           git switch main
           git pull --ff-only origin main
 
-          sed -i '' "s/version \"[^\"]*\"/version \"${VERSION}\"/" Casks/synctray.rb
-          sed -i '' "s/sha256 \"[^\"]*\"/sha256 \"${ZIP_SHA}\"/" Casks/synctray.rb
+          sed -i '' "s/version \"[^\"]*\"/version \"${VERSION}\"/" Casks/limpet.rb
+          sed -i '' "s/sha256 \"[^\"]*\"/sha256 \"${ZIP_SHA}\"/" Casks/limpet.rb
 
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add Casks/synctray.rb
+          git add Casks/limpet.rb
           if git diff --cached --quiet; then
-            echo "::notice::Casks/synctray.rb already up to date"
+            echo "::notice::Casks/limpet.rb already up to date"
           else
-            git commit -m "feat(cask): update SyncTray to version ${VERSION} with new SHA256 checksum"
+            git commit -m "feat(cask): update limpet to version ${VERSION} with new SHA256 checksum"
             git push origin main
           fi
 
@@ -473,16 +473,16 @@ jobs:
 
             ### Install
             \`\`\`bash
-            brew tap mthines/synctray
+            brew tap mthines/limpet
 
             # Latest beta from this PR
-            brew install --cask --force mthines/synctray/synctray-beta
+            brew install --cask --force mthines/limpet/limpet-beta
 
             # This exact version (pinned)
-            brew install --cask --force mthines/synctray/synctray-beta@${version}
+            brew install --cask --force mthines/limpet/limpet-beta@${version}
             \`\`\`
 
-            > Beta and stable share \`/Applications/SyncTray.app\`. \`--force\` is required so Homebrew will overwrite the app installed by the other cask. To roll back: \`brew install --cask --force mthines/synctray/synctray\`.
+            > Beta and stable share \`/Applications/limpet.app\`. \`--force\` is required so Homebrew will overwrite the app installed by the other cask. To roll back: \`brew install --cask --force mthines/limpet/limpet\`.
 
             [View release](https://github.com/${context.repo.owner}/${context.repo.repo}/releases/tag/v${version})`;
 

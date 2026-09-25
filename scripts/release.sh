@@ -2,7 +2,7 @@
 set -e
 
 # =============================================================================
-# SyncTray Release Script
+# limpet Release Script
 # Automates versioning based on conventional commits and creates GitHub releases
 # =============================================================================
 
@@ -14,11 +14,11 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 # Configuration
-PROJECT_NAME="SyncTray"
-SCHEME="SyncTray"
+PROJECT_NAME="limpet"
+SCHEME="limpet"
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="$PROJECT_DIR/build"
-XCODEPROJ="$PROJECT_DIR/SyncTray.xcodeproj"
+XCODEPROJ="$PROJECT_DIR/limpet.xcodeproj"
 
 # =============================================================================
 # Helper Functions
@@ -145,8 +145,8 @@ generate_changelog() {
     echo ""
     echo "**Via Homebrew (recommended):**"
     echo "\`\`\`bash"
-    echo "brew tap mthines/synctray"
-    echo "brew install --cask synctray"
+    echo "brew tap mthines/limpet"
+    echo "brew install --cask limpet"
     echo "\`\`\`"
     echo ""
     echo "**Manual download:**"
@@ -160,7 +160,7 @@ generate_changelog() {
 # Update version in Info.plist
 update_plist_version() {
     local version="${1#v}"  # Remove 'v' prefix
-    local plist="$PROJECT_DIR/SyncTray/Info.plist"
+    local plist="$PROJECT_DIR/limpet/Info.plist"
 
     /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $version" "$plist"
     log_success "Updated Info.plist version to $version"
@@ -264,14 +264,14 @@ create_zip() {
 # Find the homebrew tap directory
 find_tap_dir() {
     # Check sibling directory first (development setup)
-    local sibling_tap="$PROJECT_DIR/../homebrew-synctray"
+    local sibling_tap="$PROJECT_DIR/../homebrew-limpet"
     if [ -d "$sibling_tap/.git" ]; then
         echo "$sibling_tap"
         return
     fi
 
     # Check Homebrew tap location
-    local brew_tap=$(brew --repository mthines/synctray 2>/dev/null)
+    local brew_tap=$(brew --repository mthines/limpet 2>/dev/null)
     if [ -n "$brew_tap" ] && [ -d "$brew_tap/.git" ]; then
         echo "$brew_tap"
         return
@@ -285,7 +285,7 @@ find_tap_dir() {
 update_cask() {
     local version="$1"
     local zip_path="$2"
-    local cask_file="$PROJECT_DIR/Casks/synctray.rb"
+    local cask_file="$PROJECT_DIR/Casks/limpet.rb"
 
     if [ ! -f "$cask_file" ]; then
         log_error "Cask file not found at $cask_file"
@@ -305,16 +305,16 @@ update_cask() {
     # Find and update tap repo
     TAP_DIR=$(find_tap_dir)
     if [ -z "$TAP_DIR" ]; then
-        log_error "Homebrew tap not found. Install with: brew tap mthines/synctray"
+        log_error "Homebrew tap not found. Install with: brew tap mthines/limpet"
     fi
 
-    local tap_cask="$TAP_DIR/Casks/synctray.rb"
+    local tap_cask="$TAP_DIR/Casks/limpet.rb"
     if [ ! -f "$tap_cask" ]; then
         log_error "Tap cask file not found at $tap_cask"
     fi
 
     cp "$cask_file" "$tap_cask"
-    log_success "Synced Cask to homebrew-synctray tap at $TAP_DIR"
+    log_success "Synced Cask to homebrew-limpet tap at $TAP_DIR"
 }
 
 # Create GitHub release
@@ -416,9 +416,9 @@ main() {
     update_cask "$new_version" "$zip_path"
 
     # Commit cask update if changed
-    if [ -n "$(git status --porcelain Casks/synctray.rb 2>/dev/null)" ]; then
-        git add Casks/synctray.rb
-        git commit -m "feat(cask): update SyncTray to version ${new_version#v} with new SHA256 checksum"
+    if [ -n "$(git status --porcelain Casks/limpet.rb 2>/dev/null)" ]; then
+        git add Casks/limpet.rb
+        git commit -m "feat(cask): update limpet to version ${new_version#v} with new SHA256 checksum"
         log_success "Committed cask update"
     fi
 
@@ -443,10 +443,10 @@ main() {
         create_github_release "$new_version" "$zip_path" "$changelog"
 
         # Update homebrew tap (TAP_DIR set by update_cask)
-        log_info "Updating homebrew-synctray tap at $TAP_DIR..."
+        log_info "Updating homebrew-limpet tap at $TAP_DIR..."
         cd "$TAP_DIR"
-        git add Casks/synctray.rb
-        if ! git commit -m "feat(cask): update SyncTray to ${new_version#v}"; then
+        git add Casks/limpet.rb
+        if ! git commit -m "feat(cask): update limpet to ${new_version#v}"; then
             log_error "Failed to commit tap update"
         fi
         if ! git push origin main; then

@@ -1,16 +1,16 @@
 #!/bin/bash
 #
-# CI Release Script for SyncTray
+# CI Release Script for limpet
 #
 # Runs in GitHub Actions after the version tag has been created.
-# Builds SyncTray.app, zips it, creates a GitHub release, and updates the
-# Homebrew tap (mthines/homebrew-synctray).
+# Builds limpet.app, zips it, creates a GitHub release, and updates the
+# Homebrew tap (mthines/homebrew-limpet).
 #
 # Required env:
 #   RELEASE_VERSION     - e.g. v0.35.0 or v0.35.0-beta.42.1
 #   IS_BETA             - "true" | "false"
 #   GITHUB_TOKEN        - For `gh release create`
-#   HOMEBREW_TAP_TOKEN  - PAT with repo scope on mthines/homebrew-synctray
+#   HOMEBREW_TAP_TOKEN  - PAT with repo scope on mthines/homebrew-limpet
 #
 # Optional env:
 #   PR_NUMBER           - Required when IS_BETA=true
@@ -37,10 +37,10 @@ fi
 VERSION="${RELEASE_VERSION#v}"
 TAG="v${VERSION}"
 
-PROJECT_NAME="SyncTray"
+PROJECT_NAME="limpet"
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="$PROJECT_DIR/build"
-XCODEPROJ="$PROJECT_DIR/SyncTray.xcodeproj"
+XCODEPROJ="$PROJECT_DIR/limpet.xcodeproj"
 
 cd "$PROJECT_DIR"
 
@@ -82,7 +82,7 @@ log_success "Build OK ($ARCH_INFO)"
 SIGNED="false"
 if [ -n "${MACOS_CERTIFICATE_P12_BASE64:-}" ] && [ -n "${MACOS_CERTIFICATE_PASSWORD:-}" ]; then
   log_info "Developer ID signing enabled — importing certificate into a temp keychain..."
-  KEYCHAIN="$BUILD_DIR/synctray-signing.keychain-db"
+  KEYCHAIN="$BUILD_DIR/limpet-signing.keychain-db"
   KEYCHAIN_PW="$(uuidgen)"
   CERT_P12="$BUILD_DIR/developer_id.p12"
   echo "$MACOS_CERTIFICATE_P12_BASE64" | base64 --decode > "$CERT_P12"
@@ -103,7 +103,7 @@ if [ -n "${MACOS_CERTIFICATE_P12_BASE64:-}" ] && [ -n "${MACOS_CERTIFICATE_PASSW
   [ -n "$IDENTITY" ] || log_error "No 'Developer ID Application' identity in the imported certificate."
   log_success "Signing identity: $IDENTITY"
 
-  APP_ENTITLEMENTS="$PROJECT_DIR/SyncTray/SyncTray.entitlements"
+  APP_ENTITLEMENTS="$PROJECT_DIR/limpet/limpet.entitlements"
 
   # Sign inside-out (nested code first, then the app). Hardened runtime
   # (--options runtime) + a secure --timestamp are required for notarization.
@@ -233,22 +233,22 @@ CHANGELOG+=$'\n---\n\n### Installation\n\n'
 if [ "$IS_BETA" = "true" ]; then
   CHANGELOG+='**Via Homebrew (beta tap):**'$'\n'
   CHANGELOG+='```bash'$'\n'
-  CHANGELOG+='brew tap mthines/synctray'$'\n'
-  CHANGELOG+='brew install --cask --force mthines/synctray/synctray-beta              # latest beta'$'\n'
-  CHANGELOG+="brew install --cask --force mthines/synctray/synctray-beta@${VERSION}    # this exact version"$'\n'
+  CHANGELOG+='brew tap mthines/limpet'$'\n'
+  CHANGELOG+='brew install --cask --force mthines/limpet/limpet-beta              # latest beta'$'\n'
+  CHANGELOG+="brew install --cask --force mthines/limpet/limpet-beta@${VERSION}    # this exact version"$'\n'
   CHANGELOG+='```'$'\n'
   CHANGELOG+=$'\n'
-  CHANGELOG+='> `--force` lets Homebrew overwrite a stable SyncTray.app already installed by the `synctray` cask.'$'\n'
+  CHANGELOG+='> `--force` lets Homebrew overwrite a stable limpet.app already installed by the `limpet` cask.'$'\n'
 else
   CHANGELOG+='**Via Homebrew (recommended):**'$'\n'
   CHANGELOG+='```bash'$'\n'
-  CHANGELOG+='brew tap mthines/synctray'$'\n'
-  CHANGELOG+='brew install --cask synctray'$'\n'
+  CHANGELOG+='brew tap mthines/limpet'$'\n'
+  CHANGELOG+='brew install --cask limpet'$'\n'
   CHANGELOG+='```'$'\n'
 fi
 
 CHANGELOG+=$'\n'
-CHANGELOG+='**Manual:** download '"\`${ZIP_NAME}\`"' below, unzip, drag SyncTray.app to /Applications.'$'\n\n'
+CHANGELOG+='**Manual:** download '"\`${ZIP_NAME}\`"' below, unzip, drag limpet.app to /Applications.'$'\n\n'
 CHANGELOG+='**Requirements:** macOS 13.0+, [rclone](https://rclone.org/) installed.'$'\n'
 
 # =============================================================================
@@ -288,16 +288,16 @@ if [ "${DRY_RUN:-}" = "true" ]; then
   exit 0
 fi
 
-log_info "Updating mthines/homebrew-synctray..."
+log_info "Updating mthines/homebrew-limpet..."
 
 # The source-of-truth cask lives in the app repo. We copy it wholesale to the
 # tap on every release so any change (depends_on, desc, zap, caveats) propagates
 # automatically — sed only patches version + sha256 on top.
-SOURCE_CASK="$PROJECT_DIR/Casks/synctray.rb"
+SOURCE_CASK="$PROJECT_DIR/Casks/limpet.rb"
 
-TAP_DIR="/tmp/homebrew-synctray-ci"
+TAP_DIR="/tmp/homebrew-limpet-ci"
 rm -rf "$TAP_DIR"
-git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/mthines/homebrew-synctray.git" "$TAP_DIR"
+git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/mthines/homebrew-limpet.git" "$TAP_DIR"
 
 cd "$TAP_DIR"
 git config user.name "github-actions[bot]"
@@ -305,32 +305,32 @@ git config user.email "github-actions[bot]@users.noreply.github.com"
 mkdir -p Casks
 
 if [ "$IS_BETA" = "true" ]; then
-  BETA_CASK="Casks/synctray-beta.rb"
+  BETA_CASK="Casks/limpet-beta.rb"
   cp "$SOURCE_CASK" "$BETA_CASK"
-  sed -i '' 's/cask "synctray"/cask "synctray-beta"/' "$BETA_CASK"
+  sed -i '' 's/cask "limpet"/cask "limpet-beta"/' "$BETA_CASK"
   sed -i '' "s/version \"[^\"]*\"/version \"${VERSION}\"/" "$BETA_CASK"
   sed -i '' "s/sha256 \"[^\"]*\"/sha256 \"${ZIP_SHA}\"/" "$BETA_CASK"
 
   # Pinned beta for reproducible installs
-  VERSIONED_CASK="Casks/synctray-beta@${VERSION}.rb"
+  VERSIONED_CASK="Casks/limpet-beta@${VERSION}.rb"
   cp "$BETA_CASK" "$VERSIONED_CASK"
-  sed -i '' "s/cask \"synctray-beta\"/cask \"synctray-beta@${VERSION}\"/" "$VERSIONED_CASK"
+  sed -i '' "s/cask \"limpet-beta\"/cask \"limpet-beta@${VERSION}\"/" "$VERSIONED_CASK"
 
   git add "$BETA_CASK" "$VERSIONED_CASK"
-  git commit -m "synctray-beta: update to ${TAG}"
-  log_success "Updated synctray-beta.rb + synctray-beta@${VERSION}.rb"
+  git commit -m "limpet-beta: update to ${TAG}"
+  log_success "Updated limpet-beta.rb + limpet-beta@${VERSION}.rb"
 else
-  STABLE_CASK="Casks/synctray.rb"
+  STABLE_CASK="Casks/limpet.rb"
   cp "$SOURCE_CASK" "$STABLE_CASK"
   sed -i '' "s/version \"[^\"]*\"/version \"${VERSION}\"/" "$STABLE_CASK"
   sed -i '' "s/sha256 \"[^\"]*\"/sha256 \"${ZIP_SHA}\"/" "$STABLE_CASK"
 
   git add "$STABLE_CASK"
-  git commit -m "synctray: update to ${TAG}"
-  log_success "Updated synctray.rb"
+  git commit -m "limpet: update to ${TAG}"
+  log_success "Updated limpet.rb"
 fi
 
-git remote set-url origin "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/mthines/homebrew-synctray.git"
+git remote set-url origin "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/mthines/homebrew-limpet.git"
 git push origin main
 
 cd "$PROJECT_DIR"

@@ -1,12 +1,12 @@
 #!/bin/bash
-# Build and install SyncTray to Applications folder
+# Build and install limpet to Applications folder
 
 set -e
 cd "$(dirname "$0")/.."
 
-APP_NAME="SyncTray"
+APP_NAME="limpet"
 BUILD_DIR="$(pwd)/build"
-BUILD_PATH="$BUILD_DIR/Build/Products/Debug/SyncTray.app"
+BUILD_PATH="$BUILD_DIR/Build/Products/Debug/limpet.app"
 INSTALL_PATH="/Applications/$APP_NAME.app"
 
 # Clean and build the app
@@ -14,7 +14,7 @@ echo "Cleaning build artifacts..."
 rm -rf "$BUILD_DIR"
 
 echo "Building $APP_NAME (full rebuild)..."
-xcodebuild -scheme SyncTray -configuration Debug \
+xcodebuild -scheme limpet -configuration Debug \
     -derivedDataPath "$BUILD_DIR" \
     build 2>&1 | grep -E "(error:|warning:.*error|BUILD)" || true
 

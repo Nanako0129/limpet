@@ -1,4 +1,4 @@
-// SyncTray signing configuration (tracked — contains NO personal data).
+// limpet signing configuration (tracked — contains NO personal data).
 //
 // CI and the release build produce UNSIGNED apps (CODE_SIGNING_ALLOWED=NO is passed
 // on the xcodebuild command line by .github/workflows/ci.yml and scripts/release-ci.sh),
@@ -16,8 +16,8 @@ CODE_SIGN_STYLE = Automatic
 // Dev (Debug) builds get a distinct bundle id so a dev build never collides with an
 // installed release (e.g. shared UserDefaults/notification identity). Release keeps
 // the empty suffix, so the shipping bundle id is unchanged.
-//   Debug:   com.synctray.app.dev
-//   Release: com.synctray.app
+//   Debug:   com.nanako.limpet.dev
+//   Release: com.nanako.limpet
 BUNDLE_ID_SUFFIX =
 BUNDLE_ID_SUFFIX[config=Debug] = .dev
 

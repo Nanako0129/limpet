@@ -1,8 +1,8 @@
-# SyncTray Development Guidelines
+# limpet Development Guidelines
 
 ## Project Overview
 
-SyncTray is a macOS menu bar application that provides Google Drive-style background folder sync using rclone. It syncs a local folder one-way with any of rclone's 70+ supported cloud providers (Dropbox, OneDrive, Google Drive, S3, SFTP, etc.).
+limpet is a macOS menu bar application that provides Google Drive-style background folder sync using rclone. It syncs a local folder one-way with any of rclone's 70+ supported cloud providers (Dropbox, OneDrive, Google Drive, S3, SFTP, etc.).
 
 ### Key Features
 - **Multi-profile support**: Configure multiple sync pairs (local folder ↔ cloud remote)
@@ -22,7 +22,7 @@ SyncTray is a macOS menu bar application that provides Google Drive-style backgr
 
 ### How It Works
 1. User configures a profile: local path, rclone remote, and sync interval
-2. SyncTray generates a shell script and launchd plist for scheduled syncs
+2. limpet generates a shell script and launchd plist for scheduled syncs
 3. LogWatcher monitors the sync log file for state changes and progress
 4. DirectoryWatcher monitors the local folder for file changes (triggers immediate sync)
 5. NotificationService batches and displays file change notifications
@@ -30,12 +30,12 @@ SyncTray is a macOS menu bar application that provides Google Drive-style backgr
 ## Architecture
 
 ```
-SyncTray/
+limpet/
 ├── Models/           # Data models and state types
 ├── Services/         # Business logic and background services
 ├── Views/            # SwiftUI views
 ├── Assets.xcassets/  # App icons and images
-└── SyncTrayApp.swift # App entry point and AppDelegate
+└── LimpetApp.swift # App entry point and AppDelegate
 ```
 
 ### Models/
@@ -57,23 +57,23 @@ SyncTray/
 | `LogWatcher.swift` | FSEvents + polling hybrid file watcher for rclone log files |
 | `LogParser.swift` | Parses plain text and JSON log lines into typed `ParsedLogEvent` |
 | `DirectoryWatcher.swift` | FSEvents-based directory monitoring with debouncing |
-| `ConfigFileWatcher.swift` | FSEvents watcher on `~/.config/synctray` for external profile/settings edits; self-write suppression via `ConfigSelfWriteRegistry` |
+| `ConfigFileWatcher.swift` | FSEvents watcher on `~/.config/limpet` for external profile/settings edits; self-write suppression via `ConfigSelfWriteRegistry` |
 | `ConfigReconciler.swift` | `SyncManager.reconcileAction` (shared launchd install/uninstall/reinstall delta logic) and `SyncManager.applyExternalCreateIfNeeded`/`ExternalCreateOutcome` (create-from-file decision) |
-| `AppSettingsFileStore.swift` | Reads/writes `~/.config/synctray/settings.json` — an enumerated safe-key mirror of `SyncTraySettings` |
-| `ConfigSchemaInstaller.swift` | Copies the committed JSON Schemas into `~/.config/synctray/schema/` at launch |
-| `ConfigSelfTest.swift` | `#if DEBUG` host self-test suite (`SyncTray --self-test`) — round-trip, migration + migration-integrity, reconcile-delta, self-write, isolated-login, external-create, and CLI assertions |
+| `AppSettingsFileStore.swift` | Reads/writes `~/.config/limpet/settings.json` — an enumerated safe-key mirror of `LimpetSettings` |
+| `ConfigSchemaInstaller.swift` | Copies the committed JSON Schemas into `~/.config/limpet/schema/` at launch |
+| `ConfigSelfTest.swift` | `#if DEBUG` host self-test suite (`limpet --self-test`) — round-trip, migration + migration-integrity, reconcile-delta, self-write, isolated-login, external-create, and CLI assertions |
 | `NotificationService.swift` | Batched macOS notifications with action support |
 
 ### CLI/
 
 | File | Purpose |
 |------|---------|
-| `SyncTrayCLI.swift` | Headless `synctray` CLI — `CLICommand`, `parse`/`execute`/`run` (pure over `CLIEnvironment`), `doctorChecks`, `resolveProfile`, `applyProfileAssignment` (bounded `profile set` key set); mutating commands (`profile create`/`show`/`set`/`enable`/`disable`/`delete`, `sync`, `install`/`reinstall`) drive `ProfileStore.writeProfileFile` + `SyncSetupService`; dispatched from `SyncTrayApp.init` before SwiftUI/`SyncManager` |
-| `CLIShimInstaller.swift` | Writes/refreshes the `~/.local/bin/synctray` shim on every launch; marker-guarded so it never clobbers a non-SyncTray file |
+| `LimpetCLI.swift` | Headless `limpet` CLI — `CLICommand`, `parse`/`execute`/`run` (pure over `CLIEnvironment`), `doctorChecks`, `resolveProfile`, `applyProfileAssignment` (bounded `profile set` key set); mutating commands (`profile create`/`show`/`set`/`enable`/`disable`/`delete`, `sync`, `install`/`reinstall`) drive `ProfileStore.writeProfileFile` + `SyncSetupService`; dispatched from `LimpetApp.init` before SwiftUI/`SyncManager` |
+| `CLIShimInstaller.swift` | Writes/refreshes the `~/.local/bin/limpet` shim on every launch; marker-guarded so it never clobbers a non-limpet file |
 
 ### File-Backed Configuration
 
-`~/.config/synctray/` is the editable, authoritative surface for SyncTray's
+`~/.config/limpet/` is the editable, authoritative surface for limpet's
 configuration: an external agent or human can hand-edit these files and the
 running app applies the change live, without a restart.
 
@@ -81,11 +81,11 @@ running app applies the change live, without a restart.
 |------|----------|-------|
 | `profiles/{shortId}.profile.json` | Full `SyncProfile`, including `isEnabled`, `isMuted` | NEW authoritative file. Written by `ProfileStore.save()` (encodes the whole model, so any new `SyncProfile` field flows in automatically); read by `ProfileStore.load()` (file-authoritative). References `../schema/profile.schema.json` via `$schema`. |
 | `profiles/{shortId}.json` | Derived, script-only subset (frozen key set) | Unchanged, byte-for-byte — this is `SyncSetupService.generateProfileConfig`'s output, consumed only by the sync shell script. The app never reads it back. |
-| `settings.json` | Enumerated safe subset of `SyncTraySettings` (`debugLoggingEnabled`, `launchAtLogin`) | Written by `AppSettingsFileStore`. |
+| `settings.json` | Enumerated safe subset of `LimpetSettings` (`debugLoggingEnabled`, `launchAtLogin`) | Written by `AppSettingsFileStore`. |
 | `schema/profile.schema.json`, `schema/settings.schema.json` | Committed JSON Schemas | Copied out of the app bundle by `ConfigSchemaInstaller` at every launch. Kept in lockstep with `SyncProfile.CodingKeys` by the fail-closed `scripts/check-schema-in-sync.sh`, run locally and in CI. |
 
 **Live apply, not a struct swap.** A single `ConfigFileWatcher` (FSEvents,
-~1s debounce) watches the whole `~/.config/synctray` directory. Every edit —
+~1s debounce) watches the whole `~/.config/limpet` directory. Every edit —
 from the UI's Save button or an external file write — routes through the SAME
 reconcile path (`SyncManager.applyExternalProfileEdit` /
 `applyExternalSettingsEdit`), which mirrors the reinstall/enable/disable
@@ -109,16 +109,16 @@ enabled/disabled/garbage/canonicalize matrix.
 
 **Threat model — this is a conscious acceptance, not an oversight.** Creating and
 installing a launchd agent from a dropped file is the deliberate goal: an agent or
-a human edits files under `~/.config/synctray` to set SyncTray up. It does not
-widen the trust boundary. Every writer of `~/.config/synctray/profiles/` already
+a human edits files under `~/.config/limpet` to set limpet up. It does not
+widen the trust boundary. Every writer of `~/.config/limpet/profiles/` already
 runs as the user, and a same-user process can write a `~/Library/LaunchAgents/*.plist`
-and `launchctl load` it directly — SyncTray adds no privilege the attacker lacked.
+and `launchctl load` it directly — limpet adds no privilege the attacker lacked.
 The profile files are also credential-free: rclone remotes and secrets live in
 `~/.config/rclone/rclone.conf`, never here, so a malicious drop can schedule an
 agent but can't exfiltrate or forge credentials through this path.
 
 **Self-write suppression.** `ConfigSelfWriteRegistry` tracks the content hash
-of every file SyncTray itself writes; `ConfigFileWatcher.shouldReconcile`
+of every file limpet itself writes; `ConfigFileWatcher.shouldReconcile`
 drops an FSEvent whose file content hash matches a just-noted self-write, so
 the app never reacts to its own writes.
 
@@ -137,8 +137,8 @@ per-profile file exists yet, so the mirror can never create a split-brain.
 when the number of files accounted for on disk is fewer than the profiles in the
 source blob, so a silent partial migration is observable.
 
-**Testing.** SyncTray has no XCTest target (Option A — see `docs/` if this
-changes). `ConfigSelfTest.swift` (`#if DEBUG`) runs as `SyncTray --self-test`
+**Testing.** limpet has no XCTest target (Option A — see `docs/` if this
+changes). `ConfigSelfTest.swift` (`#if DEBUG`) runs as `limpet --self-test`
 and exits non-zero on any failed assertion; `scripts/check-schema-in-sync.sh`
 is the separate, fail-closed schema-drift gate.
 
@@ -157,17 +157,17 @@ is the separate, fail-closed schema-drift gate.
 
 ## Agent-Editable Configuration & CLI
 
-`~/.config/synctray/` (see **File-Backed Configuration** above) and the
-headless `synctray` CLI together make SyncTray fully scriptable by an agent —
+`~/.config/limpet/` (see **File-Backed Configuration** above) and the
+headless `limpet` CLI together make limpet fully scriptable by an agent —
 bootstrapping a new sync, checking health, and introspecting profiles, all
 without opening the app UI.
 
 ### Bootstrapping a profile by dropping a file
 
-A `*.profile.json` written into `~/.config/synctray/profiles/` with a NEW,
+A `*.profile.json` written into `~/.config/limpet/profiles/` with a NEW,
 well-formed `id` CREATES that profile (see **Creation via file, not just
 editing** above) — an agent no longer has to go through the UI to start a
-sync. Validate the file against `~/.config/synctray/schema/profile.schema.json`
+sync. Validate the file against `~/.config/limpet/schema/profile.schema.json`
 before writing it; the schema's top-level `description` documents the
 creation behavior. Only FIVE keys are required — `id`, `name`, `rcloneRemote`,
 `remotePath`, `localSyncPath` — so an agent can author a minimal profile and
@@ -181,46 +181,46 @@ and `isValid` (non-empty `name`/`rcloneRemote`/`remotePath`/`localSyncPath`) —
 so an agent can stage a profile disabled, then flip `isEnabled` in a follow-up
 edit once it's confident the fields are correct.
 
-### The `synctray` CLI
+### The `limpet` CLI
 
-SyncTray installs a shim at `~/.local/bin/synctray` on every launch
+limpet installs a shim at `~/.local/bin/limpet` on every launch
 (`CLIShimInstaller`, called from `AppDelegate.applicationDidFinishLaunching`)
 that `exec`s the running app's binary with whatever subcommand you pass —
-**`~/.local/bin` must be on `PATH`** for the bare `synctray` command to
-resolve (matches the existing `~/.local/bin/synctray-sync.sh` convention). The
+**`~/.local/bin` must be on `PATH`** for the bare `limpet` command to
+resolve (matches the existing `~/.local/bin/limpet-sync.sh` convention). The
 shim is idempotent and marker-guarded: it refreshes on every launch (so it
 survives a `brew upgrade`/app move) but is never written over a file that
-isn't SyncTray's own.
+isn't limpet's own.
 
 **Inspect** (read-only):
 
 | Command | Purpose |
 |---------|---------|
-| `synctray doctor` | Health report: rclone found + version, config schemas installed, per-profile derived-config presence, launchd agent loaded (enabled profiles), stale lock files, remote reachability. Exits non-zero iff any check is `[fail]`; `[warn]` never fails the run. |
-| `synctray status [name\|shortId]` | One tab-separated line per profile (or a single one): `enabled=`, `agent=loaded\|unloaded\|n/a`, `running=` (lock present), `last=started\|completed\|failed\|none` (from the log tail via the shared `SyncLogPatterns`). |
-| `synctray profiles` | List every profile: name, shortId, mode, `enabled=`, `remote=` — no secrets. (`profile list` is an alias.) |
-| `synctray profile show <name\|shortId>` | Print one profile's FULL config as pretty, sorted-key JSON — the same shape as its `.profile.json`, so an agent can `show` → edit → `profile create`/`profile set` round-trip. No secrets (credentials live in `rclone.conf`). |
-| `synctray logs <name\|shortId> [--follow]` | Print (or `tail -f`) that profile's sync log. |
-| `synctray test-remote <name\|shortId>` | Probe one profile's remote with `rclone lsd` under a hard timeout; prints `reachable: <remote>` or the real rclone stderr. |
-| `synctray listremotes` | `rclone listremotes`, passthrough. |
+| `limpet doctor` | Health report: rclone found + version, config schemas installed, per-profile derived-config presence, launchd agent loaded (enabled profiles), stale lock files, remote reachability. Exits non-zero iff any check is `[fail]`; `[warn]` never fails the run. |
+| `limpet status [name\|shortId]` | One tab-separated line per profile (or a single one): `enabled=`, `agent=loaded\|unloaded\|n/a`, `running=` (lock present), `last=started\|completed\|failed\|none` (from the log tail via the shared `SyncLogPatterns`). |
+| `limpet profiles` | List every profile: name, shortId, mode, `enabled=`, `remote=` — no secrets. (`profile list` is an alias.) |
+| `limpet profile show <name\|shortId>` | Print one profile's FULL config as pretty, sorted-key JSON — the same shape as its `.profile.json`, so an agent can `show` → edit → `profile create`/`profile set` round-trip. No secrets (credentials live in `rclone.conf`). |
+| `limpet logs <name\|shortId> [--follow]` | Print (or `tail -f`) that profile's sync log. |
+| `limpet test-remote <name\|shortId>` | Probe one profile's remote with `rclone lsd` under a hard timeout; prints `reachable: <remote>` or the real rclone stderr. |
+| `limpet listremotes` | `rclone listremotes`, passthrough. |
 
 **Configure** (mutating — headless-capable, no running app required):
 
 | Command | Purpose |
 |---------|---------|
-| `synctray profile create --from <file>` / `... create -` | Create a profile from a `.profile.json` file (or stdin `-`). Validates by decoding (a bad file exits `65` with the decode error — the feedback an agent needs); refuses a colliding `id`/`shortId` (`1`); writes the authoritative file, then installs the launchd agent iff `isEnabled && isValid` — the SAME persist-then-install rule as the file-watcher create path (`applyExternalCreateIfNeeded`). |
-| `synctray profile enable <name\|shortId>` | Set `isEnabled=true`, rewrite the file, install the agent. |
-| `synctray profile disable <name\|shortId>` | Set `isEnabled=false`, rewrite the file, uninstall the agent. |
-| `synctray profile set <name\|shortId> <key> <value> [<key> <value> …]` | Edit fields on an existing profile from a BOUNDED key set (mirrors `SyncProfile.CodingKeys` minus `id`/`isEnabled`; positional `key value` pairs), rewrite the authoritative `.profile.json`, then drive the launchd delta `SyncManager.reconcileAction` dictates (reinstall as needed). Validates ALL assignments against a copy first — an unknown key or invalid value exits `65` and writes nothing. Use `enable`/`disable` for `isEnabled`. |
-| `synctray profile delete <name\|shortId>` | Uninstall the agent and remove the `.profile.json`. |
-| `synctray install <name\|shortId>` | Install an already-enabled profile's launchd agent (idempotent; runs `SyncSetupService.install`). Complements `profile enable`, which early-returns without installing when the profile is ALREADY enabled — so `install` re-creates an agent that went missing. Refuses a disabled or incomplete profile. Never flips `isEnabled`. |
-| `synctray reinstall <name\|shortId>` | Regenerate script+plist and reinstall the agent (uninstall → install), i.e. the settings-save reinstall path. Works for any sync mode. Refuses a disabled profile. |
+| `limpet profile create --from <file>` / `... create -` | Create a profile from a `.profile.json` file (or stdin `-`). Validates by decoding (a bad file exits `65` with the decode error — the feedback an agent needs); refuses a colliding `id`/`shortId` (`1`); writes the authoritative file, then installs the launchd agent iff `isEnabled && isValid` — the SAME persist-then-install rule as the file-watcher create path (`applyExternalCreateIfNeeded`). |
+| `limpet profile enable <name\|shortId>` | Set `isEnabled=true`, rewrite the file, install the agent. |
+| `limpet profile disable <name\|shortId>` | Set `isEnabled=false`, rewrite the file, uninstall the agent. |
+| `limpet profile set <name\|shortId> <key> <value> [<key> <value> …]` | Edit fields on an existing profile from a BOUNDED key set (mirrors `SyncProfile.CodingKeys` minus `id`/`isEnabled`; positional `key value` pairs), rewrite the authoritative `.profile.json`, then drive the launchd delta `SyncManager.reconcileAction` dictates (reinstall as needed). Validates ALL assignments against a copy first — an unknown key or invalid value exits `65` and writes nothing. Use `enable`/`disable` for `isEnabled`. |
+| `limpet profile delete <name\|shortId>` | Uninstall the agent and remove the `.profile.json`. |
+| `limpet install <name\|shortId>` | Install an already-enabled profile's launchd agent (idempotent; runs `SyncSetupService.install`). Complements `profile enable`, which early-returns without installing when the profile is ALREADY enabled — so `install` re-creates an agent that went missing. Refuses a disabled or incomplete profile. Never flips `isEnabled`. |
+| `limpet reinstall <name\|shortId>` | Regenerate script+plist and reinstall the agent (uninstall → install), i.e. the settings-save reinstall path. Works for any sync mode. Refuses a disabled profile. |
 
 **Operate:**
 
 | Command | Purpose |
 |---------|---------|
-| `synctray sync <name\|shortId>` | Run one sync now and BLOCK until it finishes, returning the script's exit code — exactly what the app's `triggerManualSync` runs (`bash <sharedScript> <configPath>`), lock-file-guarded against a concurrent scheduled run. |
+| `limpet sync <name\|shortId>` | Run one sync now and BLOCK until it finishes, returning the script's exit code — exactly what the app's `triggerManualSync` runs (`bash <sharedScript> <configPath>`), lock-file-guarded against a concurrent scheduled run. |
 
 `<name|shortId>` resolution tries an exact `shortId` match first, then a
 case-insensitive `name` match; an unmatched (or ambiguous) target exits
@@ -235,15 +235,15 @@ converge on identical files and one loaded agent, so running both is redundant,
 not conflicting. Profile files stay credential-free (rclone secrets live in
 `~/.config/rclone/rclone.conf`), so nothing the CLI writes carries a credential.
 
-**Dispatch and safety.** `SyncTrayCLI.dispatch` is checked at the very top of
-`SyncTrayApp.init` — before `--self-test`, before `MigrationRunner`,
+**Dispatch and safety.** `LimpetCLI.dispatch` is checked at the very top of
+`LimpetApp.init` — before `--self-test`, before `MigrationRunner`,
 or `SyncManager()` — and `exit()`s the process
 before any of that runs. A CLI invocation NEVER opens a window and NEVER
 starts a background watcher or timer; `dispatch` returns `nil` (falling
 through to the normal app launch) for a bare launch and for `-`-prefixed args
 (`--self-test`, macOS's `-psn_…`), except `-h`/`--help`.
 
-**Pure core / impure shell.** `SyncTrayCLI.parse`/`execute`/`run`/`doctorChecks`
+**Pure core / impure shell.** `LimpetCLI.parse`/`execute`/`run`/`doctorChecks`
 are pure over an injected `CLIEnvironment` (rclone invocation, profile reads +
 writes, install/uninstall, sync-script run, `launchctl`, stdio) — `ConfigSelfTest`'s
 AC-CLI1–AC-CLI6 drive the full dispatch/doctor/resolution/shim-install AND the
@@ -262,7 +262,7 @@ from a CLI invocation is ever sent anywhere else.
 ```
 launchd triggers sync script
         ↓
-Script writes to log file (~/.local/log/synctray-sync-{shortId}.log)
+Script writes to log file (~/.local/log/limpet-sync-{shortId}.log)
         ↓
 LogWatcher detects file changes (FSEvents + polling fallback)
         ↓
@@ -418,33 +418,33 @@ func doBackgroundWork() {
 ## Debugging
 
 ### Enable Debug Logging
-In Settings, toggle "Debug Logging" to enable verbose output. Debug messages are written via `SyncTraySettings.debugLog()` and appear in the sync log files.
+In Settings, toggle "Debug Logging" to enable verbose output. Debug messages are written via `LimpetSettings.debugLog()` and appear in the sync log files.
 
 ### Inspect launchd Agents
 ```bash
-# List SyncTray agents
-launchctl list | grep synctray
+# List limpet agents
+launchctl list | grep limpet
 
 # Check agent status
-launchctl print gui/$(id -u)/com.synctray.sync.{shortId}
+launchctl print gui/$(id -u)/com.nanako.limpet.watch.{shortId}
 
 # View agent definition
-cat ~/Library/LaunchAgents/com.synctray.sync.*.plist
+cat ~/Library/LaunchAgents/com.nanako.limpet.watch.*.plist
 ```
 
 ### View Sync Logs
 ```bash
 # Tail live log
-tail -f ~/.local/log/synctray-sync-{shortId}.log
+tail -f ~/.local/log/limpet-sync-{shortId}.log
 
 # View profile config
-cat ~/.config/synctray/profiles/{shortId}.json
+cat ~/.config/limpet/profiles/{shortId}.json
 ```
 
 ### Lock Files
 If sync appears stuck, check for stale lock files:
 ```bash
-ls -la /tmp/synctray-sync-*.lock
+ls -la /tmp/limpet-sync-*.lock
 ```
 
 The app automatically cleans stale locks on startup.
@@ -453,13 +453,13 @@ The app automatically cleans stale locks on startup.
 
 ```bash
 # Build the project
-xcodebuild -scheme SyncTray -destination 'platform=macOS' build
+xcodebuild -scheme limpet -destination 'platform=macOS' build
 
 # Build with verbose output
-xcodebuild -scheme SyncTray -destination 'platform=macOS' build 2>&1 | xcbeautify
+xcodebuild -scheme limpet -destination 'platform=macOS' build 2>&1 | xcbeautify
 
 # Run the app
-open ~/Library/Developer/Xcode/DerivedData/SyncTray-*/Build/Products/Debug/SyncTray.app
+open ~/Library/Developer/Xcode/DerivedData/limpet-*/Build/Products/Debug/limpet.app
 ```
 
 ## Key Files Reference
@@ -471,9 +471,9 @@ open ~/Library/Developer/Xcode/DerivedData/SyncTray-*/Build/Products/Debug/SyncT
 | `SyncManager.swift` | Central state manager, LogWatcher/DirectoryWatcher coordination |
 | `SettingsView.swift` | Main settings UI with profile editing |
 | `ProfileStore.swift` | File-backed profile persistence — authoritative `{shortId}.profile.json` per profile, write-only blob mirror (see "File-Backed Configuration") |
-| `ConfigFileWatcher.swift` | Live-apply watcher for `~/.config/synctray` (profiles + settings); routes an unknown-id `.profile.json` to create-via-file |
-| `SyncTrayCLI.swift` | Headless `synctray` CLI: inspect (`doctor`/`status`/`profiles`/`profile show`/`logs`/`test-remote`/`listremotes`), configure (`profile create`/`set`/`enable`/`disable`/`delete`, `install`/`reinstall`), operate (`sync`); dispatched from `SyncTrayApp.init` (see "Agent-Editable Configuration & CLI") |
-| `CLIShimInstaller.swift` | Installs the `~/.local/bin/synctray` shim (`~/.local/bin` must be on `PATH`) |
+| `ConfigFileWatcher.swift` | Live-apply watcher for `~/.config/limpet` (profiles + settings); routes an unknown-id `.profile.json` to create-via-file |
+| `LimpetCLI.swift` | Headless `limpet` CLI: inspect (`doctor`/`status`/`profiles`/`profile show`/`logs`/`test-remote`/`listremotes`), configure (`profile create`/`set`/`enable`/`disable`/`delete`, `install`/`reinstall`), operate (`sync`); dispatched from `LimpetApp.init` (see "Agent-Editable Configuration & CLI") |
+| `CLIShimInstaller.swift` | Installs the `~/.local/bin/limpet` shim (`~/.local/bin` must be on `PATH`) |
 | `SyncLogPatterns` | Centralized log message pattern matching (includes `isOutOfSyncError`) |
 | `Settings.swift` | Global settings (debug logging toggle) |
 
@@ -481,9 +481,9 @@ open ~/Library/Developer/Xcode/DerivedData/SyncTray-*/Build/Products/Debug/SyncT
 
 | Path | Purpose |
 |------|---------|
-| `~/.config/synctray/profiles/{shortId}.json` | Profile config |
-| `~/.config/synctray/profiles/{shortId}-exclude.txt` | Exclude filter (user-editable) |
-| `~/.local/bin/synctray-sync.sh` | Shared sync script (all profiles) |
-| `~/Library/LaunchAgents/com.synctray.sync.{shortId}.plist` | launchd schedule |
-| `~/.local/log/synctray-sync-{shortId}.log` | Sync logs |
-| `/tmp/synctray-sync-{shortId}.lock` | Lock file (prevents concurrent syncs) |
+| `~/.config/limpet/profiles/{shortId}.json` | Profile config |
+| `~/.config/limpet/profiles/{shortId}-exclude.txt` | Exclude filter (user-editable) |
+| `~/.local/bin/limpet-sync.sh` | Shared sync script (all profiles) |
+| `~/Library/LaunchAgents/com.nanako.limpet.watch.{shortId}.plist` | launchd schedule |
+| `~/.local/log/limpet-sync-{shortId}.log` | Sync logs |
+| `/tmp/limpet-sync-{shortId}.lock` | Lock file (prevents concurrent syncs) |
