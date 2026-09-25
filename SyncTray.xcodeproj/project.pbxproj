@@ -48,38 +48,13 @@
 		F99405AC91359147E15ABEFD /* SyncTrayCLI.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5FF13407D6D0E3A3B55ED862 /* SyncTrayCLI.swift */; };
 		FC42AD91FD4C3FCBE784DE4F /* AppSettingsFileStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 48C81844C44AA7C559B6730B /* AppSettingsFileStore.swift */; };
 		FC6298CE8767141C78EB8D75 /* ConfigSelfTest.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7F52EB2FA3D07D3E970F226D /* ConfigSelfTest.swift */; };
-		FS000000000000000000B001 /* FinderSyncExtension.swift in Sources */ = {isa = PBXBuildFile; fileRef = FS000000000000000000A001 /* FinderSyncExtension.swift */; };
-		FS000000000000000000B002 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = FS000000000000000000A002 /* Assets.xcassets */; };
-		FS000000000000000000B003 /* SyncTrayFinderSync.appex in Embed App Extensions */ = {isa = PBXBuildFile; fileRef = FS000000000000000000A003 /* SyncTrayFinderSync.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		OT00000000000000000000B1 /* TelemetryService.swift in Sources */ = {isa = PBXBuildFile; fileRef = OT00000000000000000000A1 /* TelemetryService.swift */; };
 		OT00000000000000000000C1 /* OpenTelemetryApi in Frameworks */ = {isa = PBXBuildFile; productRef = OT00000000000000000000D1 /* OpenTelemetryApi */; };
 		OT00000000000000000000C2 /* OpenTelemetrySdk in Frameworks */ = {isa = PBXBuildFile; productRef = OT00000000000000000000D2 /* OpenTelemetrySdk */; };
 		OT00000000000000000000C3 /* OpenTelemetryProtocolExporterHTTP in Frameworks */ = {isa = PBXBuildFile; productRef = OT00000000000000000000D3 /* OpenTelemetryProtocolExporterHTTP */; };
 /* End PBXBuildFile section */
 
-/* Begin PBXContainerItemProxy section */
-		FS000000000000000000E001 /* PBXContainerItemProxy */ = {
-			isa = PBXContainerItemProxy;
-			containerPortal = A17000000000000000000001 /* Project object */;
-			proxyType = 1;
-			remoteGlobalIDString = FS000000000000000000F001;
-			remoteInfo = SyncTrayFinderSync;
-		};
-/* End PBXContainerItemProxy section */
 
-/* Begin PBXCopyFilesBuildPhase section */
-		FS000000000000000000C001 /* Embed App Extensions */ = {
-			isa = PBXCopyFilesBuildPhase;
-			buildActionMask = 2147483647;
-			dstPath = "";
-			dstSubfolderSpec = 13;
-			files = (
-				FS000000000000000000B003 /* SyncTrayFinderSync.appex in Embed App Extensions */,
-			);
-			name = "Embed App Extensions";
-			runOnlyForDeploymentPostprocessing = 0;
-		};
-/* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
 		0A584CD77E2D28463C2BCE08 /* profile.schema.json */ = {isa = PBXFileReference; includeInIndex = 1; path = profile.schema.json; sourceTree = "<group>"; };
@@ -126,11 +101,6 @@
 		E1A0B1C2D3E4F56789AB0006 /* TelemetryOptInBanner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TelemetryOptInBanner.swift; sourceTree = "<group>"; };
 		E1A0B1C2D3E4F56789AB0008 /* TelemetryDetailsSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TelemetryDetailsSheet.swift; sourceTree = "<group>"; };
 		F2B3C4D5E6F7089012AB0002 /* MigrationRunner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MigrationRunner.swift; sourceTree = "<group>"; };
-		FS000000000000000000A001 /* FinderSyncExtension.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FinderSyncExtension.swift; sourceTree = "<group>"; };
-		FS000000000000000000A002 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
-		FS000000000000000000A003 /* SyncTrayFinderSync.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = SyncTrayFinderSync.appex; sourceTree = BUILT_PRODUCTS_DIR; };
-		FS000000000000000000A004 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
-		FS000000000000000000A005 /* SyncTrayFinderSync.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = SyncTrayFinderSync.entitlements; sourceTree = "<group>"; };
 		FSCFG00000000000000000001 /* Signing.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Config/Signing.xcconfig; sourceTree = SOURCE_ROOT; };
 		OT00000000000000000000A1 /* TelemetryService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TelemetryService.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
@@ -143,13 +113,6 @@
 				OT00000000000000000000C1 /* OpenTelemetryApi in Frameworks */,
 				OT00000000000000000000C2 /* OpenTelemetrySdk in Frameworks */,
 				OT00000000000000000000C3 /* OpenTelemetryProtocolExporterHTTP in Frameworks */,
-			);
-			runOnlyForDeploymentPostprocessing = 0;
-		};
-		FS000000000000000000C002 /* Frameworks */ = {
-			isa = PBXFrameworksBuildPhase;
-			buildActionMask = 2147483647;
-			files = (
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -190,7 +153,6 @@
 			isa = PBXGroup;
 			children = (
 				A13000000000000000000002 /* SyncTray */,
-				FS000000000000000000D001 /* SyncTrayFinderSync */,
 				A13000000000000000000006 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -268,7 +230,6 @@
 			isa = PBXGroup;
 			children = (
 				A1000000000000000000000C /* SyncTray.app */,
-				FS000000000000000000A003 /* SyncTrayFinderSync.appex */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -300,17 +261,6 @@
 			path = Resources;
 			sourceTree = "<group>";
 		};
-		FS000000000000000000D001 /* SyncTrayFinderSync */ = {
-			isa = PBXGroup;
-			children = (
-				FS000000000000000000A001 /* FinderSyncExtension.swift */,
-				FS000000000000000000A004 /* Info.plist */,
-				FS000000000000000000A005 /* SyncTrayFinderSync.entitlements */,
-				FS000000000000000000A002 /* Assets.xcassets */,
-			);
-			path = SyncTrayFinderSync;
-			sourceTree = "<group>";
-		};
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
@@ -322,12 +272,10 @@
 				A12000000000000000000001 /* Frameworks */,
 				A19000000000000000000001 /* Resources */,
 				A1B000000000000000000001 /* Embed Git Metadata */,
-				FS000000000000000000C001 /* Embed App Extensions */,
 			);
 			buildRules = (
 			);
 			dependencies = (
-				FS000000000000000000E002 /* PBXTargetDependency */,
 			);
 			name = SyncTray;
 			packageProductDependencies = (
@@ -338,23 +286,6 @@
 			productName = SyncTray;
 			productReference = A1000000000000000000000C /* SyncTray.app */;
 			productType = "com.apple.product-type.application";
-		};
-		FS000000000000000000F001 /* SyncTrayFinderSync */ = {
-			isa = PBXNativeTarget;
-			buildConfigurationList = FS000000000000000000G001 /* Build configuration list for PBXNativeTarget "SyncTrayFinderSync" */;
-			buildPhases = (
-				FS000000000000000000H001 /* Sources */,
-				FS000000000000000000C002 /* Frameworks */,
-				FS000000000000000000H002 /* Resources */,
-			);
-			buildRules = (
-			);
-			dependencies = (
-			);
-			name = SyncTrayFinderSync;
-			productName = SyncTrayFinderSync;
-			productReference = FS000000000000000000A003 /* SyncTrayFinderSync.appex */;
-			productType = "com.apple.product-type.app-extension";
 		};
 /* End PBXNativeTarget section */
 
@@ -367,9 +298,6 @@
 				LastUpgradeCheck = 1500;
 				TargetAttributes = {
 					A14000000000000000000001 = {
-						CreatedOnToolsVersion = 15.0;
-					};
-					FS000000000000000000F001 = {
 						CreatedOnToolsVersion = 15.0;
 					};
 				};
@@ -391,7 +319,6 @@
 			projectRoot = "";
 			targets = (
 				A14000000000000000000001 /* SyncTray */,
-				FS000000000000000000F001 /* SyncTrayFinderSync */,
 			);
 		};
 /* End PBXProject section */
@@ -404,14 +331,6 @@
 				A11111110000000000000010 /* Assets.xcassets in Resources */,
 				AF1148C620DEEB255ED5697E /* profile.schema.json in Resources */,
 				CD8DBB07353E3912253F60F6 /* settings.schema.json in Resources */,
-			);
-			runOnlyForDeploymentPostprocessing = 0;
-		};
-		FS000000000000000000H002 /* Resources */ = {
-			isa = PBXResourcesBuildPhase;
-			buildActionMask = 2147483647;
-			files = (
-				FS000000000000000000B002 /* Assets.xcassets in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -486,23 +405,8 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
-		FS000000000000000000H001 /* Sources */ = {
-			isa = PBXSourcesBuildPhase;
-			buildActionMask = 2147483647;
-			files = (
-				FS000000000000000000B001 /* FinderSyncExtension.swift in Sources */,
-			);
-			runOnlyForDeploymentPostprocessing = 0;
-		};
 /* End PBXSourcesBuildPhase section */
 
-/* Begin PBXTargetDependency section */
-		FS000000000000000000E002 /* PBXTargetDependency */ = {
-			isa = PBXTargetDependency;
-			target = FS000000000000000000F001 /* SyncTrayFinderSync */;
-			targetProxy = FS000000000000000000E001 /* PBXContainerItemProxy */;
-		};
-/* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
 		A18000000000000000000001 /* Debug */ = {
@@ -681,58 +585,6 @@
 			};
 			name = Release;
 		};
-		FS000000000000000000I001 /* Debug */ = {
-			isa = XCBuildConfiguration;
-			baseConfigurationReference = FSCFG00000000000000000001 /* Signing.xcconfig */;
-			buildSettings = {
-				CODE_SIGN_ENTITLEMENTS = SyncTrayFinderSync/SyncTrayFinderSync.entitlements;
-				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "Apple Development";
-				CODE_SIGN_STYLE = Automatic;
-				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 1;
-				GENERATE_INFOPLIST_FILE = NO;
-				INFOPLIST_FILE = SyncTrayFinderSync/Info.plist;
-				LD_RUNPATH_SEARCH_PATHS = (
-					"$(inherited)",
-					"@executable_path/../Frameworks",
-					"@executable_path/../../../../Frameworks",
-				);
-				MACOSX_DEPLOYMENT_TARGET = 13.0;
-				MARKETING_VERSION = 0.45.0;
-				PRODUCT_BUNDLE_IDENTIFIER = "com.synctray.app$(BUNDLE_ID_SUFFIX).findersync";
-				PRODUCT_NAME = "$(TARGET_NAME)";
-				SKIP_INSTALL = YES;
-				SWIFT_EMIT_LOC_STRINGS = YES;
-				SWIFT_VERSION = 5.0;
-			};
-			name = Debug;
-		};
-		FS000000000000000000I002 /* Release */ = {
-			isa = XCBuildConfiguration;
-			baseConfigurationReference = FSCFG00000000000000000001 /* Signing.xcconfig */;
-			buildSettings = {
-				CODE_SIGN_ENTITLEMENTS = SyncTrayFinderSync/SyncTrayFinderSync.entitlements;
-				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "Apple Development";
-				CODE_SIGN_STYLE = Automatic;
-				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 1;
-				GENERATE_INFOPLIST_FILE = NO;
-				INFOPLIST_FILE = SyncTrayFinderSync/Info.plist;
-				LD_RUNPATH_SEARCH_PATHS = (
-					"$(inherited)",
-					"@executable_path/../Frameworks",
-					"@executable_path/../../../../Frameworks",
-				);
-				MACOSX_DEPLOYMENT_TARGET = 13.0;
-				MARKETING_VERSION = 0.45.0;
-				PRODUCT_BUNDLE_IDENTIFIER = "com.synctray.app$(BUNDLE_ID_SUFFIX).findersync";
-				PRODUCT_NAME = "$(TARGET_NAME)";
-				SKIP_INSTALL = YES;
-				SWIFT_EMIT_LOC_STRINGS = YES;
-				SWIFT_VERSION = 5.0;
-			};
-			name = Release;
-		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -750,15 +602,6 @@
 			buildConfigurations = (
 				A18000000000000000000001 /* Debug */,
 				A18000000000000000000002 /* Release */,
-			);
-			defaultConfigurationIsVisible = 0;
-			defaultConfigurationName = Release;
-		};
-		FS000000000000000000G001 /* Build configuration list for PBXNativeTarget "SyncTrayFinderSync" */ = {
-			isa = XCConfigurationList;
-			buildConfigurations = (
-				FS000000000000000000I001 /* Debug */,
-				FS000000000000000000I002 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;

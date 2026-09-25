@@ -4,23 +4,20 @@
 // on the xcodebuild command line by .github/workflows/ci.yml and scripts/release-ci.sh),
 // so no Team is needed there.
 //
-// A local SIGNED build is required to run/test the FinderSync extension. Your Apple
-// Developer Team ID is read from an OPTIONAL, gitignored local override below, so it
-// never lives in a tracked file and can't be committed by accident.
+// Your Apple Developer Team ID (needed for a locally SIGNED build) is read from an
+// OPTIONAL, gitignored local override below, so it never lives in a tracked file
+// and can't be committed by accident.
 //
 // One-time setup on each machine:
 //   cp Config/Signing.local.xcconfig.example Config/Signing.local.xcconfig
 //   # then edit Config/Signing.local.xcconfig and set your Team ID
 CODE_SIGN_STYLE = Automatic
 
-// Dev (Debug) builds get a distinct bundle-id suffix so their Finder extension
-// registers under a DIFFERENT identity than an installed release. Without this, a
-// dev build and the brew-installed app share `com.synctray.app.findersync`;
-// whichever is built/run last hijacks the registration and — because they're signed
-// differently — invalidates the other, so Finder shows no menu. Release keeps the
-// empty suffix, so the shipping bundle ids are unchanged.
-//   Debug:   com.synctray.app.dev / com.synctray.app.dev.findersync
-//   Release: com.synctray.app     / com.synctray.app.findersync
+// Dev (Debug) builds get a distinct bundle id so a dev build never collides with an
+// installed release (e.g. shared UserDefaults/notification identity). Release keeps
+// the empty suffix, so the shipping bundle id is unchanged.
+//   Debug:   com.synctray.app.dev
+//   Release: com.synctray.app
 BUNDLE_ID_SUFFIX =
 BUNDLE_ID_SUFFIX[config=Debug] = .dev
 

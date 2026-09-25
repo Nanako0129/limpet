@@ -72,31 +72,6 @@ final class SyncManager: ObservableObject {
     private var currentSyncChanges: [UUID: [FileChange]] = [:]
     private var cancellables = Set<AnyCancellable>()
 
-    // MARK: - FinderSync IPC Constants
-    //
-    // These string literals are intentionally duplicated in FinderSyncExtension.swift
-    // (the extension target). The two targets are separate compilation units and cannot
-    // share a Swift file. Treat them as a cross-target contract — if you rename one, rename both.
-
-    /// App Group identifier shared between host app and the FinderSync extension.
-    private let kAppGroupID = "7HVK85DZG7.group.com.synctray.app"
-
-    /// UserDefaults key for the mount-path array read by the extension.
-    private let kMountPathsKey = "com.synctray.app.mountPaths"
-
-    /// Darwin notification name posted by the extension when a pin/unpin request is pending.
-    private let kPinRequestNotificationName = "com.synctray.app.pinRequest"
-
-    /// UserDefaults key for per-profile data read by the extension. Always empty now
-    /// that mount mode is gone — see `updateAppGroupMountPaths`.
-    private let kProfileDataKey = "com.synctray.app.profileData"
-
-    /// Filename of the pending pin/unpin request written by the extension into the App Group container.
-    private let kPendingPinRequestFile = "pending-pin-request.json"
-
-    /// 1-second fallback poll timer for missed Darwin notifications.
-    private var pinRequestPollTimer: DispatchSourceTimer?
-
     /// Track the last error message per profile (for correlating with syncFailed events)
     private var lastSeenErrorMessage: [UUID: String] = [:]
 
@@ -145,8 +120,6 @@ final class SyncManager: ObservableObject {
         TelemetryService.shared.recordProfileCount(self.profileStore.enabledProfiles.count)
         TelemetryService.shared.recordAllProfileConfigurations(self.profileStore.profiles)
         startSessionHeartbeat()
-        setupFinderSyncIPC()
-        updateAppGroupMountPaths()
         refreshSettingsFile()
         startConfigWatcher()
     }
@@ -162,18 +135,6 @@ final class SyncManager: ObservableObject {
         // Cancel primary-recovery monitor
         primaryRecoveryTimer?.cancel()
         primaryRecoveryTimer = nil
-
-        // Cancel pin-request poll timer
-        pinRequestPollTimer?.cancel()
-        pinRequestPollTimer = nil
-
-        // Remove Darwin notification observer to avoid dangling-pointer crash.
-        CFNotificationCenterRemoveObserver(
-            CFNotificationCenterGetDistributedCenter(),
-            Unmanaged.passUnretained(self).toOpaque(),
-            CFNotificationName(kPinRequestNotificationName as CFString),
-            nil
-        )
 
         // Cancel all sync completion pollers
         for timer in syncCompletionPollers.values {
@@ -1327,7 +1288,6 @@ final class SyncManager: ObservableObject {
             .sink { [weak self] _ in
                 self?.startWatchingAllProfiles()
                 self?.updateAggregateState()
-                self?.updateAppGroupMountPaths()
             }
             .store(in: &cancellables)
     }
@@ -1941,86 +1901,6 @@ final class SyncManager: ObservableObject {
         if recentChanges.count > maxRecentChanges {
             recentChanges = Array(recentChanges.prefix(maxRecentChanges))
         }
-    }
-
-    // MARK: - FinderSync IPC
-
-    /// Set up the Darwin notification observer and fallback poll timer for
-    /// receiving pin/unpin requests from the FinderSync extension.
-    private func setupFinderSyncIPC() {
-        // Register Darwin notification observer.
-        // CFNotificationCenterAddObserver requires a C-callable callback with no captures.
-        // Pass `self` via the `observer` UnsafeRawPointer and cast it back inside the callback.
-        let observer = Unmanaged.passUnretained(self).toOpaque()
-        CFNotificationCenterAddObserver(
-            CFNotificationCenterGetDistributedCenter(),
-            observer,
-            { _, observer, _, _, _ in
-                // The C callback is on an arbitrary thread — bridge to @MainActor.
-                guard let observer = observer else { return }
-                let manager = Unmanaged<SyncManager>.fromOpaque(observer).takeUnretainedValue()
-                Task { @MainActor in
-                    await manager.processPendingPinRequest()
-                }
-            },
-            kPinRequestNotificationName as CFString,
-            nil,
-            .deliverImmediately
-        )
-
-        // 1-second fallback poll timer in case a Darwin notification is missed.
-        let timer = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
-        timer.schedule(deadline: .now() + 1, repeating: 1.0)
-        timer.setEventHandler { [weak self] in
-            guard let self else { return }
-            Task { @MainActor in
-                await self.processPendingPinRequest()
-            }
-        }
-        pinRequestPollTimer = timer
-        timer.resume()
-    }
-
-    /// Discard a pending pin/unpin request written by the FinderSync extension.
-    ///
-    /// Mount mode (and the offline-file pinning/warming it enabled) was removed, so
-    /// there is nothing left to apply — this just drains any leftover request file.
-    /// Kept as a stub only because `FinderSyncExtension` (a separate target) still
-    /// writes this file; removing the drain belongs to that target's own removal.
-    func processPendingPinRequest() async {
-        guard let containerURL = FileManager.default.containerURL(
-            forSecurityApplicationGroupIdentifier: kAppGroupID
-        ) else { return }
-        let requestURL = containerURL.appendingPathComponent(kPendingPinRequestFile)
-        try? FileManager.default.removeItem(at: requestURL)
-    }
-
-    private func notifyFinderSyncReload() {
-        CFNotificationCenterPostNotification(
-            CFNotificationCenterGetDistributedCenter(),
-            CFNotificationName(kPinRequestNotificationName as CFString),
-            nil,
-            nil,
-            true
-        )
-    }
-
-    /// Write active mount paths to App Group UserDefaults so the FinderSync extension
-    /// can register them via `FIFinderSyncController.setDirectoryURLs`.
-    ///
-    /// Mount mode was removed, so there is never anything to report — this always
-    /// writes empty arrays. Kept as a no-op stub only because `FinderSyncExtension`
-    /// (a separate target) still reads these keys; removing it belongs to that
-    /// target's own removal, not this one.
-    func updateAppGroupMountPaths() {
-        guard let defaults = UserDefaults(suiteName: kAppGroupID) else {
-            SyncTraySettings.debugLog("updateAppGroupMountPaths: App Group UserDefaults not accessible")
-            return
-        }
-
-        defaults.set([String](), forKey: kMountPathsKey)
-        defaults.set([[String: Any]](), forKey: kProfileDataKey)
-        notifyFinderSyncReload()
     }
 
 

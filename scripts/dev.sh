@@ -23,10 +23,6 @@ SCHEME="SyncTray"
 BUILD_DIR="$PROJECT_DIR/build/Build/Products/Debug"
 APP_NAME="SyncTray.app"
 APP_PATH="$BUILD_DIR/$APP_NAME"
-APPEX_PATH="$APP_PATH/Contents/PlugIns/SyncTrayFinderSync.appex"
-# Debug builds use a .dev-suffixed extension id (Config/Signing.xcconfig) so they
-# never collide with an installed release's `com.synctray.app.findersync`.
-FINDER_EXT_ID="com.synctray.app.dev.findersync"
 
 # Colors for output
 RED='\033[0;31m'
@@ -68,10 +64,8 @@ build_app() {
     log_info "Building $SCHEME..."
 
     # Dev iteration must never be blocked by code signing. Try a normal (signed)
-    # build first — so the Finder extension can load when a signing team is set up
-    # (see DEVELOPMENT.md) — then fall back to an unsigned build so iteration
-    # always works even without a team. To actually test the extension, use a
-    # signed Xcode build.
+    # build first, then fall back to an unsigned build so iteration always works
+    # even without a signing team set up.
     local args=(
         -scheme "$SCHEME"
         -configuration Debug
@@ -93,7 +87,7 @@ build_app() {
         return 0
     fi
 
-    log_warning "Signed build failed — retrying unsigned (Finder extension won't load; use a signed Xcode build to test it)"
+    log_warning "Signed build failed — retrying unsigned"
     if xcodebuild "${args[@]}" CODE_SIGNING_ALLOWED=NO > "$log" 2>&1; then
         rm -f "$log"
         log_success "Build succeeded (unsigned)"
@@ -105,29 +99,6 @@ build_app() {
     rm -f "$log"
     log_error "Build failed"
     return 1
-}
-
-# Register + enable the built Finder extension so Finder loads THIS build's copy
-# (a dev build and an installed release share the bundle id and otherwise fight
-# over the registration). Pass "restart" to also relaunch Finder — required when
-# the extension's own code changed, since Finder caches the loaded plug-in until
-# it relaunches. Only works for a signed build; a no-op if the appex is absent.
-reload_finder_extension() {
-    [ -d "$APPEX_PATH" ] || return 0
-    # Purge every OTHER registered copy of the DEV extension (stray Xcode DerivedData
-    # builds, old worktree builds) so macOS loads THIS build. The installed release
-    # uses a different id (com.synctray.app.findersync) and is never touched.
-    pluginkit -mAvvv -i "$FINDER_EXT_ID" 2>/dev/null \
-        | awk '/Path = /{ sub(/.*Path = /, ""); print }' \
-        | while IFS= read -r p; do
-            [ -n "$p" ] && [ "$p" != "$APPEX_PATH" ] && pluginkit -r "$p" 2>/dev/null
-        done
-    pluginkit -a "$APPEX_PATH" 2>/dev/null || true
-    pluginkit -e use -i "$FINDER_EXT_ID" 2>/dev/null || true
-    if [ "$1" = "restart" ]; then
-        log_info "Reloading Finder so it picks up the rebuilt extension..."
-        killall Finder 2>/dev/null || true
-    fi
 }
 
 # Launch the app
@@ -173,12 +144,6 @@ on_change() {
 
     if build_app; then
         launch_app
-        # Restart Finder only when the extension's own sources changed; for app-only
-        # edits just refresh the registration (cheap, keeps Finder windows open).
-        case "$changed_file" in
-            */SyncTrayFinderSync/*) reload_finder_extension restart ;;
-            *) reload_finder_extension ;;
-        esac
     fi
 }
 
@@ -208,15 +173,12 @@ cd "$PROJECT_DIR"
 # Initial build and launch
 if build_app; then
     launch_app
-    # Load this build's Finder extension and relaunch Finder so the right-click
-    # menu / badges reflect the current code from the first run.
-    reload_finder_extension restart
 else
     log_warning "Initial build failed, waiting for changes..."
 fi
 
 echo ""
-log_info "Watching for file changes in SyncTray/ and SyncTrayFinderSync/..."
+log_info "Watching for file changes in SyncTray/..."
 
 # Watch for changes (--latency debounces at the fswatch level too)
 fswatch -0 -r \
@@ -227,7 +189,6 @@ fswatch -0 -r \
     --include='\.xcassets$' \
     --include='\.plist$' \
     --exclude='.*' \
-    "$PROJECT_DIR/SyncTray" \
-    "$PROJECT_DIR/SyncTrayFinderSync" | while read -d "" file; do
+    "$PROJECT_DIR/SyncTray" | while read -d "" file; do
     on_change "$file"
 done
