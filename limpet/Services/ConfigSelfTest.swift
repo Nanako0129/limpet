@@ -71,6 +71,8 @@ enum ConfigSelfTest {
             testGeneratedScriptAcceptsFlagEqualsValueForm,
             testGeneratedPlistShape,
             testMissingSourceIsNotCreated,
+            testScriptRefusesNonNumericTransfers,
+            testScriptRefusesMultilineFlags,
             testShimQuotesHostilePath,
             testTransfersChangeReinstalls,
             testTranslocatedAppRefused,
@@ -1856,6 +1858,99 @@ enum ConfigSelfTest {
             return report("AC-W8", "shim-quotes-hostile-path", false, "(command substitution in the path was executed)")
         }
         return report("AC-W8", "shim-quotes-hostile-path", true)
+    }
+
+    // MARK: - Script fixture shared by AC-W14/AC-W15
+
+    /// Runs the generated sync script once against a stub rclone, with `overrides`
+    /// merged into a minimal valid profile config. Returns nil if the fixture could
+    /// not be set up; otherwise the script's exit status, whether the stub ran, and
+    /// the profile log text.
+    private static func runScriptFixture(
+        name: String, overrides: [String: Any]
+    ) -> (status: Int32, stubRan: Bool, log: String)? {
+        let fm = FileManager.default
+        let root = (selfTestRoot as NSString).appendingPathComponent(name)
+        try? fm.removeItem(atPath: root)
+        let localPath = (root as NSString).appendingPathComponent("source")
+        let scriptPath = (root as NSString).appendingPathComponent("limpet-sync.sh")
+        let configPath = (root as NSString).appendingPathComponent("profile.json")
+        let filterPath = (root as NSString).appendingPathComponent("exclude.txt")
+        let logPath = (root as NSString).appendingPathComponent("sync.log")
+        let stubPath = (root as NSString).appendingPathComponent("rclone-stub.sh")
+        let ranPath = (root as NSString).appendingPathComponent("stub-ran")
+        var config: [String: Any] = [
+            "remote": "selftest-fixture-remote:SelfTest",
+            "localPath": localPath,
+            "logPath": logPath,
+            "lockFile": (root as NSString).appendingPathComponent("sync.lock"),
+            "drivePath": "",
+            "additionalFlags": "",
+            "filterPath": filterPath,
+            "syncDirection": "localToRemote",
+            "remotePath": "SelfTest",
+            "transfers": 4,
+        ]
+        config.merge(overrides) { _, new in new }
+        do {
+            try fm.createDirectory(atPath: localPath, withIntermediateDirectories: true)
+            try "".write(toFile: filterPath, atomically: true, encoding: .utf8)
+            try SyncSetupService.shared.generateSyncScript().write(toFile: scriptPath, atomically: true, encoding: .utf8)
+            try JSONSerialization.data(withJSONObject: config).write(to: URL(fileURLWithPath: configPath))
+            try "#!/bin/sh\ntouch \"\(ranPath)\"\nexit 0\n".write(toFile: stubPath, atomically: true, encoding: .utf8)
+            try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: stubPath)
+        } catch {
+            return nil
+        }
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/bash")
+        process.arguments = [scriptPath, configPath]
+        var env = ProcessInfo.processInfo.environment
+        env["RCLONE_BIN"] = stubPath
+        process.environment = env
+        process.standardError = FileHandle.nullDevice
+        process.standardOutput = FileHandle.nullDevice
+        guard (try? process.run()) != nil else { return nil }
+        process.waitUntilExit()
+        let log = (try? String(contentsOfFile: logPath, encoding: .utf8)) ?? ""
+        return (process.terminationStatus, fm.fileExists(atPath: ranPath), log)
+    }
+
+    // MARK: - AC-W14 — `transfers` is never evaluated as shell arithmetic
+
+    /// bash arithmetic evaluates command substitutions inside an array subscript, so
+    /// a non-numeric `transfers` in the derived config must be refused, not computed.
+    private static func testScriptRefusesNonNumericTransfers() -> Bool {
+        let marker = (selfTestRoot as NSString).appendingPathComponent("ac-w14-executed")
+        try? FileManager.default.removeItem(atPath: marker)
+        guard let result = runScriptFixture(
+            name: "ac-w14-transfers", overrides: ["transfers": "a[$(touch \(marker))]"]) else {
+            return report("AC-W14", "script-refuses-non-numeric-transfers", false, "(fixture setup failed)")
+        }
+        guard !FileManager.default.fileExists(atPath: marker) else {
+            return report("AC-W14", "script-refuses-non-numeric-transfers", false, "(command in transfers was executed)")
+        }
+        guard result.status == 64, !result.stubRan, result.log.contains("transfers must be a whole number") else {
+            return report("AC-W14", "script-refuses-non-numeric-transfers", false,
+                          "(status \(result.status), stubRan \(result.stubRan))")
+        }
+        return report("AC-W14", "script-refuses-non-numeric-transfers", true)
+    }
+
+    // MARK: - AC-W15 — multi-line additionalRcloneFlags are refused, not truncated
+
+    /// `read -r -a` reads one line only; a flag after a newline (here `--dry-run`)
+    /// would be dropped and the run would be a real sync. Must exit 64 instead.
+    private static func testScriptRefusesMultilineFlags() -> Bool {
+        guard let result = runScriptFixture(
+            name: "ac-w15-multiline", overrides: ["additionalFlags": "--exclude=*.tmp\n--dry-run"]) else {
+            return report("AC-W15", "script-refuses-multiline-flags", false, "(fixture setup failed)")
+        }
+        guard result.status == 64, !result.stubRan, result.log.contains("line break") else {
+            return report("AC-W15", "script-refuses-multiline-flags", false,
+                          "(status \(result.status), stubRan \(result.stubRan))")
+        }
+        return report("AC-W15", "script-refuses-multiline-flags", true)
     }
 
     // MARK: - AC-W4 — a missing localToRemote source is refused, never created

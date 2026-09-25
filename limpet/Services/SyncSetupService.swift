@@ -392,7 +392,6 @@ final class SyncSetupService {
             SYNC_DIRECTION=$(parse_json "syncDirection" "localToRemote")
             REMOTE_PATH=$(parse_json "remotePath" "")
             TRANSFERS=$(parse_json "transfers" "16")
-            CHECKERS=$((TRANSFERS * 2))
 
             if [[ -z "$REMOTE" || -z "$LOCAL_PATH" ]]; then
                 echo "Error: Invalid config - missing remote or localPath"
@@ -409,6 +408,22 @@ final class SyncSetupService {
             # `~`. Refuse instead of doing either silently: a quote, $, backtick, or
             # a token starting with ~ exits 64 before rclone is ever invoked. Write
             # flags as --flag=value, e.g. --exclude=*.tmp.
+            # `transfers` reaches bash arithmetic below, which would run command
+            # substitutions inside an array subscript (`a[$(cmd)]`); accept digits only.
+            if [[ ! "$TRANSFERS" =~ ^[0-9]+$ ]]; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S') - Refusing to sync: transfers must be a whole number" >> "$LOG_FILE"
+                exit 64
+            fi
+            CHECKERS=$((TRANSFERS * 2))
+
+            # `read -r -a` only consumes the first line, so a flag after a newline would
+            # be dropped silently (turning `--exclude=*.tmp` + newline + `--dry-run` into
+            # a real sync). Refuse instead.
+            if [[ "$ADDITIONAL_FLAGS" == *$'\\n'* || "$ADDITIONAL_FLAGS" == *$'\\r'* ]]; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S') - Refusing to sync: additionalRcloneFlags contains a line break; put all flags on one line" >> "$LOG_FILE"
+                exit 64
+            fi
+
             if [[ -n "$ADDITIONAL_FLAGS" ]]; then
                 read -r -a ADDITIONAL_FLAGS_ARRAY <<< "$ADDITIONAL_FLAGS"
             else
