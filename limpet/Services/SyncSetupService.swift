@@ -45,6 +45,14 @@ final class SyncSetupService {
 
         # limpet legacy access-check sentinel (no longer used; excluded so it is never synced)
         - .limpet-check
+
+        # Build/dependency artifacts not worth syncing
+        - target/**
+        - .build/**
+        - node_modules/**
+        - .venv/**
+        - __pycache__/**
+        - DerivedData/**
         """
 
     // MARK: - Rclone Path Helper
@@ -180,10 +188,11 @@ final class SyncSetupService {
             try fm.removeItem(atPath: profile.filterFilePath)
         }
 
-        // Clean up /tmp lock file
-        if fm.fileExists(atPath: profile.lockFilePath) {
-            try? fm.removeItem(atPath: profile.lockFilePath)
-        }
+        // The lock file belongs to the launchd-owned watcher, never the GUI
+        // (limpet-plan.md L3(c)) — not touched here even on uninstall. The
+        // agent was already unloaded above, so nothing can still be holding
+        // it; a leftover lock is harmless and the next install's script run
+        // reclaims it via its own atomic stale-lock check.
 
         // Note: We don't remove the shared script as other profiles may use it
         // Note: We don't remove log files to preserve history
@@ -317,7 +326,10 @@ final class SyncSetupService {
     // MARK: - Script Generation
 
     /// Generate the shared sync script that reads config from JSON
-    private func generateSyncScript() -> String {
+    /// Generate the shared sync script. Not private — `ConfigSelfTest` reads
+    /// this text directly to assert its exit-code/flag shape (limpet-plan.md
+    /// L3(b)) without writing it to disk.
+    func generateSyncScript() -> String {
         return """
             #!/bin/bash
             # limpet Sync Script
@@ -347,6 +359,8 @@ final class SyncSetupService {
             FILTER_FILE=$(parse_json "filterPath" "")
             SYNC_DIRECTION=$(parse_json "syncDirection" "localToRemote")
             REMOTE_PATH=$(parse_json "remotePath" "")
+            TRANSFERS=$(parse_json "transfers" "16")
+            CHECKERS=$((TRANSFERS * 2))
 
             if [[ -z "$REMOTE" || -z "$LOCAL_PATH" ]]; then
                 echo "Error: Invalid config - missing remote or localPath"
@@ -425,30 +439,38 @@ final class SyncSetupService {
                 PID=$(cat "$LOCK_FILE" 2>/dev/null)
                 if [[ -n "$PID" ]] && ps -p "$PID" > /dev/null 2>&1; then
                     echo "$(date '+%Y-%m-%d %H:%M:%S') - Sync already running (PID $PID), skipping" >> "$LOG_FILE"
-                    exit 0
+                    exit 75
                 fi
                 # Lock owner is gone — reclaim the stale lock and retry once.
                 echo "$(date '+%Y-%m-%d %H:%M:%S') - Removing stale lock (PID ${PID:-unknown} not running)" >> "$LOG_FILE"
                 rm -f "$LOCK_FILE"
                 if ! acquire_lock; then
                     echo "$(date '+%Y-%m-%d %H:%M:%S') - Could not acquire lock, skipping" >> "$LOG_FILE"
-                    exit 0
+                    exit 75
                 fi
             fi
             trap 'rm -f "$LOCK_FILE"' EXIT
 
-            # Ensure local sync directory exists
-            mkdir -p "$LOCAL_PATH"
+            # A missing local source must NEVER be silently created (upstream
+            # unconditionally recreated the source directory here, so a moved
+            # or unmounted source became an empty one and the next sync
+            # deleted the entire remote). Log and bail instead; the watcher's
+            # own missing-source recheck starts syncing again once the path
+            # comes back.
+            if [[ ! -d "$LOCAL_PATH" ]]; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S') - Source missing: $LOCAL_PATH" >> "$LOG_FILE"
+                exit 2
+            fi
 
             # One-way sync
             if [[ "$SYNC_DIRECTION" == "localToRemote" ]]; then
                 # Local is source, remote is destination (backup/upload)
                 echo "$(date '+%Y-%m-%d %H:%M:%S') - Starting sync (local → remote)" >> "$LOG_FILE"
-                RCLONE_CMD="$RCLONE_BIN sync \\"$LOCAL_PATH\\" \\"$REMOTE\\" --verbose --use-json-log --stats 2s --filter-from \\"$FILTER_FILE\\""
+                RCLONE_CMD="$RCLONE_BIN sync \\"$LOCAL_PATH\\" \\"$REMOTE\\" --verbose --use-json-log --stats 2s --filter-from \\"$FILTER_FILE\\" --links --fast-list --transfers $TRANSFERS --checkers $CHECKERS"
             else
                 # Remote is source, local is destination (download/mirror)
                 echo "$(date '+%Y-%m-%d %H:%M:%S') - Starting sync (remote → local)" >> "$LOG_FILE"
-                RCLONE_CMD="$RCLONE_BIN sync \\"$REMOTE\\" \\"$LOCAL_PATH\\" --verbose --use-json-log --stats 2s --filter-from \\"$FILTER_FILE\\""
+                RCLONE_CMD="$RCLONE_BIN sync \\"$REMOTE\\" \\"$LOCAL_PATH\\" --verbose --use-json-log --stats 2s --filter-from \\"$FILTER_FILE\\" --links --fast-list --transfers $TRANSFERS --checkers $CHECKERS"
             fi
 
             if [[ -n "$NO_CHECK_CERT" ]]; then
@@ -492,6 +514,7 @@ final class SyncSetupService {
             "syncIntervalMinutes": profile.syncIntervalMinutes,
             "syncDirection": profile.syncDirection.rawValue,
             "remotePath": profile.remotePath,
+            "transfers": profile.transfers,
         ]
 
         if let data = try? JSONSerialization.data(
@@ -503,14 +526,23 @@ final class SyncSetupService {
         return "{}"
     }
 
-    private func generateLaunchdPlist(for profile: SyncProfile) -> String {
-        let scriptPath = SyncProfile.sharedScriptPath
-        let configPath = profile.configPath
+    /// Generate the per-profile LaunchAgent plist. Not private — `ConfigSelfTest`
+    /// calls this directly to verify its shape without touching real launchd
+    /// (AC for limpet-plan.md L3(c)).
+    ///
+    /// `KeepAlive=true` + `RunAtLoad=true` and NO `StartInterval`: the agent
+    /// runs `limpet watch <shortId>` (this app's own binary, not the shared
+    /// script) as a long-lived process that is the SOLE owner of this
+    /// profile's scheduling — see `SyncWatchDaemon`. launchd restarts it if it
+    /// ever exits, which doubles as the "watcher crashed" recovery path.
+    /// stdout/stderr go to a separate `limpet-launchd-*.log`, never the
+    /// profile log the GUI reads — the watcher's child processes already tee
+    /// their own output into the profile log themselves.
+    func generateLaunchdPlist(for profile: SyncProfile) -> String {
+        let appExecutablePath = Bundle.main.executablePath ?? "/Applications/limpet.app/Contents/MacOS/limpet"
         let logDir = (profile.logPath as NSString).deletingLastPathComponent
         let launchdLogPath = logDir + "/limpet-launchd-\(profile.shortId).log"
 
-        // StartInterval for periodic execution
-        let intervalSeconds = profile.syncIntervalMinutes * 60
         return """
             <?xml version="1.0" encoding="UTF-8"?>
             <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -521,12 +553,13 @@ final class SyncSetupService {
 
                 <key>ProgramArguments</key>
                 <array>
-                    <string>\(scriptPath)</string>
-                    <string>\(configPath)</string>
+                    <string>\(appExecutablePath)</string>
+                    <string>watch</string>
+                    <string>\(profile.shortId)</string>
                 </array>
 
-                <key>StartInterval</key>
-                <integer>\(intervalSeconds)</integer>
+                <key>KeepAlive</key>
+                <true/>
 
                 <key>RunAtLoad</key>
                 <true/>
