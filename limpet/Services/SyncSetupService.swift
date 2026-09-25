@@ -621,16 +621,22 @@ final class SyncSetupService {
                 cmd+=("${ADDITIONAL_FLAGS_ARRAY[@]}")
             fi
 
-            # This run's own output, so the delete-limit check below reads only
-            # this run and never an older run's lines in the profile log.
-            RUN_OUTPUT=$(mktemp "${TMPDIR:-/tmp}/limpet-run.XXXXXX") || {
+            # The max-delete lines of THIS run only (never an older run's lines in
+            # the profile log), and only those lines, not the whole output.
+            MAX_DELETE_MESSAGE='Got fatal error on delete: --max-delete threshold reached'
+            RUN_MATCHES=$(mktemp "${TMPDIR:-/tmp}/limpet-run.XXXXXX") || {
                 echo "$(date '+%Y-%m-%d %H:%M:%S') - Refusing to sync: could not create a temporary file" >> "$LOG_FILE"
                 exit 1
             }
-            trap 'rm -f "$LOCK_FILE" "$RUN_OUTPUT"' EXIT
+            trap 'rm -f "$LOCK_FILE" "$RUN_MATCHES"' EXIT
 
-            # Run sync command
-            "${cmd[@]}" 2>&1 | tee -a "$LOG_FILE" "$RUN_OUTPUT"
+            # Run sync command. awk passes every line on and copies matching ones
+            # to RUN_MATCHES. It is a pipeline stage, not a process substitution:
+            # /bin/bash 3.2.57 sets no $! for one (measured 2026-09-26), so the
+            # script could not wait for it. awk reads to the end (no early exit,
+            # so no SIGPIPE for tee or rclone), and the pipeline has finished
+            # before the check below.
+            "${cmd[@]}" 2>&1 | tee -a "$LOG_FILE" | awk -v m="$MAX_DELETE_MESSAGE" -v f="$RUN_MATCHES" 'index($0, m) { print > f } { print }'
 
             EXIT_CODE=${PIPESTATUS[0]}
 
@@ -640,7 +646,7 @@ final class SyncSetupService {
             # 2 files deleted, each refused delete logged as "Got fatal error on
             # delete: --max-delete threshold reached" (text and JSON log alike).
             # Exit 7 is every fatal error, so the code AND the message must match.
-            if [[ $EXIT_CODE -eq 7 ]] && grep -qF -- 'Got fatal error on delete: --max-delete threshold reached' "$RUN_OUTPUT"; then
+            if [[ $EXIT_CODE -eq 7 && -s "$RUN_MATCHES" ]]; then
                 echo "$(date '+%Y-%m-%d %H:%M:%S') - Delete limit reached: rclone stopped at --max-delete $MAX_DELETE; limpet will not sync this profile again until the limit is cleared (limpet profile clear-delete-limit, or the menu)" >> "$LOG_FILE"
                 EXIT_CODE=76
             fi

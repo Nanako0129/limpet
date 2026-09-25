@@ -1929,7 +1929,7 @@ enum ConfigSelfTest {
     /// not be set up; otherwise the script's exit status, whether the stub ran, and
     /// the profile log text.
     private static func runScriptFixture(
-        name: String, overrides: [String: Any], stubTail: String = "exit 0\n"
+        name: String, overrides: [String: Any], stubTail: String = "exit 0\n", extraEnvironment: [String: String] = [:]
     ) -> (status: Int32, stubRan: Bool, log: String, argv: [String])? {
         let fm = FileManager.default
         let root = (selfTestRoot as NSString).appendingPathComponent(name)
@@ -1971,6 +1971,7 @@ enum ConfigSelfTest {
         process.arguments = [scriptPath, configPath]
         var env = ProcessInfo.processInfo.environment
         env["RCLONE_BIN"] = stubPath
+        env.merge(extraEnvironment) { _, new in new }
         process.environment = env
         process.standardError = FileHandle.nullDevice
         process.standardOutput = FileHandle.nullDevice
@@ -2804,6 +2805,24 @@ enum ConfigSelfTest {
         }
         guard bad.status == 64, !bad.stubRan else {
             return report(id, slug, false, "(a non-numeric maxDelete was not refused: \(bad.status))")
+        }
+        // Review finding 10: a large run keeps only the matching lines on disk.
+        // The stub prints ~1 MB, then the tripped line, then measures the
+        // script's temp file(s) while the script is still running.
+        let tmp = "\(selfTestRoot)/ac-l4-11-tmp"
+        try? FileManager.default.removeItem(atPath: tmp)
+        try? FileManager.default.createDirectory(atPath: tmp, withIntermediateDirectories: true)
+        let sizeFile = "\(selfTestRoot)/ac-l4-11-tmp-size"
+        let large = "i=0; while [ $i -lt 20000 ]; do echo '{\"level\":\"info\",\"msg\":\"Copied (new)\",\"object\":\"some/long/path/file-'$i'.dat\"}'; i=$((i+1)); done\n"
+            + tripped + "sleep 1\ncat \"\(tmp)\"/limpet-run.* | wc -c > \"\(sizeFile)\"\nexit 7\n"
+        guard let big = runScriptFixture(name: "ac-l4-11-large", overrides: ["maxDelete": 5], stubTail: large,
+                                         extraEnvironment: ["TMPDIR": tmp]),
+              let size = Int(((try? String(contentsOfFile: sizeFile, encoding: .utf8)) ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)) else {
+            return report(id, slug, false, "(large-output fixture failed)")
+        }
+        guard big.status == 76, size < 4096 else {
+            return report(id, slug, false, "(large output: status \(big.status), temp file \(size) bytes)")
         }
         return report(id, slug, true)
     }
