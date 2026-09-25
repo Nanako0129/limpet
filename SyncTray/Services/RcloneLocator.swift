@@ -18,7 +18,7 @@ import Foundation
 /// and may spawn a shell, so a successful result is cached; a `nil` result is not cached, so a
 /// later call re-resolves once rclone is installed.
 enum RcloneLocator {
-    /// How the binary was found. Low-cardinality — safe to attach to telemetry.
+    /// How the binary was found.
     enum Source: String {
         case candidatePath = "candidate_path"
         case loginShell = "login_shell"
@@ -72,15 +72,6 @@ enum RcloneLocator {
     /// Whether rclone is installed and locatable.
     static func isInstalled() -> Bool {
         resolve() != nil
-    }
-
-    /// Uncached resolution that also reports *how* the binary was found and a low-cardinality
-    /// location bucket. Used for telemetry at launch. Populates the cache on success so a
-    /// following `resolve()` doesn't repeat the (possibly shell-spawning) work.
-    static func resolveDetailed() -> (path: String?, source: Source, location: String) {
-        let result = locate()
-        if let path = result.path { storeResult(path) }
-        return (result.path, result.source, locationBucket(for: result.path))
     }
 
     // MARK: - Private
@@ -146,18 +137,5 @@ enum RcloneLocator {
         // path to a real executable.
         guard path.hasPrefix("/"), FileManager.default.isExecutableFile(atPath: path) else { return nil }
         return path
-    }
-
-    /// Map a resolved path to a low-cardinality bucket for telemetry. Never emits the raw path,
-    /// so no username or custom directory leaks; an unrecognised location collapses to `other`.
-    private static func locationBucket(for path: String?) -> String {
-        guard let path else { return "none" }
-        if path.hasPrefix("/opt/homebrew/") { return "homebrew" }
-        if path.hasPrefix("/usr/local/") { return "usr_local" }
-        if path.hasPrefix("/run/current-system/") { return "nix_system" }
-        if path.hasPrefix("/etc/profiles/per-user/") { return "nix_per_user" }
-        if path.contains("/.nix-profile/") { return "nix_profile" }
-        if path.hasPrefix("/usr/bin/") { return "usr_bin" }
-        return "other"
     }
 }

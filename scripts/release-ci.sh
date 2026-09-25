@@ -11,7 +11,6 @@
 #   IS_BETA             - "true" | "false"
 #   GITHUB_TOKEN        - For `gh release create`
 #   HOMEBREW_TAP_TOKEN  - PAT with repo scope on mthines/homebrew-synctray
-#   DASH0_AUTH_TOKEN    - Embedded into the Release build (optional but warns if missing)
 #
 # Optional env:
 #   PR_NUMBER           - Required when IS_BETA=true
@@ -47,10 +46,6 @@ cd "$PROJECT_DIR"
 
 log_info "CI release ${TAG} (beta=${IS_BETA})"
 
-if [ -z "${DASH0_AUTH_TOKEN:-}" ]; then
-  log_warning "DASH0_AUTH_TOKEN not set — telemetry token will not be embedded"
-fi
-
 # =============================================================================
 # Build Release .app
 # =============================================================================
@@ -64,7 +59,6 @@ xcodebuild -project "$XCODEPROJ" \
   clean build \
   ONLY_ACTIVE_ARCH=NO \
   CODE_SIGNING_ALLOWED=NO \
-  DASH0_AUTH_TOKEN="${DASH0_AUTH_TOKEN:-}" \
   | tail -20
 
 APP_PATH="$BUILD_DIR/DerivedData/Build/Products/Release/${PROJECT_NAME}.app"
@@ -82,9 +76,8 @@ log_success "Build OK ($ARCH_INFO)"
 #
 # Without MACOS_CERTIFICATE_P12_BASE64 the app stays ad-hoc signed exactly as
 # before, so this can never break an existing release; it only *upgrades* the
-# release when configured. A signed + notarized app is REQUIRED for the
-# SyncTrayFinderSync extension (and App Groups) to load on end-user machines —
-# see docs/release-signing.md for the one-time Apple-account + secrets setup.
+# release when configured. Set MACOS_CERTIFICATE_P12_BASE64/PASSWORD and
+# NOTARY_KEY_P8_BASE64/NOTARY_KEY_ID/NOTARY_ISSUER_ID as repo secrets to opt in.
 # =============================================================================
 SIGNED="false"
 if [ -n "${MACOS_CERTIFICATE_P12_BASE64:-}" ] && [ -n "${MACOS_CERTIFICATE_PASSWORD:-}" ]; then
@@ -111,8 +104,6 @@ if [ -n "${MACOS_CERTIFICATE_P12_BASE64:-}" ] && [ -n "${MACOS_CERTIFICATE_PASSW
   log_success "Signing identity: $IDENTITY"
 
   APP_ENTITLEMENTS="$PROJECT_DIR/SyncTray/SyncTray.entitlements"
-  EXT_ENTITLEMENTS="$PROJECT_DIR/SyncTrayFinderSync/SyncTrayFinderSync.entitlements"
-  EXT_PATH="$APP_PATH/Contents/PlugIns/SyncTrayFinderSync.appex"
 
   # Sign inside-out (nested code first, then the app). Hardened runtime
   # (--options runtime) + a secure --timestamp are required for notarization.
@@ -122,10 +113,6 @@ if [ -n "${MACOS_CERTIFICATE_P12_BASE64:-}" ] && [ -n "${MACOS_CERTIFICATE_PASSW
         --sign "$IDENTITY" "$item"
     done < <(find "$APP_PATH/Contents/Frameworks" -mindepth 1 -maxdepth 1 -print0)
   fi
-  if [ -d "$EXT_PATH" ]; then
-    codesign --force --timestamp --options runtime --keychain "$KEYCHAIN" \
-      --entitlements "$EXT_ENTITLEMENTS" --sign "$IDENTITY" "$EXT_PATH"
-  fi
   codesign --force --timestamp --options runtime --keychain "$KEYCHAIN" \
     --entitlements "$APP_ENTITLEMENTS" --sign "$IDENTITY" "$APP_PATH"
 
@@ -133,7 +120,7 @@ if [ -n "${MACOS_CERTIFICATE_P12_BASE64:-}" ] && [ -n "${MACOS_CERTIFICATE_PASSW
   log_success "Signed with Developer ID"
   SIGNED="true"
 else
-  log_warning "MACOS_CERTIFICATE_* not set — building UNSIGNED. The Finder extension will NOT load for users; see docs/release-signing.md."
+  log_warning "MACOS_CERTIFICATE_* not set — building UNSIGNED (ad-hoc)."
 fi
 
 # =============================================================================

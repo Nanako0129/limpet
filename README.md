@@ -6,7 +6,7 @@
 
 <p align="center">
   <strong>Google Drive-style folder sync for any cloud</strong><br>
-  A native macOS menu bar app with three sync modes: two-way sync, one-way backup, and on-demand streaming.
+  A native macOS menu bar app for one-way background folder sync.
 </p>
 
 <p align="center">
@@ -32,34 +32,20 @@ SyncTray brings the convenience of Google Drive or Dropbox sync to **any cloud s
 Instead of running complex terminal commands, SyncTray gives you:
 
 - A **menu bar icon** showing sync status at a glance
-- **Three sync modes** to match your workflow
+- **One-way sync**, upload or download, to match your workflow
 - **Automatic scheduled syncing** that runs in the background
 - **Real-time notifications** when files change
 - **Multiple sync profiles** for different folders/remotes
 
 ---
 
-## Sync Modes
+## Sync Mode
 
-SyncTray offers three ways to connect your files to the cloud:
+SyncTray syncs one-way. Choose your direction:
 
-| Mode               | Best For              | How It Works                              |
-| ------------------ | --------------------- | ----------------------------------------- |
-| **Two-Way Sync**   | Active working files  | Changes on either side sync to the other  |
-| **One-Way Sync**   | Backups & mirrors     | Source overwrites destination             |
-| **Stream (Mount)** | Large media libraries | Files appear locally but stream on-demand |
-
-<p align="center">
-  <img src="/docs/assets/profile-two-way.png" alt="Two-Way Sync Configuration" height="600">
-</p>
-
-### Two-Way Sync (Bisync)
-
-Perfect for files you actively edit on multiple devices. Uses rclone's bisync to keep both sides synchronized.
-
-- Edit a file locally → syncs to cloud
-- Edit on another device → syncs back down
-- Conflicts are resolved automatically (newer wins, old version backed up)
+| Mode              | Best For              | How It Works                             |
+| ----------------- | ---------------------- | ----------------------------------------- |
+| **One-Way Sync**  | Backups & mirrors     | Source overwrites destination             |
 
 ### One-Way Sync
 
@@ -70,22 +56,6 @@ Mirror files in one direction only. Choose your direction:
 
 The destination always matches the source exactly.
 
-### Stream (Mount)
-
-Access cloud files without downloading them. Files appear in a folder on your Mac but are streamed on-demand when opened.
-
-- No local storage used (beyond cache)
-- Ideal for large media libraries or archives
-- Configurable VFS cache with a retention window ("keep cached for N days")
-- **Live download progress**: streaming a file shows the same transfer bar and per-file list that sync/bisync profiles show, in the menu bar and the profile detail
-- **Offline files**: keep chosen folders downloaded so they open with no connection (see [Offline Files](#offline-files))
-
-<p align="center">
-  <img src="/docs/assets/profile-stream.png" alt="Stream (Mount) Configuration" height="600">
-</p>
-
-> **Note**: Stream mode is **kext-free by default** — it uses rclone's built-in NFS mount, so no macFUSE is required (it works even on locked-down/MDM-managed Macs). A legacy macFUSE backend is still selectable per profile ([details](#mount-mode-setup)).
-
 ---
 
 ## Features
@@ -94,7 +64,6 @@ Access cloud files without downloading them. Files appear in a folder on your Ma
 
 - Menu bar icon shows current state (idle, syncing, error, drive not mounted)
 - **Real-time progress** during sync: bytes transferred, percentage, ETA
-- Works for Stream (Mount) profiles too — streaming a file surfaces live download progress polled from rclone's RC API
 - Per-profile status indicators
 
 During sync, see detailed transfer progress:
@@ -139,25 +108,6 @@ View sync output and logs directly in the app:
 - Lock file prevents overlapping syncs
 - Smart external drive detection - pauses when unmounted
 
-### Fallback Remote
-
-Configure an alternative remote that activates automatically when the primary is unreachable - perfect for NAS users who sync via SMB/WebDAV at home but need access from other networks.
-
-- **Automatic failover**: Each sync checks if the primary remote is reachable (3-second timeout)
-- **Transparent switching**: Menu bar shows which transport is active (wifi icon = primary, antenna icon = fallback)
-- **Bisync cache preservation**: When the fallback uses the same directory structure, env var overrides swap the transport without invalidating rclone's bisync cache
-- **Flexible path mapping**: Supports fallback remotes with different path structures (e.g., SMB share root vs SFTP filesystem path)
-
-### Offline Files
-
-For Stream (Mount) profiles, keep chosen folders downloaded so they open instantly without a connection.
-
-- **Mark a folder offline** two ways: right-click it in Finder → **Available Offline**, or use the **Offline Files** section of the profile editor
-- **Live warming progress**: making a folder available offline downloads it with parallel transfers and shows per-file progress; interrupted runs cancel and restart cleanly on cache clear, unmount, or edit
-- **Don't Download excludes**: skip files you never want offline with wildcard patterns, including `**` folder globs
-- **Cache management**: clear the VFS cache with an option to keep pinned (offline) folders
-- The Finder right-click menu needs a one-time approval under System Settings → General → Login Items & Extensions → Extensions; the app's Offline Files section links you there
-
 ### One-Click Actions
 
 - **Sync Now**: Trigger immediate sync for all enabled profiles
@@ -182,34 +132,6 @@ rclone config
 See [rclone's documentation](https://rclone.org/docs/) for detailed setup guides for each provider.
 
 SyncTray auto-detects rclone from Homebrew, `/usr/local/bin`, `/usr/bin`, and nix installs (nix-darwin, per-user, and profile paths), so a non-Homebrew rclone works without extra configuration.
-
-### Mount Mode Setup
-
-Stream (Mount) mode works **out of the box** — no extra setup. By default it uses
-rclone's built-in **NFS** mount (kext-free), so nothing beyond rclone itself is
-required, and it works on locked-down / MDM-managed Macs where kernel extensions
-are blocked.
-
-#### Optional: macFUSE backend (legacy)
-
-If you prefer the classic FUSE mount, switch a profile's **Mount Backend** to
-**macFUSE** in the profile editor. That backend additionally requires macFUSE and
-the official rclone binary:
-
-```bash
-# 1. Install macFUSE, then restart and approve it in
-#    System Settings → Privacy & Security.
-brew install --cask macfuse
-
-# 2. Homebrew's rclone can't mount — install the official binary.
-brew uninstall rclone
-curl -O https://downloads.rclone.org/rclone-current-osx-arm64.zip
-unzip rclone-current-osx-arm64.zip
-cd rclone-*-osx-arm64
-sudo cp rclone /usr/local/bin/
-sudo chmod +x /usr/local/bin/rclone
-rclone version
-```
 
 ---
 
@@ -283,25 +205,6 @@ Click **Install** to activate the profile. SyncTray will:
 
 Your folder will now sync automatically on schedule. The menu bar shows sync status, and you'll get notifications when files change.
 
-### Using Mount Mode
-
-Mount mode is different from sync modes - it creates a virtual drive instead of syncing files:
-
-1. **Select Mount Mode**: When creating a profile, choose "Stream (Mount)" as the sync mode
-2. **Configure Mount Settings**:
-   - **Cache Mode**: Choose how aggressively to cache (Full recommended)
-   - **Cache Size**: Set maximum cache size (default: 10G)
-   - **Cache Directory**: Where cached files are stored (default: ~/.cache/rclone/vfs)
-3. **Mount Point**: The local path becomes your mount point (where files appear)
-4. **Install and Mount**: Click Install, then Mount in the menu bar
-
-**Mount vs Sync**:
-
-- Mount: Files stream on-demand, mount runs continuously
-- Sync: Files copied locally, sync runs periodically
-
-**Unmounting**: Click the eject button in the menu bar for the profile, or disable the profile.
-
 ## Menu Bar States
 
 <p align="center">
@@ -335,59 +238,17 @@ When syncing to an external drive:
 3. Syncs pause when the drive is unmounted
 4. Resume automatically when reconnected
 
-### Resync (Reset Sync State)
-
-If sync gets out of sync or shows persistent errors:
-
-1. Open Settings → Select the profile
-2. Click **Resync**
-3. This resets rclone's bisync cache and performs a fresh comparison
-
-### Fallback Remote Setup
-
-If your primary remote is only accessible on a local network (e.g., Synology NAS via SMB or WebDAV), you can configure a fallback that kicks in when you're away:
-
-1. Open Settings → Select the profile
-2. Scroll to **Fallback Remote** section
-3. Toggle **Enable Fallback Remote**
-4. Select the fallback remote from the dropdown (must already exist in rclone config)
-5. If the fallback uses different paths (e.g., SFTP vs SMB), enable **"Fallback uses a different path"** and enter the correct path
-
-**Example: Synology NAS**
-
-| Setting | Primary (LAN) | Fallback (Remote) |
-|---------|--------------|-------------------|
-| Remote | `synology-webdav` (LAN IP) | `synology-quickconnect` (QuickConnect URL) |
-| Path | `MyShare/Documents` | `MyShare/Documents` (same) |
-
-Or with different path structures:
-
-| Setting | Primary (SMB) | Fallback (SFTP via Tailscale) |
-|---------|--------------|-------------------------------|
-| Remote | `synology` | `synology-sftp` |
-| Path | `Kaiju/KAIJU` | `/volume1/Kaiju/KAIJU` |
-
-The sync script automatically tries the primary first. If unreachable within 3 seconds, it falls back transparently. The menu bar shows which transport was used (wifi = primary, antenna = fallback).
-
-### Conflict Resolution
-
-SyncTray uses rclone bisync with smart conflict handling:
-
-- Newer file wins by default
-- Conflicts create backup copies with `-sync-conflict-` suffix
-- Check the log file for conflict details
-
 ### File-Backed Configuration
 
 `~/.config/synctray/` is the editable, authoritative home for SyncTray's config. A human or a script can hand-edit these files and the running app applies the change live, no restart needed.
 
 | Path | Contents |
 | ---- | -------- |
-| `profiles/{id}.profile.json` | The full profile: paths, remote, sync mode, offline folders, enable/mute state |
-| `settings.json` | App settings: launch at login, telemetry, debug logging, auto-fix |
+| `profiles/{id}.profile.json` | The full profile: paths, remote, sync direction, enable/mute state |
+| `settings.json` | App settings: launch at login, debug logging |
 | `schema/*.schema.json` | JSON Schemas for validating the files above |
 
-- **Live apply**: a file watcher (~1s debounce) reconciles every external edit through the same path as the app's Save button — an enabled/disabled toggle installs or removes the launchd agent, a warm-field edit re-warms offline folders.
+- **Live apply**: a file watcher (~1s debounce) reconciles every external edit through the same path as the app's Save button — an enabled/disabled toggle installs or removes the launchd agent.
 - **Create by dropping a file**: write a new `*.profile.json` with a fresh `id` and SyncTray creates that profile. Only five keys are required — `id`, `name`, `rcloneRemote`, `remotePath`, `localSyncPath` — every other field takes its default. The launchd agent installs only once the profile is also `isEnabled` and valid, so you can stage a profile disabled, then flip it on in a second edit.
 - **Credential-free**: rclone secrets live in `~/.config/rclone/rclone.conf`, never in these files. Validate a profile against `schema/profile.schema.json` before writing it.
 
@@ -401,7 +262,7 @@ SyncTray installs a `synctray` shim at `~/.local/bin/synctray` on every launch. 
 | ------- | ------- |
 | `synctray doctor` | Health report: rclone version, schemas installed, per-profile agent state, stale locks, remote reachability. Exits non-zero on any failure. |
 | `synctray status [name\|id]` | One line per profile: enabled, agent loaded, running, last result. |
-| `synctray profiles` | List every profile with mode, enabled state, and remote (no secrets). |
+| `synctray profiles` | List every profile with enabled state and remote (no secrets). |
 | `synctray logs <name\|id> [--follow]` | Print or tail a profile's sync log. |
 | `synctray test-remote <name\|id>` | Probe a profile's remote with a hard timeout. |
 | `synctray listremotes` | Passthrough to `rclone listremotes`. |
@@ -413,7 +274,7 @@ SyncTray installs a `synctray` shim at `~/.local/bin/synctray` on every launch. 
 | `synctray profile create --from <file>` | Create a profile from a `.profile.json` file (or `-` for stdin). |
 | `synctray profile enable <name\|id>` | Enable a profile and install its agent. |
 | `synctray profile disable <name\|id>` | Disable a profile and uninstall its agent. |
-| `synctray profile delete <name\|id>` | Uninstall the agent (detaching a mount first) and remove the profile. |
+| `synctray profile delete <name\|id>` | Uninstall the agent and remove the profile. |
 
 **Operate:**
 
@@ -454,8 +315,7 @@ xattr -cr /Applications/SyncTray.app
 1. Click **View Log** in the menu to see detailed error messages
 2. Common issues:
    - Remote not accessible (check network/credentials)
-   - Too many deletes detected — a safety limit that blocks accidental mass deletion (use **Fix Sync Issues**, or **Force Sync** if the deletion is intentional)
-   - Conflicting changes detected (check log for details)
+   - Transient network/timeout error (use **Retry Sync**)
 
 ### Sync not running on schedule
 
@@ -470,43 +330,6 @@ xattr -cr /Applications/SyncTray.app
 
 - Only files actually transferred appear (unchanged files are skipped)
 - Check that `--use-json-log` is being used (automatic with SyncTray)
-
-### Mount mode: mount fails
-
-Mount mode is kext-free by default (NFS backend) and needs nothing beyond rclone. If a mount fails, check that rclone is installed and the remote is reachable (`synctray doctor`).
-
-If you switched a profile to the **macFUSE** backend, that backend needs macFUSE and the official rclone binary:
-
-```bash
-brew install --cask macfuse
-```
-
-After installation:
-
-1. Reboot your Mac
-2. Go to System Settings → Privacy & Security
-3. Approve the macFUSE system extension
-4. Replace Homebrew's rclone with the official binary (see [Mount Mode Setup](#mount-mode-setup))
-5. Try mounting again
-
-### Mount mode: Stale mount or "Device busy" error
-
-If a mount fails to unmount cleanly:
-
-```bash
-# Force unmount
-diskutil unmount force /path/to/mount/point
-
-# Or restart SyncTray (auto-cleans stale mounts)
-```
-
-### Mount mode: Slow file access
-
-Try adjusting cache settings:
-
-- Increase cache size (e.g., from 10G to 20G)
-- Use "Full" cache mode for better read performance
-- Check network speed to remote (mount streams over network)
 
 ## Development
 
@@ -567,5 +390,4 @@ MIT License - see [LICENSE](LICENSE) for details.
 ## Acknowledgments
 
 - [rclone](https://rclone.org/) - The powerful sync engine
-- [macFUSE](https://osxfuse.github.io/) - Virtual filesystem support
 - Apple's SwiftUI and MenuBarExtra APIs

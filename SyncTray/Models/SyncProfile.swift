@@ -12,58 +12,11 @@ struct SyncProfile: Identifiable, Codable, Equatable {
     var additionalRcloneFlags: String   // optional extra flags
     var isEnabled: Bool                 // whether scheduled sync is active
     var isMuted: Bool                   // whether notifications are muted for this profile
-    var syncMode: SyncMode              // bisync (two-way), sync (one-way), or mount (streaming)
     var syncDirection: SyncDirection    // direction for one-way sync
-
-    // Fallback remote (used when primary remote is unreachable)
-    var fallbackRemote: String          // e.g., "synology-sftp" (empty = no fallback)
-    var fallbackRemotePath: String      // e.g., "/volume1/Kaiju" (empty = same as primary remotePath)
-    /// True when primary and fallback remotes use different rclone wire types (e.g. smb vs sftp).
-    /// When true, the sync script swaps the full REMOTE reference on fallback activation instead of
-    /// using env-var overrides — bisync cache is intentionally rebuilt to avoid NFD/NFC divergence.
-    /// Populated at install/save time. Defaults to false for profiles created before this field existed.
-    var fallbackRequiresCacheRebuild: Bool
-
-    // Mount mode specific settings
-    var mountBackend: MountBackend      // Mount backend: nfs (kext-free, default) or macfuse
-    var vfsCacheMode: VFSCacheMode      // VFS cache mode for mount (default: full)
-    var vfsCacheMaxSize: String         // Max cache size (e.g., "10G")
-    var vfsCacheMaxAge: String          // Keep cached files this long since last access (e.g., "168h")
-    var vfsCachePath: String            // Cache directory path (default: ~/.cache/rclone)
-    var allowNonEmptyMount: Bool        // Allow mounting to non-empty folders (default: false)
-    var mountAtStartup: Bool            // Auto-mount when SyncTray launches (mount mode, default: true)
-    /// Maintain a read-only "<mount-name> (Offline)" browse point next to the mount that
-    /// links straight to the VFS cache DATA tree, so already-cached files stay readable in
-    /// Finder even when the network is down and the live `rclone nfsmount` has stalled/dropped
-    /// (rclone's streaming VFS cannot itself serve purely-from-cache offline). App-side only —
-    /// never written to the script's `{shortId}.json`. Mount mode; default: true. See the
-    /// "Offline access" section in CLAUDE.md.
-    var offlineAccessEnabled: Bool
-    var pinnedDirectories: [String]     // Directories to automatically cache offline (mount mode)
-    /// Glob patterns excluded from offline warming, matched **case-sensitively** against each
-    /// file's name and its path relative to the pinned dir. Supports `*` (within a segment),
-    /// `?`, and `**` (across segments), so `*.bak` skips backup files and `**/BACKUP/**` skips
-    /// every folder named BACKUP at any depth (e.g. "*.bak", "*.tmp", "**/BACKUP/**").
-    /// Excluded files are skipped by the warmer so they never download into the offline cache.
-    var warmExcludePatterns: [String]
-    var rcPort: Int                     // Port for rclone RC (remote control) API (mount mode)
-    /// Number of files rclone downloads in parallel — drives the mount's `--transfers`
-    /// AND the app-side offline-warm concurrency (`VFSCacheService`), kept in lockstep.
-    /// Higher saturates a fast wired link; 1–2 is faster on Wi-Fi / a mesh backhaul / a
-    /// slow remote, where extra parallel transfers contend for a shared half-duplex link
-    /// (and thrash a spinning-disk cache) and collapse aggregate throughput. Clamped to
-    /// 1...16. Defaults to 2 — a safe value for the common case (a NAS reached over Wi-Fi
-    /// or a mesh, and/or a spinning-disk cache); users on a fast wired link raise it.
-    var downloadConnections: Int
 
     /// Short ID for file naming (first 8 chars of UUID)
     var shortId: String {
         String(id.uuidString.prefix(8)).lowercased()
-    }
-
-    /// Returns true if this profile is in mount mode
-    var isMountMode: Bool {
-        syncMode == .mount
     }
 
     // MARK: - Computed Paths
@@ -85,7 +38,7 @@ struct SyncProfile: Identifiable, Codable, Equatable {
 
     /// NEW authoritative per-profile file carrying the FULL `SyncProfile`
     /// (including fields the derived `configPath` JSON omits: `isEnabled`,
-    /// `isMuted`, `mountAtStartup`). This is the external-agent-editable
+    /// `isMuted`). This is the external-agent-editable
     /// surface; `configPath` remains the derived, frozen subset the sync
     /// script reads and stays byte-for-byte unchanged.
     var profileFilePath: String {
@@ -124,23 +77,6 @@ struct SyncProfile: Identifiable, Codable, Equatable {
         }
         let remote = rcloneRemote.hasSuffix(":") ? String(rcloneRemote.dropLast()) : rcloneRemote
         return "\(remote):\(remotePath)"
-    }
-
-    // MARK: - Fallback
-
-    /// Whether a fallback remote is configured
-    var hasFallback: Bool {
-        !fallbackRemote.isEmpty
-    }
-
-    /// Full fallback remote path for rclone (e.g., "synology-sftp:/volume1/Kaiju")
-    var fullFallbackRemotePath: String {
-        let path = fallbackRemotePath.isEmpty ? remotePath : fallbackRemotePath
-        let remote = fallbackRemote.hasSuffix(":") ? String(fallbackRemote.dropLast()) : fallbackRemote
-        if path.isEmpty {
-            return "\(remote):"
-        }
-        return "\(remote):\(path)"
     }
 
     // MARK: - Validation
@@ -183,23 +119,7 @@ struct SyncProfile: Identifiable, Codable, Equatable {
         additionalRcloneFlags: String = "",
         isEnabled: Bool = false,
         isMuted: Bool = false,
-        syncMode: SyncMode = .bisync,
-        syncDirection: SyncDirection = .localToRemote,
-        fallbackRemote: String = "",
-        fallbackRemotePath: String = "",
-        fallbackRequiresCacheRebuild: Bool = false,
-        mountBackend: MountBackend = .nfs,
-        vfsCacheMode: VFSCacheMode = .full,
-        vfsCacheMaxSize: String = "10G",
-        vfsCacheMaxAge: String = "168h",
-        vfsCachePath: String = "",
-        allowNonEmptyMount: Bool = false,
-        mountAtStartup: Bool = true,
-        offlineAccessEnabled: Bool = true,
-        pinnedDirectories: [String] = [],
-        warmExcludePatterns: [String] = [],
-        rcPort: Int = 0,
-        downloadConnections: Int = 2
+        syncDirection: SyncDirection = .localToRemote
     ) {
         self.id = id
         self.name = name
@@ -211,34 +131,7 @@ struct SyncProfile: Identifiable, Codable, Equatable {
         self.additionalRcloneFlags = additionalRcloneFlags
         self.isEnabled = isEnabled
         self.isMuted = isMuted
-        self.syncMode = syncMode
         self.syncDirection = syncDirection
-        self.fallbackRemote = fallbackRemote
-        self.fallbackRemotePath = fallbackRemotePath
-        self.fallbackRequiresCacheRebuild = fallbackRequiresCacheRebuild
-        self.mountBackend = mountBackend
-        self.vfsCacheMode = vfsCacheMode
-        self.vfsCacheMaxSize = vfsCacheMaxSize
-        self.vfsCacheMaxAge = vfsCacheMaxAge
-        self.vfsCachePath = vfsCachePath.isEmpty ? "\(NSHomeDirectory())/.cache/rclone" : vfsCachePath
-        self.allowNonEmptyMount = allowNonEmptyMount
-        self.mountAtStartup = mountAtStartup
-        self.offlineAccessEnabled = offlineAccessEnabled
-        self.pinnedDirectories = pinnedDirectories
-        self.warmExcludePatterns = warmExcludePatterns
-        self.rcPort = rcPort > 0 ? rcPort : SyncProfile.defaultRCPort(for: id)
-        self.downloadConnections = min(16, max(1, downloadConnections))
-    }
-
-    /// Generate a deterministic RC port from the profile UUID (range: 5800-5899)
-    /// Uses djb2 hash for stability (Swift's hashValue is randomized per process)
-    static func defaultRCPort(for id: UUID) -> Int {
-        let bytes = Array(id.uuidString.utf8)
-        var hash: UInt32 = 5381
-        for byte in bytes {
-            hash = ((hash &<< 5) &+ hash) &+ UInt32(byte)
-        }
-        return 5800 + Int(hash % 100)
     }
 
     /// Create a new profile with default values
@@ -253,13 +146,7 @@ extension SyncProfile {
     enum CodingKeys: String, CodingKey {
         case id, name, rcloneRemote, remotePath, localSyncPath
         case drivePathToMonitor, syncIntervalMinutes, additionalRcloneFlags
-        case isEnabled, isMuted, syncMode, syncDirection
-        case fallbackRemote, fallbackRemotePath, fallbackRequiresCacheRebuild
-        case mountBackend
-        case vfsCacheMode, vfsCacheMaxSize, vfsCacheMaxAge, vfsCachePath, allowNonEmptyMount
-        case mountAtStartup, offlineAccessEnabled
-        case pinnedDirectories, warmExcludePatterns, rcPort
-        case downloadConnections
+        case isEnabled, isMuted, syncDirection
     }
 
     init(from decoder: Decoder) throws {
@@ -279,50 +166,8 @@ extension SyncProfile {
         isEnabled = try container.decodeIfPresent(Bool.self, forKey: .isEnabled) ?? false
         // Backwards compatibility: default to false if not present
         isMuted = try container.decodeIfPresent(Bool.self, forKey: .isMuted) ?? false
-        // Backwards compatibility: default to bisync if not present
-        syncMode = try container.decodeIfPresent(SyncMode.self, forKey: .syncMode) ?? .bisync
         // Backwards compatibility: default to localToRemote if not present
         syncDirection = try container.decodeIfPresent(SyncDirection.self, forKey: .syncDirection) ?? .localToRemote
-        // Backwards compatibility: fallback remote defaults to empty (disabled)
-        fallbackRemote = try container.decodeIfPresent(String.self, forKey: .fallbackRemote) ?? ""
-        fallbackRemotePath = try container.decodeIfPresent(String.self, forKey: .fallbackRemotePath) ?? ""
-        // Backwards compatibility: defaults to false (preserves env-var-override behaviour for old profiles)
-        fallbackRequiresCacheRebuild = try container.decodeIfPresent(
-            Bool.self, forKey: .fallbackRequiresCacheRebuild) ?? false
-        // Backwards compatibility: mount mode settings with defaults.
-        // Profiles with no explicit backend default to the kext-free NFS backend —
-        // it needs no macFUSE install, so it's the lowest-friction default. A profile
-        // that was running on macFUSE switches to NFS on its next mount (the VFS cache
-        // is shared, so no re-download); users who specifically want FUSE can pick
-        // macFUSE in the profile editor.
-        mountBackend = try container.decodeIfPresent(MountBackend.self, forKey: .mountBackend) ?? .nfs
-        vfsCacheMode = try container.decodeIfPresent(VFSCacheMode.self, forKey: .vfsCacheMode) ?? .full
-        vfsCacheMaxSize = try container.decodeIfPresent(String.self, forKey: .vfsCacheMaxSize) ?? "10G"
-        vfsCacheMaxAge = try container.decodeIfPresent(String.self, forKey: .vfsCacheMaxAge) ?? "168h"
-        let cachePath = try container.decodeIfPresent(String.self, forKey: .vfsCachePath) ?? ""
-        vfsCachePath = cachePath.isEmpty ? "\(NSHomeDirectory())/.cache/rclone" : cachePath
-        // Backwards compatibility: default to false if not present
-        allowNonEmptyMount = try container.decodeIfPresent(Bool.self, forKey: .allowNonEmptyMount) ?? false
-        // Backwards compatibility: auto-mount on startup defaults to true (matches the
-        // pre-existing behaviour where an installed mount profile always came up on launch)
-        mountAtStartup = try container.decodeIfPresent(Bool.self, forKey: .mountAtStartup) ?? true
-        // Backwards compatibility: offline access defaults to true, so a profile
-        // persisted before this field existed gains the read-only "(Offline)" browse
-        // point on its next mount (the VFS cache is shared, so nothing re-downloads).
-        offlineAccessEnabled = try container.decodeIfPresent(Bool.self, forKey: .offlineAccessEnabled) ?? true
-        // Backwards compatibility: default to empty array if not present
-        pinnedDirectories = try container.decodeIfPresent([String].self, forKey: .pinnedDirectories) ?? []
-        // Backwards compatibility: default to empty array if not present
-        warmExcludePatterns = try container.decodeIfPresent([String].self, forKey: .warmExcludePatterns) ?? []
-        // Backwards compatibility: generate default RC port if not present
-        let decodedRCPort = try container.decodeIfPresent(Int.self, forKey: .rcPort) ?? 0
-        rcPort = decodedRCPort > 0 ? decodedRCPort : SyncProfile.defaultRCPort(for: id)
-        // Backwards compatibility: parallel downloads default to 2 (a safe value on a
-        // contended Wi-Fi/mesh link or spinning-disk cache). Clamped to the supported
-        // 1...16 range so a hand-edited profile file can never inject an out-of-range
-        // --transfers.
-        let decodedConnections = try container.decodeIfPresent(Int.self, forKey: .downloadConnections) ?? 2
-        downloadConnections = min(16, max(1, decodedConnections))
     }
 }
 

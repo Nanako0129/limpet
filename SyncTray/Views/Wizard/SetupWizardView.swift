@@ -13,15 +13,11 @@ struct SetupWizardView: View {
 
     // Wizard state
     @State private var currentStep: WizardStep = .welcome
-    // Onboarding-funnel bookkeeping (new-profile flow only, not edit mode).
-    @State private var didLogWizardStart = false
-    @State private var wizardCompleted = false
     @State private var remoteConfig = RemoteConfiguration(name: "", provider: .googleDrive)
     @State private var selectedRemote: String = ""
     @State private var remotePath: String = ""
     @State private var localPath: String = ""
     @State private var profileName: String = ""
-    @State private var syncMode: SyncMode = .bisync
     @State private var syncDirection: SyncDirection = .localToRemote
     @State private var syncInterval: Int = 5
     @State private var isExternalDrive: Bool = false
@@ -30,8 +26,6 @@ struct SetupWizardView: View {
     @State private var isLoading: Bool = false
     @State private var errorMessage: String?
     @State private var isOAuthInProgress: Bool = false
-    @State private var wasFirstProfile: Bool = false
-    @State private var showingTelemetryDetails: Bool = false
 
     // Non-empty local folder confirmation (warns about local/remote merge on first sync)
     @State private var showingNonEmptyDirConfirm: Bool = false
@@ -72,7 +66,6 @@ struct SetupWizardView: View {
         case localPath = 4
         case syncSettings = 5
         case confirmation = 6
-        case helpImprove = 7
 
         var title: String {
             switch self {
@@ -83,21 +76,6 @@ struct SetupWizardView: View {
             case .localPath: return "Local Path"
             case .syncSettings: return "Sync Settings"
             case .confirmation: return "Confirm"
-            case .helpImprove: return "Help shape SyncTray"
-            }
-        }
-
-        /// Bounded, low-cardinality id for telemetry (`wizard.abandoned_at_step`).
-        var telemetryName: String {
-            switch self {
-            case .welcome: return "welcome"
-            case .provider: return "provider"
-            case .credentials: return "credentials"
-            case .remotePath: return "remote_path"
-            case .localPath: return "local_path"
-            case .syncSettings: return "sync_settings"
-            case .confirmation: return "confirmation"
-            case .helpImprove: return "help_improve"
             }
         }
 
@@ -139,11 +117,6 @@ struct SetupWizardView: View {
         .onAppear {
             checkRcloneInstallation()
             loadEditingProfile()
-            // Onboarding funnel: entry event (new-profile flow only, once per presentation).
-            if !isEditMode && !didLogWizardStart {
-                didLogWizardStart = true
-                TelemetryService.shared.recordWizardStep(outcome: "started")
-            }
         }
         .alert("This Folder Is Not Empty", isPresented: $showingNonEmptyDirConfirm) {
             Button("Cancel", role: .cancel) {
@@ -169,7 +142,6 @@ struct SetupWizardView: View {
         selectedRemote = profile.rcloneRemote.hasSuffix(":") ? profile.rcloneRemote : "\(profile.rcloneRemote):"
         remotePath = profile.remotePath
         localPath = profile.localSyncPath
-        syncMode = profile.syncMode
         syncDirection = profile.syncDirection
         syncInterval = profile.syncIntervalMinutes
         isExternalDrive = !profile.drivePathToMonitor.isEmpty
@@ -182,7 +154,7 @@ struct SetupWizardView: View {
 
     private var progressIndicator: some View {
         HStack(spacing: 4) {
-            ForEach(WizardStep.allCases.filter { $0 != .helpImprove }, id: \.rawValue) { step in
+            ForEach(WizardStep.allCases, id: \.rawValue) { step in
                 Circle()
                     .fill(step.rawValue <= currentStep.rawValue ? Color.accentColor : Color.gray.opacity(0.3))
                     .frame(width: 8, height: 8)
@@ -209,8 +181,6 @@ struct SetupWizardView: View {
             syncSettingsStep
         case .confirmation:
             confirmationStep
-        case .helpImprove:
-            helpImproveStep
         }
     }
 
@@ -428,61 +398,35 @@ struct SetupWizardView: View {
                 .font(.title2)
                 .fontWeight(.semibold)
 
-            // Sync mode
+            // Direction
             VStack(alignment: .leading, spacing: 8) {
-                Text("Sync Mode")
+                Text("Sync Direction")
                     .font(.subheadline)
                     .foregroundColor(.secondary)
 
-                Picker("Mode", selection: $syncMode) {
-                    ForEach(SyncMode.allCases) { mode in
+                Picker("Direction", selection: $syncDirection) {
+                    ForEach(SyncDirection.allCases) { direction in
                         HStack {
-                            Image(systemName: mode.iconName)
-                            Text(mode.displayName)
+                            Image(systemName: direction.iconName)
+                            Text(direction.displayName)
                         }
-                        .tag(mode)
+                        .tag(direction)
                     }
                 }
                 .pickerStyle(.radioGroup)
 
-                Text(syncMode.description)
+                Text(syncDirection.description)
                     .font(.caption)
                     .foregroundColor(.secondary)
-            }
 
-            // Direction (only for one-way sync)
-            if syncMode == .sync {
-                Divider()
-
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("Sync Direction")
-                        .font(.subheadline)
-                        .foregroundColor(.secondary)
-
-                    Picker("Direction", selection: $syncDirection) {
-                        ForEach(SyncDirection.allCases) { direction in
-                            HStack {
-                                Image(systemName: direction.iconName)
-                                Text(direction.displayName)
-                            }
-                            .tag(direction)
-                        }
-                    }
-                    .pickerStyle(.radioGroup)
-
-                    Text(syncDirection.description)
+                if syncDirection == .localToRemote {
+                    Label("Remote files not in local will be deleted", systemImage: "exclamationmark.triangle")
                         .font(.caption)
-                        .foregroundColor(.secondary)
-
-                    if syncDirection == .localToRemote {
-                        Label("Remote files not in local will be deleted", systemImage: "exclamationmark.triangle")
-                            .font(.caption)
-                            .foregroundColor(.orange)
-                    } else {
-                        Label("Local files not in remote will be deleted", systemImage: "exclamationmark.triangle")
-                            .font(.caption)
-                            .foregroundColor(.orange)
-                    }
+                        .foregroundColor(.orange)
+                } else {
+                    Label("Local files not in remote will be deleted", systemImage: "exclamationmark.triangle")
+                        .font(.caption)
+                        .foregroundColor(.orange)
                 }
             }
 
@@ -520,10 +464,7 @@ struct SetupWizardView: View {
             GroupBox("Profile") {
                 VStack(alignment: .leading, spacing: 8) {
                     LabeledContent("Name", value: profileName.isEmpty ? "New Profile" : profileName)
-                    LabeledContent("Sync Mode", value: syncMode.displayName)
-                    if syncMode == .sync {
-                        LabeledContent("Direction", value: syncDirection.displayName)
-                    }
+                    LabeledContent("Direction", value: syncDirection.displayName)
                     LabeledContent("Interval", value: "\(syncInterval) minutes")
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -566,120 +507,11 @@ struct SetupWizardView: View {
         isEditMode ? .remotePath : nil
     }
 
-    // MARK: - Help Improve Step
-
-    private var helpImproveStep: some View {
-        VStack(alignment: .leading, spacing: 20) {
-            Text("Help shape SyncTray")
-                .font(.title2)
-                .fontWeight(.semibold)
-
-            Text("SyncTray is built by one person in his spare time. Anonymous usage data tells me which sync modes people actually use, when syncs fail, and where the app gets stuck — so I can fix real problems instead of guessing.")
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-
-            HStack(alignment: .top, spacing: 12) {
-                // What's sent
-                GroupBox {
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text("What's sent")
-                            .font(.subheadline.weight(.medium))
-                            .padding(.bottom, 2)
-                        Label("Sync mode, success/failure, and duration", systemImage: "checkmark.circle.fill")
-                            .foregroundStyle(.primary)
-                            .labelStyle(ColoredIconLabelStyle(iconColor: .green))
-                        Label("Error categories (e.g. \"timeout\", \"network\")", systemImage: "checkmark.circle.fill")
-                            .foregroundStyle(.primary)
-                            .labelStyle(ColoredIconLabelStyle(iconColor: .green))
-                        Label("Anonymous machine ID — not reversible to you", systemImage: "checkmark.circle.fill")
-                            .foregroundStyle(.primary)
-                            .labelStyle(ColoredIconLabelStyle(iconColor: .green))
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                .frame(maxWidth: .infinity)
-
-                // What's never sent
-                GroupBox {
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text("What's never sent")
-                            .font(.subheadline.weight(.medium))
-                            .padding(.bottom, 2)
-                        Label("File names, folder names, or file contents", systemImage: "xmark.circle.fill")
-                            .foregroundStyle(.primary)
-                            .labelStyle(ColoredIconLabelStyle(iconColor: .red))
-                        Label("Remote names, hostnames, or credentials", systemImage: "xmark.circle.fill")
-                            .foregroundStyle(.primary)
-                            .labelStyle(ColoredIconLabelStyle(iconColor: .red))
-                        Label("Your IP address or personal identifiers", systemImage: "xmark.circle.fill")
-                            .foregroundStyle(.primary)
-                            .labelStyle(ColoredIconLabelStyle(iconColor: .red))
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                .frame(maxWidth: .infinity)
-            }
-
-            HStack {
-                Button("Learn more") {
-                    showingTelemetryDetails = true
-                }
-                .buttonStyle(.link)
-
-                Spacer()
-
-                Text("— Mads, SyncTray maintainer")
-                    .font(.caption)
-                    .italic()
-                    .foregroundStyle(.secondary)
-            }
-
-            Text("You can change this any time in App Settings.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-
-            // Action buttons — two equal-weight buttons, only tint differs
-            HStack(spacing: 12) {
-                Button("Share anonymous data") {
-                    SyncTraySettings.telemetryEnabled = true
-                    SyncTraySettings.telemetryBannerDismissedVersion = SyncTraySettings.currentTelemetryConsentVersion
-                    TelemetryService.shared.configure()
-                    dismiss()
-                }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.large)
-                .frame(maxWidth: .infinity)
-
-                Button("Not now") {
-                    SyncTraySettings.telemetryBannerDismissedVersion = SyncTraySettings.currentTelemetryConsentVersion
-                    dismiss()
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(.secondary)
-                .controlSize(.large)
-                .frame(maxWidth: .infinity)
-            }
-        }
-        .sheet(isPresented: $showingTelemetryDetails) {
-            TelemetryDetailsSheet()
-        }
-    }
-
     // MARK: - Navigation Buttons
 
     private var navigationButtons: some View {
         HStack {
             Button("Cancel") {
-                if currentStep == .helpImprove {
-                    SyncTraySettings.telemetryBannerDismissedVersion = SyncTraySettings.currentTelemetryConsentVersion
-                }
-                // Onboarding funnel: abandonment, tagged with the step they quit on.
-                if !isEditMode && !wizardCompleted && currentStep != .helpImprove {
-                    TelemetryService.shared.recordWizardStep(
-                        outcome: "abandoned",
-                        abandonedAtStep: currentStep.telemetryName
-                    )
-                }
                 dismiss()
             }
             .keyboardShortcut(.cancelAction)
@@ -687,8 +519,7 @@ struct SetupWizardView: View {
             Spacer()
 
             // Hide Back when at the starting step in edit mode (provider/credentials uninitialized)
-            // Also hide Back on the .helpImprove epilogue step
-            if currentStep.previous != nil && currentStep != editModeStartStep && currentStep != .helpImprove {
+            if currentStep.previous != nil && currentStep != editModeStartStep {
                 Button("Back") {
                     withAnimation {
                         currentStep = currentStep.previous!
@@ -696,20 +527,18 @@ struct SetupWizardView: View {
                 }
             }
 
-            if currentStep != .helpImprove {
-                if currentStep == .confirmation {
-                    Button(isEditMode ? "Save Changes" : "Create Profile") {
-                        saveProfile()
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(isLoading)
-                } else if let nextStep = currentStep.next {
-                    Button("Next") {
-                        advanceToNextStep(nextStep)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(!canAdvance)
+            if currentStep == .confirmation {
+                Button(isEditMode ? "Save Changes" : "Create Profile") {
+                    saveProfile()
                 }
+                .buttonStyle(.borderedProminent)
+                .disabled(isLoading)
+            } else if let nextStep = currentStep.next {
+                Button("Next") {
+                    advanceToNextStep(nextStep)
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(!canAdvance)
             }
         }
     }
@@ -737,8 +566,6 @@ struct SetupWizardView: View {
         case .syncSettings:
             return true
         case .confirmation:
-            return true
-        case .helpImprove:
             return true
         }
     }
@@ -768,14 +595,6 @@ struct SetupWizardView: View {
     private func advanceToNextStep(_ nextStep: WizardStep) {
         errorMessage = nil
 
-        // Onboarding funnel: capture the chosen provider as the user leaves the provider step.
-        if currentStep == .provider && !isEditMode {
-            TelemetryService.shared.recordWizardStep(
-                outcome: "provider_selected",
-                providerType: remoteConfig.provider.rcloneType
-            )
-        }
-
         // Skip credentials step if using existing remote
         if currentStep == .welcome && !selectedRemote.isEmpty {
             withAnimation {
@@ -803,16 +622,13 @@ struct SetupWizardView: View {
         isOAuthInProgress = true
         errorMessage = nil
 
-        let providerType = remoteConfig.provider.rcloneType
         configService.startOAuthFlow(for: remoteConfig.provider) { result in
             isOAuthInProgress = false
             switch result {
             case .success(let token):
                 remoteConfig.oauthToken = token
-                TelemetryService.shared.recordOAuthOutcome(result: "success", providerType: providerType)
             case .failure(let error):
                 errorMessage = error.localizedDescription
-                TelemetryService.shared.recordOAuthOutcome(result: "failure", providerType: providerType)
             }
         }
     }
@@ -825,21 +641,10 @@ struct SetupWizardView: View {
             try configService.addRemote(remoteConfig)
             selectedRemote = "\(remoteConfig.name):"
             isLoading = false
-            TelemetryService.shared.recordRemoteConfigOperation(
-                operation: "create",
-                providerType: remoteConfig.provider.rcloneType,
-                result: "success"
-            )
             completion()
         } catch {
             isLoading = false
             errorMessage = error.localizedDescription
-            TelemetryService.shared.recordRemoteConfigOperation(
-                operation: "create",
-                providerType: remoteConfig.provider.rcloneType,
-                result: "failure",
-                errorMessage: error.localizedDescription
-            )
         }
     }
 
@@ -864,14 +669,6 @@ struct SetupWizardView: View {
                 applyLocalPath(path)
             }
         }
-    }
-
-    /// Gate: wasFirstProfile must be set as the FIRST statement, before profileStore.add() changes the count.
-    private var shouldShowHelpImproveStep: Bool {
-        wasFirstProfile
-            && !isEditMode
-            && !SyncTraySettings.telemetryEnabled
-            && !SyncTraySettings.telemetryBannerDismissed
     }
 
     /// Applies a chosen local folder path along with its derived side effects
@@ -905,9 +702,6 @@ struct SetupWizardView: View {
     }
 
     private func saveProfile() {
-        // Capture BEFORE profileStore.add() changes the count
-        wasFirstProfile = profileStore.profiles.isEmpty
-
         isLoading = true
         errorMessage = nil
 
@@ -933,7 +727,6 @@ struct SetupWizardView: View {
             updatedProfile.localSyncPath = localPath
             updatedProfile.drivePathToMonitor = drivePath
             updatedProfile.syncIntervalMinutes = syncInterval
-            updatedProfile.syncMode = syncMode
             updatedProfile.syncDirection = syncDirection
 
             profileStore.update(updatedProfile)
@@ -947,19 +740,11 @@ struct SetupWizardView: View {
                 localSyncPath: localPath,
                 drivePathToMonitor: drivePath,
                 syncIntervalMinutes: syncInterval,
-                syncMode: syncMode,
                 syncDirection: syncDirection
             )
 
             profileStore.add(profile)
             profileToInstall = profile
-
-            // Onboarding funnel: completion (new-profile flow only).
-            wizardCompleted = true
-            TelemetryService.shared.recordWizardStep(
-                outcome: "created",
-                providerType: remoteConfig.provider.rcloneType
-            )
         }
 
         // Automatically install the scheduled sync
@@ -971,28 +756,7 @@ struct SetupWizardView: View {
         }
 
         isLoading = false
-        if shouldShowHelpImproveStep {
-            withAnimation {
-                currentStep = .helpImprove
-            }
-        } else {
-            dismiss()
-        }
-    }
-}
-
-// MARK: - Colored Icon Label Style
-
-private struct ColoredIconLabelStyle: LabelStyle {
-    let iconColor: Color
-
-    func makeBody(configuration: Configuration) -> some View {
-        HStack(alignment: .firstTextBaseline, spacing: 6) {
-            configuration.icon
-                .foregroundStyle(iconColor)
-            configuration.title
-                .font(.caption)
-        }
+        dismiss()
     }
 }
 

@@ -1,5 +1,4 @@
 import Foundation
-import CryptoKit
 import os.log
 
 /// Global app settings (not profile-specific)
@@ -25,112 +24,6 @@ struct SyncTraySettings {
 
         // Debug settings
         static let debugLoggingEnabled = "debugLoggingEnabled"
-
-        // Auto-fix settings
-        static let autoFixSyncIssues = "autoFixSyncIssues"
-
-        // Telemetry settings
-        static let telemetryEnabled = "telemetryEnabled"
-        static let installationId = "installationId"
-        static let telemetryBannerDismissedVersion = "telemetryBannerDismissedVersion"
-        static let lastLaunchedVersion = "lastLaunchedVersion"
-        static let finderSetupVersion = "finderSetupVersion"
-    }
-
-    // MARK: - Telemetry Settings
-
-    /// Whether anonymous telemetry is enabled. Off by default (opt-in).
-    static var telemetryEnabled: Bool {
-        get { defaults.bool(forKey: Keys.telemetryEnabled) }
-        set { defaults.set(newValue, forKey: Keys.telemetryEnabled) }
-    }
-
-    /// A persistent anonymous installation ID (UUID) for correlating metrics.
-    /// Generated once and stored in UserDefaults. Never contains personal data.
-    static var installationId: String {
-        if let existing = defaults.string(forKey: Keys.installationId) {
-            return existing
-        }
-        let newId = UUID().uuidString
-        defaults.set(newId, forKey: Keys.installationId)
-        return newId
-    }
-
-    /// A stable, anonymous user identifier derived from the hardware UUID.
-    /// HMAC-SHA256(hardwareUUID, key: "synctray-telemetry") — not reversible,
-    /// survives reinstalls, and correlates all telemetry to the same physical machine.
-    static var anonymousUserId: String {
-        let hardwareUUID = platformUUID() ?? installationId
-        let key = SymmetricKey(data: Data("synctray-telemetry".utf8))
-        let mac = HMAC<SHA256>.authenticationCode(
-            for: Data(hardwareUUID.utf8),
-            using: key
-        )
-        return mac.map { String(format: "%02x", $0) }.joined()
-    }
-
-    /// Read the hardware UUID from IOKit (stable across reinstalls).
-    private static func platformUUID() -> String? {
-        let service = IOServiceGetMatchingService(
-            kIOMainPortDefault,
-            IOServiceMatching("IOPlatformExpertDevice")
-        )
-        guard service != IO_OBJECT_NULL else { return nil }
-        defer { IOObjectRelease(service) }
-
-        let key = kIOPlatformUUIDKey as CFString
-        guard let uuid = IORegistryEntryCreateCFProperty(service, key, kCFAllocatorDefault, 0)?
-            .takeRetainedValue() as? String else { return nil }
-        return uuid
-    }
-
-    /// The current consent banner version. Bump this to re-show the banner to all users,
-    /// even those who previously dismissed it. Independent of the app version.
-    static let currentTelemetryConsentVersion = 1
-
-    /// The consent banner version the user last dismissed (or opted in on).
-    /// Returns 0 if the user has never interacted with the banner.
-    static var telemetryBannerDismissedVersion: Int {
-        get { defaults.integer(forKey: Keys.telemetryBannerDismissedVersion) }
-        set { defaults.set(newValue, forKey: Keys.telemetryBannerDismissedVersion) }
-    }
-
-    /// Whether the banner should be shown — true if the user hasn't dismissed the current version.
-    static var telemetryBannerDismissed: Bool {
-        telemetryBannerDismissedVersion >= currentTelemetryConsentVersion
-    }
-
-    /// The `service.version` recorded the last time the app launched.
-    /// Used to detect upgrades (deployment markers) across launches.
-    /// nil on a fresh install (no upgrade event should be emitted then).
-    static var lastLaunchedVersion: String? {
-        get { defaults.string(forKey: Keys.lastLaunchedVersion) }
-        set { defaults.set(newValue, forKey: Keys.lastLaunchedVersion) }
-    }
-
-    /// App version the FinderSync extension was last (re)loaded for. When this differs
-    /// from the current version — i.e. after an install/upgrade — SyncTray relaunches
-    /// Finder on the next launch so it drops the stale extension and loads the new
-    /// binary, without the user restarting Finder manually. Kept separate from
-    /// `lastLaunchedVersion` so telemetry's deployment tracking and this can't race.
-    static var finderSetupVersion: String? {
-        get { defaults.string(forKey: Keys.finderSetupVersion) }
-        set { defaults.set(newValue, forKey: Keys.finderSetupVersion) }
-    }
-
-    // MARK: - Auto-Fix Settings
-
-    /// Automatically run --resync when bisync detects an out-of-sync state. On by default.
-    static var autoFixSyncIssues: Bool {
-        get {
-            // UserDefaults.bool returns false when key is absent — default ON requires
-            // registering a default or using object(forKey:) and treating nil as true.
-            if defaults.object(forKey: Keys.autoFixSyncIssues) == nil {
-                return true  // default ON
-            }
-            return defaults.bool(forKey: Keys.autoFixSyncIssues)
-        }
-        set { defaults.set(newValue, forKey: Keys.autoFixSyncIssues) }
     }
 
     // MARK: - Debug Settings

@@ -368,11 +368,6 @@ struct AddRemoteSheet: View {
                 let remoteName = "\(capturedConfig.name):"
                 DispatchQueue.main.async {
                     isLoading = false
-                    TelemetryService.shared.recordRemoteConfigOperation(
-                        operation: "create",
-                        providerType: capturedConfig.provider.rcloneType,
-                        result: "success"
-                    )
                     onRemoteCreated(remoteName)
                     onSuccess()
                 }
@@ -380,12 +375,6 @@ struct AddRemoteSheet: View {
                 DispatchQueue.main.async {
                     isLoading = false
                     errorMessage = error.localizedDescription
-                    TelemetryService.shared.recordRemoteConfigOperation(
-                        operation: "create",
-                        providerType: capturedConfig.provider.rcloneType,
-                        result: "failure",
-                        errorMessage: error.localizedDescription
-                    )
                 }
             }
         }
@@ -401,11 +390,6 @@ struct AddRemoteSheet: View {
                 try configService.updateRemote(capturedConfig)
                 DispatchQueue.main.async {
                     isLoading = false
-                    TelemetryService.shared.recordRemoteConfigOperation(
-                        operation: "update",
-                        providerType: capturedConfig.provider.rcloneType,
-                        result: "success"
-                    )
                     onRemoteUpdated?(capturedConfig.name)
                     onSuccess()
                 }
@@ -413,12 +397,6 @@ struct AddRemoteSheet: View {
                 DispatchQueue.main.async {
                     isLoading = false
                     errorMessage = error.localizedDescription
-                    TelemetryService.shared.recordRemoteConfigOperation(
-                        operation: "update",
-                        providerType: capturedConfig.provider.rcloneType,
-                        result: "failure",
-                        errorMessage: error.localizedDescription
-                    )
                 }
             }
         }
@@ -448,19 +426,8 @@ struct AddRemoteSheet: View {
                         switch result {
                         case .success:
                             connectionTestSuccess = true
-                            TelemetryService.shared.recordRemoteConfigOperation(
-                                operation: "connection_test",
-                                providerType: capturedConfig.provider.rcloneType,
-                                result: "success"
-                            )
                         case .failure(let error):
                             errorMessage = error.localizedDescription
-                            TelemetryService.shared.recordRemoteConfigOperation(
-                                operation: "connection_test",
-                                providerType: capturedConfig.provider.rcloneType,
-                                result: "failure",
-                                errorMessage: error.localizedDescription
-                            )
                         }
                     }
                 }

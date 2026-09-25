@@ -37,47 +37,8 @@ final class SyncManager: ObservableObject {
     /// Last error message per profile (for display in UI)
     @Published private(set) var profileErrors: [UUID: String] = [:]
 
-    /// Mount state per profile (for mount mode profiles only)
-    @Published private(set) var profileMountStates: [UUID: MountState] = [:]
-
-    /// Human-friendly status shown under a `.mounting` profile, escalated by how
-    /// long establishment has taken (see `mountProgressMessage`). Lets the UI say
-    /// "Starting mount…" → "Mounting…" → "warming a large cache…" instead of a
-    /// single static label during a multi-minute NFS cache walk. Cleared when the
-    /// mount resolves.
-    @Published private(set) var profileMountProgress: [UUID: String] = [:]
-
-    /// Active transport per profile (primary or fallback)
-    @Published private(set) var profileTransports: [UUID: ActiveTransport] = [:]
-
     /// Paused profiles (session-only, not persisted - resets on app restart)
     @Published private(set) var pausedProfiles: Set<UUID> = []
-
-    /// Live progress of offline-file warming per profile (session-only). Drives the
-    /// "Available Offline" progress row in `OfflineFilesSection`. Set by
-    /// `warmPinnedDirectories`, which every warm entry point routes through.
-    @Published private(set) var warmProgress: [UUID: WarmProgress] = [:]
-
-    /// In-flight warming tasks per profile, kept so a warm run can be cancelled when the
-    /// cache is cleared, the profile is unmounted, or a new run supersedes it. Without this,
-    /// clearing the cache mid-warm just re-downloads the files the warmer is still reading.
-    private var warmTasks: [UUID: Task<Void, Never>] = [:]
-
-    /// Profiles the app has already auto-warmed for their CURRENT mount session, so the
-    /// repeating mount monitor warms a launchd/externally-mounted profile exactly once when
-    /// it first appears mounted — not every 5s tick (which would thrash, since `startWarm`
-    /// supersedes rather than coalesces). Re-armed when the profile is seen unmounted, so a
-    /// later remount warms again and picks up files added on the remote in the meantime.
-    private var autoWarmedMounts: Set<UUID> = []
-
-    /// Live progress of an in-flight cache-directory move, keyed by the
-    /// profile whose Cache Directory is changing. Drives `CacheMoveSheet`'s
-    /// progress UI.
-    @Published private(set) var cacheMigrationProgress: [UUID: CacheMigrationProgress] = [:]
-
-    /// In-flight cache-migration tasks, so a second start supersedes and
-    /// cancel can stop one.
-    private var cacheMigrationTasks: [UUID: Task<CacheMigrationOutcome, Never>] = [:]
 
     let profileStore: ProfileStore
 
@@ -86,90 +47,22 @@ final class SyncManager: ObservableObject {
     /// Watches ~/.config/synctray for external edits to *.profile.json and
     /// settings.json and routes them through the reconcile path below.
     private var configFileWatcher: ConfigFileWatcher?
-    // What last kicked off a sync per profile (manual | directory_watch | startup), consumed
-    // and cleared by the `.syncStarted` handler to attribute `sync.trigger`. Absent = scheduled.
-    private var pendingSyncTrigger: [UUID: String] = [:]
     private let logParser = LogParser()
     private let notificationService = NotificationService.shared
     private let setupService = SyncSetupService.shared
-    private let cacheService = VFSCacheService.shared
 
-    private var heartbeatTimer: DispatchSourceTimer?
-    private var mountStateMonitorTimer: DispatchSourceTimer?
-    private var mountProgressTimer: DispatchSourceTimer?
-    // Mount-mode profiles whose `profileProgress` is currently driven by the RC poll, so
-    // it can be cleared when a mount goes idle or unmounts.
-    private var mountProgressActive: Set<UUID> = []
-    private var primaryRecoveryTimer: DispatchSourceTimer?
-    // Profiles with an in-flight primary-recovery remount, so we don't stack remounts.
-    private var recoveringToPrimary: Set<UUID> = []
-    // Consecutive successful primary probes per profile. We only remount back onto the
-    // primary after the primary has been reachable for several probes in a row, so a
-    // flapping primary can't trigger a remount storm (every remount is an unmount+mount,
-    // which surfaces a macOS "Server connections interrupted" dialog for a Stream mount).
-    private var primaryRecoveryStreak: [UUID: Int] = [:]
-    // Probes are 120s apart, so 3 in a row means ~6 minutes of stable primary.
-    private let primaryRecoveryRequiredStreak = 3
     private var workspaceObserver: NSObjectProtocol?
     private var currentSyncChanges: [UUID: [FileChange]] = [:]
     private var cancellables = Set<AnyCancellable>()
 
-    // MARK: - FinderSync IPC Constants
-    //
-    // These string literals are intentionally duplicated in FinderSyncExtension.swift
-    // (the extension target). The two targets are separate compilation units and cannot
-    // share a Swift file. Treat them as a cross-target contract — if you rename one, rename both.
-
-    /// App Group identifier shared between host app and the FinderSync extension.
-    private let kAppGroupID = "7HVK85DZG7.group.com.synctray.app"
-
-    /// UserDefaults key for the mount-path array read by the extension.
-    private let kMountPathsKey = "com.synctray.app.mountPaths"
-
-    /// Darwin notification name posted by the extension when a pin/unpin request is pending.
-    private let kPinRequestNotificationName = "com.synctray.app.pinRequest"
-
-    /// UserDefaults key for per-profile data (profileId, pinnedDirectories, vfsCachePath) read by the extension.
-    private let kProfileDataKey = "com.synctray.app.profileData"
-
-    /// Filename of the pending pin/unpin request written by the extension into the App Group container.
-    private let kPendingPinRequestFile = "pending-pin-request.json"
-
-    /// 1-second fallback poll timer for missed Darwin notifications.
-    private var pinRequestPollTimer: DispatchSourceTimer?
-
     /// Track the last error message per profile (for correlating with syncFailed events)
     private var lastSeenErrorMessage: [UUID: String] = [:]
-
-    /// Track sync start times per profile for duration measurement
-    private var syncStartTimes: [UUID: Date] = [:]
-
-    /// Track check phase: once totalChecks > 0 and checksDone < totalChecks, phase is active
-    private var checkPhaseStartTimes: [UUID: Date] = [:]
-    private var checkPhaseReported: Set<UUID> = []
 
     /// Profiles where we're monitoring an externally-started sync
     private var monitoringExternalSyncs: Set<UUID> = []
 
     /// Timers polling for sync completion
     private var syncCompletionPollers: [UUID: DispatchSourceTimer] = [:]
-
-    // MARK: - Auto-Fix Backoff State
-
-    /// Timestamps of the last consecutive auto-fix attempts per profile (in-memory only, not persisted).
-    /// Used to implement backoff: if 2+ attempts within autoFixBackoffWindow seconds both fail, stop auto-fixing.
-    private var autoFixAttempts: [UUID: [Date]] = [:]
-
-    /// Profiles where auto-fix has been suppressed due to repeated failures.
-    /// Reset when the profile completes a successful sync.
-    private var autoFixSuppressed: Set<UUID> = []
-
-    /// Profiles where an auto-fix resync is currently in-flight.
-    /// Prevents a second Task from being dispatched before the first completes.
-    private var autoFixInFlight: Set<UUID> = []
-
-    /// The time window (seconds) within which consecutive auto-fix failures trigger backoff suppression.
-    private let autoFixBackoffWindow: TimeInterval = 5 * 60  // 5 minutes
 
     private let maxRecentChanges = 20
 
@@ -179,22 +72,9 @@ final class SyncManager: ObservableObject {
         setupProfileObserver()
         cleanupStaleLockFiles()
         setupService.refreshSharedScriptIfChanged()  // Propagate script template updates
-        setupService.cleanupStaleMounts(mountProfiles: self.profileStore.profiles)  // Clean up stale mounts on startup
         detectAndResumeRunningSyncs()  // After cleanup, detect external syncs
         checkInitialState()
         startWatchingAllProfiles()
-        updateMountStates()  // Initialize mount states for mount mode profiles
-        // Report active profile count and configuration snapshot for telemetry
-        TelemetryService.shared.recordProfileCount(self.profileStore.enabledProfiles.count)
-        TelemetryService.shared.recordAllProfileConfigurations(self.profileStore.profiles)
-        startSessionHeartbeat()
-        startMountStateMonitor()
-        startMountProgressMonitor()
-        startPrimaryRecoveryMonitor()
-        mountProfilesAtStartup()
-        maintainAllOfflineAccessLinks()  // Read-only offline cache browse points, independent of mount success
-        setupFinderSyncIPC()
-        updateAppGroupMountPaths()
         refreshSettingsFile()
         startConfigWatcher()
     }
@@ -202,34 +82,6 @@ final class SyncManager: ObservableObject {
     deinit {
         configFileWatcher?.stop()
         configFileWatcher = nil
-
-        // Cancel heartbeat timer
-        heartbeatTimer?.cancel()
-        heartbeatTimer = nil
-
-        // Cancel mount-state monitor
-        mountStateMonitorTimer?.cancel()
-        mountStateMonitorTimer = nil
-
-        // Cancel mount-progress monitor
-        mountProgressTimer?.cancel()
-        mountProgressTimer = nil
-
-        // Cancel primary-recovery monitor
-        primaryRecoveryTimer?.cancel()
-        primaryRecoveryTimer = nil
-
-        // Cancel pin-request poll timer
-        pinRequestPollTimer?.cancel()
-        pinRequestPollTimer = nil
-
-        // Remove Darwin notification observer to avoid dangling-pointer crash.
-        CFNotificationCenterRemoveObserver(
-            CFNotificationCenterGetDistributedCenter(),
-            Unmanaged.passUnretained(self).toOpaque(),
-            CFNotificationName(kPinRequestNotificationName as CFString),
-            nil
-        )
 
         // Cancel all sync completion pollers
         for timer in syncCompletionPollers.values {
@@ -299,272 +151,6 @@ final class SyncManager: ObservableObject {
             }
             await MainActor.run {
                 manualSyncingProfiles.subtract(syncingIds)
-            }
-        }
-    }
-
-    // MARK: - Mount Mode Management
-
-    /// On app launch, auto-mount enabled mount profiles that opt in via
-    /// `mountAtStartup`. launchd already re-mounts these at login (RunAtLoad), so
-    /// this is mostly a safety net for when the agent was unloaded — and it honours
-    /// the per-profile setting so opt-out profiles are never mounted behind the
-    /// user's back. `mountProfile` no-ops when the profile is already mounted.
-    private func mountProfilesAtStartup() {
-        for profile in profileStore.enabledProfiles
-        where profile.isMountMode
-            && profile.mountAtStartup
-            && setupService.isInstalled(profile: profile)
-            && !setupService.isMounted(profile: profile) {
-            mountProfile(profile)
-        }
-    }
-
-    // MARK: - Offline Access Browse Point
-
-    /// Maintain the read-only "<mount-name> (Offline)" cache browse point for one
-    /// profile: create it (or re-point it after a `vfsCachePath` change) when the
-    /// profile is a mount with `offlineAccessEnabled`, remove a stale one otherwise.
-    /// The filesystem work runs off the main actor because it touches the profile's
-    /// (possibly slow, external) cache volume and needs no main-actor state — the
-    /// decision is pure (`OfflineAccessLink`) and the profile is a value type.
-    func maintainOfflineAccessLink(for profile: SyncProfile) {
-        DispatchQueue.global(qos: .utility).async {
-            OfflineAccessLink.apply(for: profile) { SyncTraySettings.debugLog($0) }
-        }
-    }
-
-    /// Maintain the offline browse point for **every** profile — mount profiles gain
-    /// or keep their link, non-mount profiles have any stale link cleaned up. Called
-    /// at launch and after profile mutations so the on-disk links always match config.
-    func maintainAllOfflineAccessLinks() {
-        let profiles = profileStore.profiles
-        DispatchQueue.global(qos: .utility).async {
-            for profile in profiles {
-                OfflineAccessLink.apply(for: profile) { SyncTraySettings.debugLog($0) }
-            }
-        }
-    }
-
-    /// Mount a profile (for mount mode only)
-    /// Outcome of one tick of the mount-establishment poll.
-    enum MountPollDecision: Equatable {
-        case established    // the volume is in the mount table now
-        case keepWaiting    // not mounted yet, still establishing — stay in `.mounting`
-        case failedDead     // the mount agent stopped (fail fast, don't wait the cap)
-        case failedTimeout  // the hard time cap elapsed while still unmounted
-    }
-
-    /// Pure decision for the mount-establishment poll (see `mountProfile`).
-    /// Extracted so the timeout / liveness logic is unit-testable without a real
-    /// mount (`ConfigSelfTest` AC-MP1). A mount is `.established` the moment the
-    /// volume appears; otherwise an agent that is still alive means "establishing"
-    /// (keep the loading state) up to `maxSeconds`, while `deadThreshold`
-    /// consecutive not-alive samples end it early as `.failedDead` — so a genuinely
-    /// stopped agent fails fast, but a KeepAlive respawn gap (one missed sample)
-    /// does not.
-    /// - Note: `isMounted` wins over everything, so a mount that comes up on the
-    ///   same tick the cap elapses still reports success.
-    static func mountPollDecision(
-        elapsedSeconds: Int,
-        maxSeconds: Int,
-        isMounted: Bool,
-        agentAlive: Bool,
-        consecutiveDead: Int,
-        deadThreshold: Int
-    ) -> MountPollDecision {
-        if isMounted { return .established }
-        if !agentAlive && consecutiveDead >= deadThreshold { return .failedDead }
-        if elapsedSeconds >= maxSeconds { return .failedTimeout }
-        return .keepWaiting
-    }
-
-    /// Staged status text for a `.mounting` profile, chosen by how long the mount
-    /// has been establishing. Pure so the message buckets are unit-testable
-    /// (`ConfigSelfTest` AC-MP1). The later buckets reassure the user that a slow
-    /// mount is a large-cache walk, not a hang, and name the 5-minute ceiling.
-    static func mountProgressMessage(elapsedSeconds: Int) -> String {
-        switch elapsedSeconds {
-        case ..<8:   return "Starting mount…"
-        case ..<45:  return "Mounting…"
-        case ..<120: return "Mounting… warming a large cache, this can take a minute"
-        default:     return "Still mounting… large cache, this can take up to 5 minutes"
-        }
-    }
-
-    func mountProfile(_ profile: SyncProfile) {
-        guard profile.isMountMode else { return }
-
-        profileMountStates[profile.id] = .mounting
-        profileMountProgress[profile.id] = Self.mountProgressMessage(elapsedSeconds: 0)
-
-        Task {
-            do {
-                // Check if already mounted
-                if setupService.isMounted(profile: profile) {
-                    await MainActor.run {
-                        profileMountStates[profile.id] = .mounted
-                    }
-                    return
-                }
-
-                // Ensure the agent is loaded (so kickstart can target it), then force
-                // a fresh start. We only reach here when NOT already mounted, so
-                // kickstart -k is safe and is the reliable path: it starts opt-out
-                // profiles (RunAtLoad=false) and recovers a zombie rclone (running but
-                // unmounted, holding the RC port) that loadAgent alone can't restart.
-                _ = setupService.loadAgent(for: profile)
-                let success = setupService.startAgent(for: profile)
-
-                if success {
-                    // Poll for the mount to establish, staying in `.mounting` (the UI
-                    // shows a spinner) the whole time. A large VFS cache walk before the
-                    // NFS volume attaches can take minutes (observed ~112s for a 121GB /
-                    // 12k-file cache), so the old fixed 30s cap flipped the UI to a false
-                    // "Mount did not establish" while the mount was still coming up. Poll
-                    // up to 5 minutes using launchd job liveness as the signal: an
-                    // unmounted-but-agent-alive profile is still establishing; a stopped
-                    // agent (deadThreshold consecutive samples) fails fast; the 5-minute
-                    // cap is the backstop. The 5s mount-state monitor independently
-                    // confirms a late arrival, so this loop never needs to over-wait.
-                    let maxSeconds = 300
-                    let pollInterval = 2
-                    let deadThreshold = 3
-                    var decision: MountPollDecision = .keepWaiting
-                    var consecutiveDead = 0
-                    var elapsed = 0
-                    var lastProgress = Self.mountProgressMessage(elapsedSeconds: 0)
-                    while elapsed < maxSeconds {
-                        try? await Task.sleep(nanoseconds: UInt64(pollInterval) * 1_000_000_000)
-                        elapsed += pollInterval
-                        let mounted = setupService.isMounted(profile: profile)
-                        let alive = setupService.isMountAgentRunning(profile: profile)
-                        consecutiveDead = alive ? 0 : consecutiveDead + 1
-                        decision = Self.mountPollDecision(
-                            elapsedSeconds: elapsed,
-                            maxSeconds: maxSeconds,
-                            isMounted: mounted,
-                            agentAlive: alive,
-                            consecutiveDead: consecutiveDead,
-                            deadThreshold: deadThreshold
-                        )
-                        if decision != .keepWaiting { break }
-                        // Escalate the loading text only when the bucket changes, so a
-                        // multi-minute cache walk reads as progress, not a hang.
-                        let progress = Self.mountProgressMessage(elapsedSeconds: elapsed)
-                        if progress != lastProgress {
-                            lastProgress = progress
-                            await MainActor.run { self.profileMountProgress[profile.id] = progress }
-                        }
-                    }
-                    let established = (decision == .established)
-                    let failReason = decision == .failedDead
-                        ? "Mount agent stopped before the volume attached"
-                        : "Mount did not establish within 5 minutes"
-                    await MainActor.run {
-                        profileMountProgress[profile.id] = nil
-                        if established {
-                            profileMountStates[profile.id] = .mounted
-                            TelemetryService.shared.recordMountOperation(
-                                profileId: profile.id,
-                                profileName: profile.name,
-                                operation: "mount",
-                                result: "success"
-                            )
-                            // Update App Group mount paths so the FinderSync extension
-                            // registers this newly mounted directory.
-                            updateAppGroupMountPaths()
-                            // Ensure the read-only "(Offline)" browse point exists now that
-                            // the cache dir is (or is about to be) populated.
-                            maintainOfflineAccessLink(for: profile)
-                            // Auto-refresh pinned directories after successful mount
-                            if !profile.pinnedDirectories.isEmpty {
-                                // Claim the warm here so the mount monitor's own
-                                // warm-on-detect (reconcileMountStatesOffMain) doesn't also
-                                // fire for this same mount.
-                                autoWarmedMounts.insert(profile.id)
-                                Task { [weak self] in
-                                    // Wait for RC API to be ready
-                                    try? await Task.sleep(nanoseconds: 2_000_000_000)
-                                    self?.startWarm(for: profile.id, trigger: "startup")
-                                }
-                            }
-                        } else {
-                            profileMountStates[profile.id] = .failed(failReason)
-                            TelemetryService.shared.recordMountOperation(
-                                profileId: profile.id,
-                                profileName: profile.name,
-                                operation: "mount",
-                                result: "failure"
-                            )
-                        }
-                    }
-                } else {
-                    await MainActor.run {
-                        profileMountStates[profile.id] = .failed("Failed to start mount agent")
-                        TelemetryService.shared.recordMountOperation(
-                            profileId: profile.id,
-                            profileName: profile.name,
-                            operation: "mount",
-                            result: "failure"
-                        )
-                    }
-                }
-            }
-        }
-    }
-
-    /// Unmount a profile (for mount mode only)
-    func unmountProfile(_ profile: SyncProfile) {
-        guard profile.isMountMode else { return }
-
-        // Stop any warming first — reads through a mount that's going away would hang or fail.
-        cancelWarm(for: profile.id)
-        autoWarmedMounts.remove(profile.id)  // re-arm auto-warm for the next mount
-
-        Task {
-            do {
-                try setupService.unmount(profile: profile)
-                await MainActor.run {
-                    profileMountStates[profile.id] = .unmounted
-                    TelemetryService.shared.recordMountOperation(
-                        profileId: profile.id,
-                        profileName: profile.name,
-                        operation: "unmount",
-                        result: "success"
-                    )
-                    // Update App Group mount paths so the FinderSync extension
-                    // unregisters this directory.
-                    updateAppGroupMountPaths()
-                }
-            } catch {
-                await MainActor.run {
-                    profileMountStates[profile.id] = .failed(error.localizedDescription)
-                    TelemetryService.shared.recordMountOperation(
-                        profileId: profile.id,
-                        profileName: profile.name,
-                        operation: "unmount",
-                        result: "failure"
-                    )
-                }
-            }
-        }
-    }
-
-    /// Get mount state for a specific profile
-    func mountState(for profileId: UUID) -> MountState {
-        profileMountStates[profileId] ?? .unmounted
-    }
-
-    /// Update mount states for all mount mode profiles
-    func updateMountStates() {
-        for profile in profileStore.enabledProfiles where profile.isMountMode {
-            let isMounted = setupService.isMounted(profile: profile)
-            if isMounted {
-                profileMountStates[profile.id] = .mounted
-            } else if profileMountStates[profile.id] == nil || profileMountStates[profile.id] == .mounted {
-                // Only update to unmounted if it was previously mounted or unknown
-                profileMountStates[profile.id] = .unmounted
             }
         }
     }
@@ -766,27 +352,7 @@ final class SyncManager: ObservableObject {
             }
         }
 
-        // App-side warm reconcile, ORTHOGONAL to the launchd `action` above: an
-        // external edit that changes `warmExcludePatterns` or `pinnedDirectories`
-        // must take effect (re-warm) just as the in-app pin/unpin edit does, even
-        // though such a change yields `action == .none` (no reinstall/remount).
-        // Gated on the profile being currently mounted; runs the same primitives
-        // as the in-app path via `applyWarmReconcile` so the two cannot drift.
-        Self.applyWarmReconcileIfNeeded(
-            from: currentProfile,
-            to: updatedProfile,
-            isMounted: profileMountStates[updatedProfile.id] == .mounted
-        ) { [weak self] id in
-            self?.applyWarmReconcile(for: id, trigger: "external_edit")
-        }
-
-        // Offline browse point: create / remove / re-point per the edited profile
-        // (a toggled `offlineAccessEnabled` yields `action == .none`, and a changed
-        // `vfsCachePath` a `.reinstall`; either way the link must follow config).
-        maintainOfflineAccessLink(for: updatedProfile)
-
         updateAggregateState()
-        TelemetryService.shared.recordExternalConfigEdit(kind: "profile")
     }
 
     /// Wires `applyExternalCreateIfNeeded`'s persist/install closures to the
@@ -808,7 +374,6 @@ final class SyncManager: ObservableObject {
             persist: { [weak self] profile in
                 self?.profileStore.add(profile)
                 self?.clearError(for: profile.id)
-                self?.maintainOfflineAccessLink(for: profile)
 
                 let canonicalFilename = "\(profile.shortId).profile.json"
                 let sourceFilename = (sourcePath as NSString).lastPathComponent
@@ -829,23 +394,6 @@ final class SyncManager: ObservableObject {
         guard outcome != .ignored else { return }
 
         updateAggregateState()
-        TelemetryService.shared.recordExternalConfigEdit(kind: "profile", action: "create")
-    }
-
-    /// App-side warm reconcile: re-push the App Group data the FinderSync
-    /// extension reads (pinned set / cache path may have changed) and (re)start a
-    /// warming run for the profile's pinned directories. This is the SAME pair of
-    /// primitives the in-app pin/unpin flow uses (`processPendingPinRequest` →
-    /// `updateAppGroupMountPaths` + `startWarm`), reused here so an external
-    /// `.profile.json` edit and an in-app edit warm identically.
-    ///
-    /// SEPARATE from `ProfileReconcileAction` / `setupService` — this NEVER
-    /// reinstalls the launchd agent or remounts. `startWarm` supersedes any run
-    /// already in flight, so re-running it after an exclude/pin change re-applies
-    /// the new filter to the current download rather than only the next one.
-    func applyWarmReconcile(for profileId: UUID, dirs: [String]? = nil, trigger: String) {
-        updateAppGroupMountPaths()  // re-push pinnedDirectories/vfsCachePath; also wakes the extension
-        startWarm(for: profileId, dirs: dirs, trigger: trigger)
     }
 
     /// Apply an external edit to `settings.json`. Safe keys apply directly;
@@ -860,10 +408,6 @@ final class SyncManager: ObservableObject {
                 switch key {
                 case .debugLoggingEnabled:
                     SyncTraySettings.debugLoggingEnabled = value
-                case .autoFixSyncIssues:
-                    SyncTraySettings.autoFixSyncIssues = value
-                case .telemetryEnabled:
-                    SyncTraySettings.telemetryEnabled = value
                 case .launchAtLogin:
                     break  // handled by the isolated path below
                 }
@@ -881,18 +425,11 @@ final class SyncManager: ObservableObject {
                 self.objectWillChange.send()
             }
         )
-
-        TelemetryService.shared.recordExternalConfigEdit(kind: "settings")
     }
 
     /// Get state for a specific profile
     func state(for profileId: UUID) -> SyncState {
         profileStates[profileId] ?? .idle
-    }
-
-    /// Get active transport for a specific profile
-    func activeTransport(for profileId: UUID) -> ActiveTransport {
-        profileTransports[profileId] ?? .unknown
     }
 
     /// Get last error message for a specific profile
@@ -926,357 +463,6 @@ final class SyncManager: ObservableObject {
         monitoringExternalSyncs.contains(profileId)
     }
 
-    // MARK: - Auto-Fix
-
-    /// Attempt an automatic --resync recovery for the given profile.
-    ///
-    /// Called from `processLogEvent` when the auto-fix setting is enabled and the
-    /// profile enters an out-of-sync error state. Implements a backoff guard:
-    /// if the same profile triggers auto-fix **twice within 5 minutes**, auto-fix
-    /// is suppressed for that profile until a successful sync clears the suppression.
-    /// Note: suppression fires on the 2nd trigger (not the 2nd confirmed failure),
-    /// because confirming failure requires the log-watcher round-trip.
-    ///
-    /// Reuses the same rclone bisync --resync process that `ProfileDetailView.runResync()`
-    /// runs, but without UI state (the progress bar / output panel in the settings
-    /// view is driven by the profile state change visible via `@Published profileStates`).
-    func triggerAutoFix(for profile: SyncProfile) {
-        let profileId = profile.id
-
-        // Respect the global setting
-        guard SyncTraySettings.autoFixSyncIssues else { return }
-
-        // Skip paused profiles — auto-fix should never fire while the user has sync paused
-        guard !isPaused(for: profileId) else {
-            SyncTraySettings.debugLog("Auto-fix skipped: profile '\(profile.name)' is paused")
-            return
-        }
-
-        // Auto-fix only applies to bisync mode — one-way sync and mount profiles do not
-        // produce "out of sync" errors and have no --resync concept.
-        guard profile.syncMode == .bisync else { return }
-
-        // Never auto-resync against an unmounted external drive. The local path is missing
-        // or replaced by an empty mount point, so a --resync would run against an empty/partial
-        // local tree — exactly the case that cannot be safely auto-fixed. Reflect reality in the
-        // UI and return WITHOUT recording an attempt, so the backoff budget is not consumed by a
-        // condition the user can only resolve by reconnecting the drive.
-        if !profile.drivePathToMonitor.isEmpty,
-           !FileManager.default.fileExists(atPath: profile.drivePathToMonitor) {
-            SyncTraySettings.debugLog("Auto-fix skipped: external drive not mounted for '\(profile.name)'")
-            TelemetryService.shared.recordAutoFixTriggered(
-                profileId: profileId,
-                profileName: profile.name,
-                result: "skipped_drive_not_mounted"
-            )
-            profileStates[profileId] = .driveNotMounted
-            updateAggregateState()
-            return
-        }
-
-        // Skip if a resync is already in-flight for this profile
-        guard !autoFixInFlight.contains(profileId) else {
-            SyncTraySettings.debugLog("Auto-fix skipped: resync already in-flight for '\(profile.name)'")
-            return
-        }
-
-        // Respect per-profile suppression (backoff guard) — return silently after the first
-        // transition notification so the user is not spammed on every subsequent syncFailed event.
-        guard !autoFixSuppressed.contains(profileId) else {
-            SyncTraySettings.debugLog("Auto-fix suppressed (backoff) for '\(profile.name)'")
-            return
-        }
-
-        // Record the attempt and check backoff threshold
-        let now = Date()
-        var attempts = autoFixAttempts[profileId] ?? []
-        // Prune attempts outside the backoff window
-        attempts = attempts.filter { now.timeIntervalSince($0) < autoFixBackoffWindow }
-        attempts.append(now)
-        autoFixAttempts[profileId] = attempts
-
-        if attempts.count >= 2 {
-            // Two failures within the window — suppress further auto-fix for this profile.
-            // Only notify once (on the transition into suppressed state).
-            autoFixSuppressed.insert(profileId)
-            TelemetryService.shared.recordAutoFixTriggered(
-                profileId: profileId,
-                profileName: profile.name,
-                result: "gave_up_backoff"
-            )
-            SyncTraySettings.debugLog("Auto-fix giving up (backoff) for '\(profile.name)' after \(attempts.count) attempts")
-            notificationService.notifyAutoFixSuppressed(profileId: profileId, profileName: profile.name)
-            return
-        }
-
-        // Good to go — notify user and start the resync
-        SyncTraySettings.debugLog("Auto-fix triggering resync for '\(profile.name)'")
-        TelemetryService.shared.recordAutoFixTriggered(
-            profileId: profileId,
-            profileName: profile.name,
-            result: "triggered"
-        )
-
-        // Post a macOS notification so the user can see what's happening
-        notificationService.notifyAutoFix(profileId: profileId, profileName: profile.name)
-
-        // Clear current error and mark syncing so the UI updates
-        clearError(for: profileId)
-        setSyncing(for: profileId, isSyncing: true)
-        // Ensure the log-watcher uses its faster polling cadence so it sees the
-        // upcoming "Starting bisync" / "Bisync completed" markers promptly.
-        logWatchers[profileId]?.setActivelySyncing(true)
-
-        // Mark in-flight before dispatching
-        autoFixInFlight.insert(profileId)
-
-        Task {
-            await performResync(for: profile)
-        }
-    }
-
-    /// Resolve the remote reference and env-var overrides a resync should target,
-    /// honouring the currently active transport (primary vs fallback) the same way
-    /// the launchd sync script does. Without this, a resync launched while the
-    /// profile runs on fallback would rebuild the wrong (primary) bisync pair.
-    /// - Returns: the effective "remote:path" plus RCLONE_CONFIG_* env overrides
-    ///   (non-empty only for the same-wire-type fallback that preserves the cache
-    ///   by keeping the primary remote name).
-    func resolveActiveRemote(for profile: SyncProfile) -> (remotePath: String, extraEnv: [String: String]) {
-        let transport = profileTransports[profile.id] ?? .unknown
-        let primaryRemotePath = "\(profile.rcloneRemote):\(profile.remotePath)"
-
-        guard transport.isFallback, !profile.fallbackRemote.isEmpty else {
-            return (primaryRemotePath, [:])
-        }
-
-        // Mount mode always preserves the primary remote name (env-var overrides), so the
-        // VFS cache — keyed by {cache}/vfs/{name}/… — is shared across primary and fallback
-        // rather than duplicated into a second vfs/{fallback} tree. The full-swap branch is
-        // for bisync's listing cache only; a mount has no equivalent to protect. Mirrors the
-        // `SYNC_MODE == "mount"` guard in the sync script.
-        if profile.syncMode != .mount,
-           profile.fallbackRequiresCacheRebuild || !profile.fallbackRemotePath.isEmpty {
-            // Different wire type OR explicit path: swap full remote reference.
-            // bisync uses a separate listing pair — consistent with the script.
-            let effectiveFallbackPath = profile.fallbackRemotePath.isEmpty
-                ? profile.remotePath : profile.fallbackRemotePath
-            return ("\(profile.fallbackRemote):\(effectiveFallbackPath)", [:])
-        }
-
-        // Same remote name preserved: use env-var overrides to preserve the cache.
-        let primaryRemoteName = profile.rcloneRemote.hasSuffix(":")
-            ? String(profile.rcloneRemote.dropLast()) : profile.rcloneRemote
-        let upperName = primaryRemoteName.uppercased().replacingOccurrences(of: "-", with: "_")
-        var extraEnv: [String: String] = [:]
-        if let fallbackConfig = RcloneConfigService.shared.readRemoteConfig(name: profile.fallbackRemote) {
-            for (key, value) in fallbackConfig.values {
-                let envKey = "RCLONE_CONFIG_\(upperName)_\(key.uppercased().replacingOccurrences(of: "-", with: "_"))"
-                extraEnv[envKey] = value
-            }
-        }
-        return (primaryRemotePath, extraEnv)
-    }
-
-    /// Run `rclone bisync --resync` for a profile directly (no UI output panel).
-    /// Called by `triggerAutoFix`. On completion, state is updated via the existing
-    /// log-watcher pipeline (same as scheduled syncs).
-    private func performResync(for profile: SyncProfile) async {
-        let profileId = profile.id
-
-        // Capture all values from the main actor before going to the background
-        let rcloneRemote = profile.rcloneRemote
-        let localSyncPath = profile.localSyncPath
-        let drivePathToMonitor = profile.drivePathToMonitor
-        let filterPath = profile.filterFilePath
-        let lockPath = profile.lockFilePath
-        let logPath = profile.logPath
-        let syncMode = profile.syncMode
-        let syncDirection = profile.syncDirection
-        let additionalFlags = profile.additionalRcloneFlags
-        let fallbackTransport = profileTransports[profileId] ?? .unknown
-        let fallbackRemote = profile.fallbackRemote
-        let (effectiveRemotePath, extraEnv) = resolveActiveRemote(for: profile)
-        let bisyncDir = "\(NSHomeDirectory())/Library/Caches/rclone/bisync"
-
-        // Pre-flight: if a live lock already exists for a running process, skip.
-        if let existingPidStr = try? String(contentsOfFile: lockPath, encoding: .utf8)
-                .trimmingCharacters(in: .whitespacesAndNewlines),
-           let existingPid = Int32(existingPidStr),
-           kill(existingPid, 0) == 0 {
-            SyncTraySettings.debugLog("Resync already in progress for '\(profile.name)', skipping auto-fix")
-            autoFixInFlight.remove(profileId)
-            setSyncing(for: profileId, isSyncing: false)
-            return
-        }
-
-        // Re-check the external drive right before launching — it may have been unplugged in
-        // the window between triggerAutoFix's guard and now (a resync can be queued behind an
-        // in-flight sync, and large repos take ~12s). Running --resync against a vanished mount
-        // point is the unsafe case we must never reach.
-        if !drivePathToMonitor.isEmpty,
-           !FileManager.default.fileExists(atPath: drivePathToMonitor) {
-            SyncTraySettings.debugLog("Auto-fix aborted: external drive unmounted before resync for '\(profile.name)'")
-            autoFixInFlight.remove(profileId)
-            profileStates[profileId] = .driveNotMounted
-            updateAggregateState()
-            return
-        }
-
-        // Write a sentinel lock file NOW — before process.run() — so launchd cannot
-        // spawn a concurrent rclone bisync against the same remote/path in the gap
-        // between process creation and PID availability.
-        let lockURL = URL(fileURLWithPath: lockPath)
-        let sentinelWritten = (try? Data("pending".utf8).write(to: lockURL)) != nil
-        if !sentinelWritten {
-            SyncTraySettings.debugLog("Could not write sentinel lock for '\(profile.name)' — aborting auto-fix")
-            autoFixInFlight.remove(profileId)
-            setSyncing(for: profileId, isSyncing: false)
-            return
-        }
-
-        do {
-            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-                DispatchQueue.global(qos: .userInitiated).async {
-                    let fileManager = FileManager.default
-
-                    // Remove stale bisync .lck files before resync (same as runResync in the view)
-                    if let files = try? fileManager.contentsOfDirectory(atPath: bisyncDir) {
-                        for file in files where file.hasSuffix(".lck") {
-                            try? fileManager.removeItem(atPath: "\(bisyncDir)/\(file)")
-                        }
-                    }
-
-                    // Locate rclone binary
-                    guard let rclonePath = RcloneLocator.resolve() else {
-                        try? fileManager.removeItem(atPath: lockPath)
-                        continuation.resume(throwing: NSError(
-                            domain: "SyncManager",
-                            code: 1,
-                            userInfo: [NSLocalizedDescriptionKey: "rclone not found"]
-                        ))
-                        return
-                    }
-
-                    let isFallbackActive = fallbackTransport.isFallback
-
-                    var arguments: [String]
-
-                    if syncMode == .bisync {
-                        // --resync-mode newer: prefer the newest version per file so a
-                        // stale remote copy never overwrites fresher local edits (the
-                        // bare --resync default is path1 = remote wins).
-                        arguments = ["bisync", effectiveRemotePath, localSyncPath,
-                                     "--resync", "--resync-mode", "newer",
-                                     "--verbose", "--use-json-log", "--stats", "2s"]
-                    } else if syncDirection == .localToRemote {
-                        arguments = ["sync", localSyncPath, effectiveRemotePath,
-                                     "--verbose", "--use-json-log", "--stats", "2s"]
-                    } else {
-                        arguments = ["sync", effectiveRemotePath, localSyncPath,
-                                     "--verbose", "--use-json-log", "--stats", "2s"]
-                    }
-
-                    if fileManager.fileExists(atPath: filterPath) {
-                        arguments.append(contentsOf: ["--filter-from", filterPath])
-                    }
-
-                    // Resolve which remote name to check for no_check_certificate
-                    let certCheckRemote = (isFallbackActive && !fallbackRemote.isEmpty)
-                        ? fallbackRemote : rcloneRemote
-                    if RcloneConfigService.shared.readRemoteConfig(name: certCheckRemote)?.values["no_check_certificate"] == "true" {
-                        arguments.append("--no-check-certificate")
-                    }
-
-                    if !additionalFlags.isEmpty {
-                        let extra = additionalFlags.components(separatedBy: .whitespaces).filter { !$0.isEmpty }
-                        arguments.append(contentsOf: extra)
-                    }
-
-                    let process = Process()
-                    process.executableURL = URL(fileURLWithPath: rclonePath)
-                    process.arguments = arguments
-
-                    // Merge fallback env-var overrides into the process environment
-                    if !extraEnv.isEmpty {
-                        var env = ProcessInfo.processInfo.environment
-                        for (key, value) in extraEnv {
-                            env[key] = value
-                        }
-                        process.environment = env
-                    }
-
-                    // Route rclone output into the profile log file so the LogWatcher
-                    // pipeline fires `.syncStarted` / `.syncCompleted` / `.syncFailed`.
-                    // Without this, the profile would stay in `.syncing` indefinitely —
-                    // the watcher would never see process termination. The bracket
-                    // markers below mirror what `synctray-sync.sh` writes via `tee`.
-                    if !fileManager.fileExists(atPath: logPath) {
-                        fileManager.createFile(atPath: logPath, contents: nil)
-                    }
-                    let timestampFormatter = DateFormatter()
-                    timestampFormatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
-                    timestampFormatter.locale = Locale(identifier: "en_US_POSIX")
-                    let appendLog: (String) -> Void = { message in
-                        let line = "\(timestampFormatter.string(from: Date())) - \(message)\n"
-                        guard let data = line.data(using: .utf8),
-                              let handle = FileHandle(forWritingAtPath: logPath) else { return }
-                        handle.seekToEndOfFile()
-                        handle.write(data)
-                        try? handle.close()
-                    }
-
-                    guard let processLog = FileHandle(forWritingAtPath: logPath) else {
-                        try? fileManager.removeItem(atPath: lockPath)
-                        continuation.resume(throwing: NSError(
-                            domain: "SyncManager",
-                            code: 2,
-                            userInfo: [NSLocalizedDescriptionKey: "could not open log file"]
-                        ))
-                        return
-                    }
-                    processLog.seekToEndOfFile()
-                    process.standardOutput = processLog
-                    process.standardError = processLog
-
-                    appendLog("Starting bisync (auto-fix --resync)")
-
-                    process.terminationHandler = { proc in
-                        try? processLog.close()
-                        let exit = proc.terminationStatus
-                        appendLog(exit == 0
-                            ? "Bisync completed successfully"
-                            : "Bisync failed with exit code \(exit)")
-                        try? fileManager.removeItem(atPath: lockPath)
-                        continuation.resume()
-                    }
-
-                    do {
-                        try process.run()
-                        // Overwrite sentinel with the real PID now that we have it
-                        try? "\(process.processIdentifier)".write(
-                            toFile: lockPath, atomically: true, encoding: .utf8)
-                    } catch {
-                        try? processLog.close()
-                        appendLog("Auto-fix failed to launch rclone: \(error.localizedDescription)")
-                        try? fileManager.removeItem(atPath: lockPath)
-                        continuation.resume(throwing: error)
-                    }
-                }
-            }
-        } catch {
-            SyncTraySettings.debugLog("Auto-fix process error for '\(profile.name)': \(error)")
-            autoFixInFlight.remove(profileId)
-            setSyncing(for: profileId, isSyncing: false)
-            return
-        }
-
-        // Clear in-flight on clean exit. State after completion (idle / error) is set by
-        // the log-watcher pipeline via .syncCompleted / .syncFailed.
-        autoFixInFlight.remove(profileId)
-    }
-
-    // MARK: - Notification Muting
 
     /// Mute file change notifications for a profile (persisted)
     func muteNotifications(for profileId: UUID) {
@@ -1331,13 +517,6 @@ final class SyncManager: ObservableObject {
         // hung/slow sync can't keep holding the lock and block a later resume.
         terminateRunningSync(for: profile)
 
-        // Close any open telemetry span so it isn't later reported as abandoned.
-        TelemetryService.shared.recordSyncSkipped(
-            profileId: profileId,
-            profileName: profile.name,
-            reason: "paused"
-        )
-
         // Update profile state to paused
         profileStates[profileId] = .paused
         profileProgress[profileId] = nil
@@ -1346,11 +525,6 @@ final class SyncManager: ObservableObject {
         updateAggregateState()
 
         SyncTraySettings.debugLog("Paused profile: \(profile.name)")
-        TelemetryService.shared.recordProfileStateChange(
-            profileId: profileId,
-            profileName: profile.name,
-            action: "paused"
-        )
     }
 
     /// Terminate any running sync process for `profile` (identified via its lock
@@ -1399,11 +573,6 @@ final class SyncManager: ObservableObject {
         updateAggregateState()
 
         SyncTraySettings.debugLog("Resumed profile: \(profile.name)")
-        TelemetryService.shared.recordProfileStateChange(
-            profileId: profileId,
-            profileName: profile.name,
-            action: "resumed"
-        )
     }
 
     /// Pause all enabled profiles
@@ -1480,11 +649,6 @@ final class SyncManager: ObservableObject {
             // Clean up ANSI codes
             var msg = SyncLogPatterns.stripANSICodes(rawMsg)
 
-            // Skip generic abort messages - they don't provide useful info
-            if SyncLogPatterns.isGenericAbortMessage(msg) {
-                continue
-            }
-
             // Transient "all files were changed" error should not be shown
             if SyncLogPatterns.isTransientAllFilesChangedError(msg) {
                 continue
@@ -1540,26 +704,12 @@ final class SyncManager: ObservableObject {
 
     /// Detect running syncs at startup and start monitoring them
     private func detectAndResumeRunningSyncs() {
-        var resumedCount = 0
-        // Mount profiles hold the lock file for the entire lifetime of their
-        // rclone daemon, so lock-based detection would mark them `.syncing`
-        // forever — which disables the Pause/Uninstall controls and makes the
-        // mount impossible to stop from the UI. Mount state is tracked
-        // separately by updateMountStates(); exclude mount mode here.
-        for profile in profileStore.enabledProfiles where !profile.isMountMode {
+        for profile in profileStore.enabledProfiles {
             if let pid = detectRunningSyncPID(for: profile) {
                 profileStates[profile.id] = .syncing
                 monitoringExternalSyncs.insert(profile.id)
                 startPollingForSyncCompletion(profile: profile, pid: pid)
-                resumedCount += 1
             }
-        }
-        if resumedCount > 0 {
-            TelemetryService.shared.recordResumedExternalSync(
-                profileId: UUID(), // aggregate event
-                profileName: "all",
-                count: resumedCount
-            )
         }
         updateAggregateState()
     }
@@ -1607,10 +757,8 @@ final class SyncManager: ObservableObject {
 
     /// Clean up stale lock files on app startup
     /// Removes /tmp lock files where the PID is no longer running
-    /// Also removes rclone bisync .lck files if no rclone process is running
     private func cleanupStaleLockFiles() {
         let fm = FileManager.default
-        var staleLockCount = 0
 
         // Clean up SyncTray's /tmp lock files
         for profile in profileStore.profiles {
@@ -1625,70 +773,13 @@ final class SyncManager: ObservableObject {
                 if kill(pid, 0) != 0 {
                     // Process not running - remove stale lock
                     try? fm.removeItem(atPath: lockPath)
-                    staleLockCount += 1
                 }
             } else {
                 // Could not read/parse PID - remove the lock file
                 try? fm.removeItem(atPath: lockPath)
-                staleLockCount += 1
             }
         }
 
-        if staleLockCount > 0 {
-            TelemetryService.shared.recordStaleLockCleanup(count: staleLockCount, lockType: "synctray")
-        }
-
-        // Clean up rclone bisync lock files if no rclone process is running
-        cleanupRcloneBisyncLocks()
-    }
-
-    /// Remove stale rclone bisync .lck files when no rclone process is running
-    /// This allows sync to continue from where it left off after an interrupted sync
-    private func cleanupRcloneBisyncLocks() {
-        let fm = FileManager.default
-        let bisyncDir = "\(NSHomeDirectory())/Library/Caches/rclone/bisync"
-
-        // Check if any rclone process is running
-        let rcloneRunning = isRcloneProcessRunning()
-
-        if rcloneRunning {
-            // rclone is running, don't remove lock files
-            return
-        }
-
-        // No rclone running - remove all stale .lck files
-        guard let files = try? fm.contentsOfDirectory(atPath: bisyncDir) else { return }
-
-        var bisyncLockCount = 0
-        for file in files where file.hasSuffix(".lck") {
-            let fullPath = "\(bisyncDir)/\(file)"
-            try? fm.removeItem(atPath: fullPath)
-            bisyncLockCount += 1
-            SyncTraySettings.debugLog("Removed stale rclone bisync lock: \(file)")
-        }
-
-        if bisyncLockCount > 0 {
-            TelemetryService.shared.recordStaleLockCleanup(count: bisyncLockCount, lockType: "rclone_bisync")
-        }
-    }
-
-    /// Check if any rclone process is currently running
-    private func isRcloneProcessRunning() -> Bool {
-        let process = Process()
-        let pipe = Pipe()
-
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
-        process.arguments = ["-x", "rclone"]
-        process.standardOutput = pipe
-        process.standardError = pipe
-
-        do {
-            try process.run()
-            process.waitUntilExit()
-            return process.terminationStatus == 0
-        } catch {
-            return false
-        }
     }
 
     private func setupProfileObserver() {
@@ -1696,7 +787,6 @@ final class SyncManager: ObservableObject {
             .sink { [weak self] _ in
                 self?.startWatchingAllProfiles()
                 self?.updateAggregateState()
-                self?.updateAppGroupMountPaths()
             }
             .store(in: &cancellables)
     }
@@ -1720,8 +810,7 @@ final class SyncManager: ObservableObject {
             if logWatchers[profile.id] == nil {
                 startWatching(profile: profile)
             }
-            // Skip directory watching for mount mode profiles (no need to watch - files stream on-demand)
-            if directoryWatchers[profile.id] == nil && !profile.isMountMode {
+            if directoryWatchers[profile.id] == nil {
                 startWatchingDirectory(for: profile)
             }
         }
@@ -1729,7 +818,6 @@ final class SyncManager: ObservableObject {
 
     private func startWatching(profile: SyncProfile) {
         let watcher = LogWatcher(logPath: profile.logPath)
-        watcher.profileName = profile.name
         watcher.delegate = self
         watcher.startWatching()
         logWatchers[profile.id] = watcher
@@ -1746,8 +834,6 @@ final class SyncManager: ObservableObject {
     private func startWatchingDirectory(for profile: SyncProfile) {
         guard !profile.localSyncPath.isEmpty else { return }
         guard FileManager.default.fileExists(atPath: profile.localSyncPath) else { return }
-        // Skip directory watching for mount mode (files stream on-demand, no sync needed)
-        guard !profile.isMountMode else { return }
 
         let profileId = profile.id
         let profileName = profile.name
@@ -1765,7 +851,6 @@ final class SyncManager: ObservableObject {
                 self?.handleDirectoryChange(for: profileId)
             }
         }
-        watcher.profileName = profileName
         watcher.start()
         directoryWatchers[profile.id] = watcher
     }
@@ -1799,15 +884,10 @@ final class SyncManager: ObservableObject {
 
         SyncTraySettings.debugLog("DirectoryWatcher: Triggering sync for '\(profile.name)' (path: \(profile.localSyncPath))")
 
-        TelemetryService.shared.recordDirectoryWatchTrigger(
-            profileId: profileId,
-            profileName: profile.name
-        )
-
         // Trigger sync for this specific profile
         // Note: Lock file in sync script handles concurrent sync prevention
         Task {
-            await runSyncScript(for: profile, trigger: "directory_watch")
+            await runSyncScript(for: profile)
         }
     }
 
@@ -1921,13 +1001,11 @@ final class SyncManager: ObservableObject {
             return
         }
 
-        var affectedCount = 0
         for profile in profileStore.enabledProfiles {
             let drivePath = profile.drivePathToMonitor
             guard !drivePath.isEmpty else { continue }
 
             if drivePath.hasPrefix(volumePath) || volumePath == drivePath {
-                affectedCount += 1
                 notificationService.resetDriveNotMountedState(for: profile.id)
                 if profileStates[profile.id] == .driveNotMounted {
                     profileStates[profile.id] = .idle
@@ -1940,10 +1018,6 @@ final class SyncManager: ObservableObject {
             }
         }
 
-        if affectedCount > 0 {
-            TelemetryService.shared.recordVolumeEvent(event: "mounted", affectedProfiles: affectedCount)
-        }
-
         updateAggregateState()
     }
 
@@ -1952,13 +1026,11 @@ final class SyncManager: ObservableObject {
             return
         }
 
-        var affectedCount = 0
         for profile in profileStore.enabledProfiles {
             let drivePath = profile.drivePathToMonitor
             guard !drivePath.isEmpty else { continue }
 
             if drivePath.hasPrefix(volumePath) || volumePath == drivePath {
-                affectedCount += 1
                 profileStates[profile.id] = .driveNotMounted
                 if !isNotificationsMuted(for: profile.id) {
                     notificationService.notifyDriveNotMounted(profileId: profile.id, profileName: profile.name)
@@ -1966,19 +1038,10 @@ final class SyncManager: ObservableObject {
             }
         }
 
-        if affectedCount > 0 {
-            TelemetryService.shared.recordVolumeEvent(event: "unmounted", affectedProfiles: affectedCount)
-        }
-
         updateAggregateState()
     }
 
-    private func runSyncScript(for profile: SyncProfile, trigger: String = "manual") async {
-        // Remember what kicked this off so the `.syncStarted` log event (parsed from the
-        // sync log, decoupled from here) can attribute `sync.trigger`. A launchd/scheduled
-        // run never calls this method, so an absent entry means "scheduled".
-        pendingSyncTrigger[profile.id] = trigger
-
+    private func runSyncScript(for profile: SyncProfile) async {
         // Check if profile is paused
         if isPaused(for: profile.id) {
             SyncTraySettings.debugLog("Skipping sync script for paused profile: \(profile.name)")
@@ -2001,11 +1064,6 @@ final class SyncManager: ObservableObject {
         guard FileManager.default.fileExists(atPath: SyncProfile.sharedScriptPath) else {
             await MainActor.run {
                 profileStates[profile.id] = .error("Script not found")
-                TelemetryService.shared.recordSyncPreconditionFailure(
-                    profileId: profile.id,
-                    profileName: profile.name,
-                    reason: "script_not_found"
-                )
                 updateAggregateState()
             }
             return
@@ -2014,11 +1072,6 @@ final class SyncManager: ObservableObject {
         guard FileManager.default.fileExists(atPath: profile.configPath) else {
             await MainActor.run {
                 profileStates[profile.id] = .error("Config not found")
-                TelemetryService.shared.recordSyncPreconditionFailure(
-                    profileId: profile.id,
-                    profileName: profile.name,
-                    reason: "config_not_found"
-                )
                 updateAggregateState()
             }
             return
@@ -2056,22 +1109,9 @@ final class SyncManager: ObservableObject {
             lastSeenErrorMessage[profileId] = nil  // Clear last seen error
             profileProgress[profileId] = nil  // Reset progress for new sync
             currentSyncChanges[profileId] = []
-            syncStartTimes[profileId] = Date()  // Record start time for duration tracking
-            checkPhaseStartTimes.removeValue(forKey: profileId)  // Reset check phase tracking
-            checkPhaseReported.remove(profileId)
             logWatchers[profileId]?.setActivelySyncing(true)  // Increase polling frequency
             // Don't send notification - the menu bar icon updates to show syncing state
             notificationService.clearPendingChanges(for: profileId)
-            TelemetryService.shared.recordSyncStarted(
-                profileId: profileId,
-                profileName: profileName,
-                syncMode: profile?.syncMode ?? .bisync,
-                syncDirection: profile?.syncDirection,
-                hasFallback: profile?.hasFallback ?? false,
-                // An app-initiated run recorded its cause in runSyncScript; a bare
-                // launchd/scheduled run left none, so default to "scheduled".
-                trigger: pendingSyncTrigger.removeValue(forKey: profileId) ?? "scheduled"
-            )
 
         case .syncCompleted:
             profileStates[profileId] = .idle
@@ -2080,21 +1120,7 @@ final class SyncManager: ObservableObject {
             profileProgress[profileId] = nil  // Clear progress when sync completes
             logWatchers[profileId]?.setActivelySyncing(false)  // Reduce polling frequency
             lastSyncTime = event.timestamp
-            // Successful sync clears backoff suppression and in-flight state for this profile
-            autoFixSuppressed.remove(profileId)
-            autoFixAttempts[profileId] = nil
-            autoFixInFlight.remove(profileId)
             let changesCount = currentSyncChanges[profileId]?.count ?? 0
-            // Report telemetry for successful sync
-            let completedDuration = syncStartTimes[profileId].map { Date().timeIntervalSince($0) } ?? 0
-            syncStartTimes[profileId] = nil
-            TelemetryService.shared.recordSyncCompleted(
-                profileId: profileId,
-                profileName: profileName,
-                mode: profile?.syncMode ?? .bisync,
-                duration: completedDuration,
-                filesChanged: changesCount
-            )
             if !isNotificationsMuted(for: profileId) {
                 notificationService.notifySyncCompleted(
                     changesCount: changesCount,
@@ -2115,7 +1141,6 @@ final class SyncManager: ObservableObject {
                 // Transient "all files were changed" - just clear state, don't show error
                 profileProgress[profileId] = nil
                 lastSeenErrorMessage[profileId] = nil
-                syncStartTimes[profileId] = nil
                 logWatchers[profileId]?.setActivelySyncing(false)  // Reduce polling frequency
                 currentSyncChanges[profileId] = nil  // Only clear this profile's changes
                 // Reset to idle since this isn't a real error
@@ -2127,18 +1152,6 @@ final class SyncManager: ObservableObject {
             profileProgress[profileId] = nil  // Clear progress on failure
             lastSeenErrorMessage[profileId] = nil
             logWatchers[profileId]?.setActivelySyncing(false)  // Reduce polling frequency
-            // Report telemetry for failed sync
-            let failedDuration = syncStartTimes[profileId].map { Date().timeIntervalSince($0) } ?? 0
-            syncStartTimes[profileId] = nil
-            TelemetryService.shared.recordSyncFailed(
-                profileId: profileId,
-                profileName: profileName,
-                mode: profile?.syncMode ?? .bisync,
-                duration: failedDuration,
-                filesChanged: currentSyncChanges[profileId]?.count ?? 0,
-                exitCode: exitCode,
-                errorMessage: message ?? profileErrors[profileId]
-            )
             // Only use the syncFailed message if we don't already have a more specific error
             if profileErrors[profileId] == nil, let msg = message {
                 profileErrors[profileId] = msg
@@ -2153,27 +1166,6 @@ final class SyncManager: ObservableObject {
             }
             currentSyncChanges[profileId] = nil
 
-            // Clear in-flight sentinel so the backoff state can accept the next attempt.
-            // The backoff counter (autoFixAttempts) and suppression (autoFixSuppressed) still
-            // apply — this only unblocks the in-flight guard.
-            autoFixInFlight.remove(profileId)
-
-            // Auto-fix: if the stored error is an out-of-sync error and the setting is on,
-            // trigger an automatic --resync recovery.
-            if let storedError = profileErrors[profileId],
-               SyncLogPatterns.isOutOfSyncError(storedError),
-               let currentProfile = profile {
-                triggerAutoFix(for: currentProfile)
-            }
-
-        case .transportChanged(let transport):
-            profileTransports[profileId] = transport
-            TelemetryService.shared.recordTransportChange(
-                profileId: profileId,
-                profileName: profileName,
-                transport: transport.isPrimary ? "primary" : "fallback"
-            )
-
         case .errorMessage(let message):
             // Track all error messages so we can correlate with syncFailed events
             lastSeenErrorMessage[profileId] = message
@@ -2182,12 +1174,6 @@ final class SyncManager: ObservableObject {
             if SyncLogPatterns.isTransientAllFilesChangedError(message) {
                 break
             }
-
-            TelemetryService.shared.recordSyncError(
-                profileId: profileId,
-                profileName: profileName,
-                errorMessage: message
-            )
 
             // Prefer critical/actionable errors over file-level errors
             // Critical errors tell us what to do (e.g., "out of sync", "resync")
@@ -2205,44 +1191,28 @@ final class SyncManager: ObservableObject {
         case .driveNotMounted:
             let previousState = profileStates[profileId]
             profileStates[profileId] = .driveNotMounted
-            // Only emit telemetry/notification on state transition, not every poll
+            // Only notify on state transition, not every poll
             if previousState != .driveNotMounted {
-                TelemetryService.shared.recordDriveNotMounted(
-                    profileId: profileId,
-                    profileName: profileName
-                )
                 if !isNotificationsMuted(for: profileId) {
                     notificationService.notifyDriveNotMounted(profileId: profileId, profileName: profileName)
                 }
             }
 
-        case .syncSkipped(let reason):
+        case .syncSkipped:
             // A scheduled run exited early without syncing (remote failed the
-            // pre-flight reachability check). "Starting bisync" already set the
-            // profile to `.syncing` and opened a telemetry span; close both here
-            // so the profile returns to rest instead of appearing to sync for
-            // 11–37 min until the next run abandons the stale span.
+            // pre-flight reachability check). "Starting sync" already set the
+            // profile to `.syncing`; reset it here so the profile returns to
+            // rest instead of appearing to sync until the next run.
             logWatchers[profileId]?.setActivelySyncing(false)
             profileProgress[profileId] = nil
-            syncStartTimes[profileId] = nil
-            checkPhaseStartTimes.removeValue(forKey: profileId)
-            checkPhaseReported.remove(profileId)
             // Only downgrade from `.syncing`; never clobber a real error,
             // paused, or driveNotMounted state.
             if profileStates[profileId] == .syncing {
                 profileStates[profileId] = .idle
             }
-            TelemetryService.shared.recordSyncSkipped(
-                profileId: profileId,
-                profileName: profileName,
-                reason: reason
-            )
 
         case .syncAlreadyRunning:
-            TelemetryService.shared.recordSyncContention(
-                profileId: profileId,
-                profileName: profileName
-            )
+            break
 
         case .fileChange(var change):
             change.profileName = profileName
@@ -2251,11 +1221,6 @@ final class SyncManager: ObservableObject {
             }
             currentSyncChanges[profileId]?.append(change)
             addRecentChange(change)
-            TelemetryService.shared.recordFileOperation(
-                profileName: profileName,
-                operation: change.operation.rawValue,
-                filePath: change.path
-            )
             // Only send notification if not muted
             if !isNotificationsMuted(for: profileId) {
                 notificationService.notifyFileChange(change, profileId: profileId, syncDirectoryPath: syncDirectoryPath)
@@ -2265,25 +1230,6 @@ final class SyncManager: ObservableObject {
             if let bytes = stats.bytes, let totalBytes = stats.totalBytes, totalBytes > 0 {
                 let checksDone = stats.checks ?? 0
                 let totalChecks = stats.totalChecks ?? 0
-
-                // Track check phase duration (listing/comparison phase in bisync)
-                if totalChecks > 0 && checksDone < totalChecks && checkPhaseStartTimes[profileId] == nil {
-                    checkPhaseStartTimes[profileId] = Date()
-                    checkPhaseReported.remove(profileId)
-                }
-                if totalChecks > 0 && checksDone >= totalChecks && !checkPhaseReported.contains(profileId),
-                   let checkStart = checkPhaseStartTimes[profileId] {
-                    let checkDuration = Date().timeIntervalSince(checkStart)
-                    TelemetryService.shared.recordCheckPhaseDuration(
-                        profileName: profileName,
-                        syncMode: profile?.syncMode.rawValue ?? "unknown",
-                        durationSeconds: checkDuration,
-                        checksCompleted: checksDone,
-                        totalChecks: totalChecks
-                    )
-                    checkPhaseReported.insert(profileId)
-                    checkPhaseStartTimes.removeValue(forKey: profileId)
-                }
 
                 profileProgress[profileId] = SyncProgress(
                     bytesTransferred: Int64(bytes),
@@ -2315,1070 +1261,6 @@ final class SyncManager: ObservableObject {
         }
     }
 
-    // MARK: - FinderSync IPC
-
-    /// Set up the Darwin notification observer and fallback poll timer for
-    /// receiving pin/unpin requests from the FinderSync extension.
-    private func setupFinderSyncIPC() {
-        // Register Darwin notification observer.
-        // CFNotificationCenterAddObserver requires a C-callable callback with no captures.
-        // Pass `self` via the `observer` UnsafeRawPointer and cast it back inside the callback.
-        let observer = Unmanaged.passUnretained(self).toOpaque()
-        CFNotificationCenterAddObserver(
-            CFNotificationCenterGetDistributedCenter(),
-            observer,
-            { _, observer, _, _, _ in
-                // The C callback is on an arbitrary thread — bridge to @MainActor.
-                guard let observer = observer else { return }
-                let manager = Unmanaged<SyncManager>.fromOpaque(observer).takeUnretainedValue()
-                Task { @MainActor in
-                    await manager.processPendingPinRequest()
-                }
-            },
-            kPinRequestNotificationName as CFString,
-            nil,
-            .deliverImmediately
-        )
-
-        // 1-second fallback poll timer in case a Darwin notification is missed.
-        // Only polls when there are mounted profiles (avoids CPU waste).
-        let timer = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
-        timer.schedule(deadline: .now() + 1, repeating: 1.0)
-        timer.setEventHandler { [weak self] in
-            guard let self else { return }
-            // profileStore is @MainActor-isolated, but this handler runs on a global
-            // utility queue — read it (and process) on the main actor to avoid a data race.
-            Task { @MainActor in
-                let hasMountedProfiles = self.profileStore.enabledProfiles.contains { $0.isMountMode }
-                guard hasMountedProfiles else { return }
-                // Check for a pending request without a wake notification.
-                await self.processPendingPinRequest()
-            }
-        }
-        pinRequestPollTimer = timer
-        timer.resume()
-    }
-
-    /// Read and process a pending pin/unpin request written by the FinderSync extension.
-    ///
-    /// Reads `<AppGroupContainer>/pending-pin-request.json`, parses the action and paths,
-    /// updates the profile's `pinnedDirectories`, deletes the file, and initiates
-    /// VFS content warming for pin operations.
-    func processPendingPinRequest() async {
-        guard let containerURL = FileManager.default.containerURL(
-            forSecurityApplicationGroupIdentifier: kAppGroupID
-        ) else {
-            SyncTraySettings.debugLog("processPendingPinRequest: App Group container not accessible")
-            return
-        }
-
-        let requestURL = containerURL.appendingPathComponent(kPendingPinRequestFile)
-        guard FileManager.default.fileExists(atPath: requestURL.path) else { return }
-
-        do {
-            let data = try Data(contentsOf: requestURL)
-            // Delete the file immediately so we don't process it again.
-            try? FileManager.default.removeItem(at: requestURL)
-
-            guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let action = json["action"] as? String,
-                  let profileIdStr = json["profileId"] as? String,
-                  let profileId = UUID(uuidString: profileIdStr),
-                  let paths = json["paths"] as? [String] else {
-                SyncTraySettings.debugLog("processPendingPinRequest: malformed JSON in pending request")
-                return
-            }
-
-            guard var profile = profileStore.profile(for: profileId) else {
-                SyncTraySettings.debugLog("processPendingPinRequest: profile \(profileIdStr) not found")
-                return
-            }
-
-            let isMountMode = profile.isMountMode
-            guard isMountMode else {
-                SyncTraySettings.debugLog("processPendingPinRequest: profile '\(profile.name)' is not in mount mode")
-                return
-            }
-
-            if action == "pin" {
-                for path in paths where !profile.pinnedDirectories.contains(path) {
-                    profile.pinnedDirectories.append(path)
-                }
-            } else if action == "unpin" {
-                profile.pinnedDirectories.removeAll { paths.contains($0) }
-            }
-
-            profileStore.update(profile)
-
-            // Push the new pin state to the extension's App Group copy and wake it so it
-            // reloads + repaints the folder badge right away — otherwise the extension
-            // keeps showing the stale badge and the user gets no Finder feedback.
-            updateAppGroupMountPaths()
-            notifyFinderSyncReload()
-
-            TelemetryService.shared.recordOfflinePinOperation(
-                profileId: profileId,
-                profileName: profile.name,
-                action: action,
-                pathCount: paths.count
-            )
-
-            SyncTraySettings.debugLog("processPendingPinRequest: \(action) \(paths.count) path(s) for '\(profile.name)'")
-
-            // For pin operations, start warming the newly pinned directories. Routed through
-            // warmPinnedDirectories so the offline-files UI shows progress, and so the warmer
-            // re-checks live pin state between files (an unpin mid-warm stops the read loop).
-            if action == "pin" {
-                startWarm(for: profileId, dirs: paths, trigger: "finder_pin")
-            }
-
-        } catch {
-            SyncTraySettings.debugLog("processPendingPinRequest: error reading/parsing request: \(error)")
-        }
-    }
-
-    /// Start a warming run for a profile as a cancellable, tracked task, superseding any run
-    /// already in flight. This is the entry point every trigger uses so the run can later be
-    /// stopped (`cancelWarm`) when the cache is cleared or the profile is unmounted.
-    func startWarm(for profileId: UUID, dirs: [String]? = nil, trigger: String = "manual") {
-        let previous = warmTasks[profileId]
-        previous?.cancel()  // supersede any run in flight
-        warmTasks[profileId] = Task { [weak self] in
-            // Wait for the superseded run to fully wind down before starting. Its cleanup
-            // clears `warmProgress[profileId]`, so without this await the new run would hit
-            // `warmPinnedDirectories`' still-active coalesce guard and bail — cancelling the
-            // old warm without starting the new one (the exclude/pin "apply right away" path).
-            await previous?.value
-            await self?.warmPinnedDirectories(for: profileId, dirs: dirs, trigger: trigger)
-        }
-    }
-
-    /// Cancel an in-flight warming run for a profile. The run stops within one file chunk and
-    /// its completion block drops the progress row and records a `cancelled` outcome. Call
-    /// before clearing the cache or unmounting so the warmer doesn't re-download files that
-    /// are about to be evicted (or read through a mount that's going away).
-    func cancelWarm(for profileId: UUID) {
-        warmTasks[profileId]?.cancel()
-    }
-
-    // MARK: - Cache Directory Migration
-
-    /// Cancel an in-flight cache-directory migration for a profile. The
-    /// engine stops at the next file boundary; its own cleanup removes any
-    /// in-flight destination partial and returns `.cancelled` — nothing here
-    /// needs to clean up files.
-    func cancelCacheMigration(for profileId: UUID) {
-        cacheMigrationTasks[profileId]?.cancel()
-    }
-
-    /// Move a Stream profile's rclone VFS cache (content + metadata) from its
-    /// current `vfsCachePath` to `destination` as a tracked, cancellable
-    /// task, superseding any run already in flight for this profile. Every
-    /// entry point (the Save-time prompt, the Offline Files "Move Cache…"
-    /// action) routes through this so cancel/progress work identically.
-    @discardableResult
-    func startCacheMigration(
-        for profileId: UUID,
-        destination: String,
-        coMigrate: Set<UUID> = []
-    ) -> Task<CacheMigrationOutcome, Never> {
-        cacheMigrationTasks[profileId]?.cancel()
-        let task = Task { [weak self] () -> CacheMigrationOutcome in
-            guard let self else {
-                return CacheMigrationOutcome(result: .cancelled, filesMoved: 0, bytesMoved: 0, sameVolume: false)
-            }
-            return await self.migrateCacheDirectory(for: profileId, destination: destination, coMigrate: coMigrate)
-        }
-        cacheMigrationTasks[profileId] = task
-        return task
-    }
-
-    /// After a user-cancelled migration, move whatever already landed at
-    /// `destinationRoot` back to `sourceRoot` — the "Roll Back" option in
-    /// `CacheMoveSheet` (paired with "Resume", which is just calling
-    /// `startCacheMigration` again; the engine's resume-skip makes that
-    /// idempotent). Operates on a LOCAL, never-persisted copy of the profile
-    /// carrying `destinationRoot` as its `vfsCachePath` so the SAME
-    /// planner/engine path applies in reverse — `profileStore` is never
-    /// touched, since the original profile's `vfsCachePath` is still correct
-    /// (a cancelled run is never persisted).
-    @discardableResult
-    func rollbackCacheMigration(
-        for profileId: UUID,
-        sourceRoot: String,
-        destinationRoot: String,
-        coMigrate: Set<UUID> = []
-    ) -> Task<CacheMigrationOutcome, Never> {
-        cacheMigrationTasks[profileId]?.cancel()
-        guard let original = profileStore.profile(for: profileId) else {
-            return Task { CacheMigrationOutcome(result: .cancelled, filesMoved: 0, bytesMoved: 0, sameVolume: false) }
-        }
-        let allProfiles = profileStore.profiles
-        // A copy pinned to `sourceRoot` (NOT `original.vfsCachePath` directly —
-        // a cancelled run never persists, so it should already equal
-        // `sourceRoot`, but this stays correct even if a caller passes a
-        // slightly different root than what's currently on disk).
-        var asSource = original
-        asSource.vfsCachePath = sourceRoot
-        let cancellationFlag = CacheMigrationCancellationFlag()
-
-        let affectedIds = [profileId] + coMigrate
-        let rollbackProfiles = [asSource] + coMigrate.compactMap { profileStore.profile(for: $0) }
-
-        let task = Task { [weak self] () -> CacheMigrationOutcome in
-            // R4/R5 for the REVERSE move, which the forward bracket does not
-            // cover: `migrateCacheDirectory`'s `defer` has already re-installed
-            // the agent by the time the user is offered "Resume or roll back?",
-            // so the mount is live again on `sourceRoot` — precisely the tree a
-            // rollback writes into. Cancel any warm and re-detach first, exactly
-            // as the forward move does.
-            //
-            // This runs on the main actor (it touches `setupService` and the
-            // profile store) but from INSIDE the Task, not before it. Doing it
-            // synchronously in `rollbackCacheMigration`'s own body blocked the
-            // Roll Back button handler through a `diskutil unmount` plus a
-            // bounded remount recheck — so the sheet could not even paint its
-            // progress step until the detach finished. The forward path never
-            // had that problem because its detach already sits inside an async
-            // `migrateCacheDirectory`.
-            let startedAt = Date()
-            let telemetry = TelemetryService.shared.beginCacheMigration(
-                profileId: profileId, profileName: asSource.name
-            )
-            let detach: (toReinstall: [SyncProfile], failed: Bool) = await MainActor.run {
-                guard let self else { return (toReinstall: [], failed: true) }
-                for id in affectedIds { self.cancelWarm(for: id) }
-                return self.detachForCacheMigration(rollbackProfiles)
-            }
-            guard !detach.failed else {
-                // Still mounted after a graceful and a forced unmount — moving
-                // files back under a live mount is worse than leaving them at
-                // the destination, where the (unpersisted) profile simply does
-                // not point yet. Re-install and report, changing nothing.
-                await MainActor.run {
-                    self?.reinstallAfterCacheMigration(detach.toReinstall)
-                    self?.cacheMigrationProgress[profileId] = nil
-                }
-                let aborted = CacheMigrationOutcome(result: .failed(.mountDetachFailed, rolledBack: false), filesMoved: 0, bytesMoved: 0, sameVolume: false)
-                // Emitted for the same reason the forward path opens its span
-                // before the detach loop: an abort that produces no telemetry
-                // at all is indistinguishable from a rollback that never ran.
-                TelemetryService.shared.endCacheMigration(
-                    telemetry,
-                    filesMoved: 0,
-                    bytesMoved: 0,
-                    durationSeconds: Date().timeIntervalSince(startedAt),
-                    sameVolume: false,
-                    // Derived, not hand-copied: a literal here would agree
-                    // today only because `CacheMigrationFailure` takes its
-                    // default rawValue, and hand-copying a shared decision
-                    // is exactly what let the persist gate drift from its
-                    // own call sites earlier in this branch.
-                    outcome: SyncManager.cacheMigrationOutcomeLabel(aborted.result)
-                )
-                return aborted
-            }
-            let profilesToReinstall = detach.toReinstall
-
-            let fs = CacheMigrationFileSystem.production()
-            let outcome = await withTaskCancellationHandler {
-                await withCheckedContinuation { continuation in
-                    DispatchQueue.global(qos: .utility).async {
-                        // Re-derive the ORIGINAL forward plan (source → destination)
-                        // and reverse it, rather than re-planning FROM
-                        // `destinationRoot`: a cancelled run never persists, so
-                        // every co-migrated sibling's `vfsCachePath` is STILL
-                        // `sourceRoot` — classifying overlap against
-                        // `destinationRoot` would match none of them, stranding
-                        // their relocated bytes at the destination with no
-                        // rollback (finding 6). `.reversed()` keeps the EXACT
-                        // same subtree set the forward run used, just swapped.
-                        switch CacheMigrationPlanner.plan(moving: asSource, allProfiles: allProfiles, to: destinationRoot, coMigrate: coMigrate) {
-                        case .failure(let rejection):
-                            continuation.resume(returning: CacheMigrationOutcome(
-                                result: .preflightRejected(.plan(rejection)), filesMoved: 0, bytesMoved: 0, sameVolume: false
-                            ))
-                        case .success(let forwardPlan):
-                            let reversePlan = forwardPlan.reversed()
-                            let engine = CacheMigrationEngine(fs: fs, isCancelled: { cancellationFlag.isCancelled })
-                            switch engine.preflight(reversePlan) {
-                            case .failure(let rejection):
-                                continuation.resume(returning: CacheMigrationOutcome(
-                                    result: .preflightRejected(rejection), filesMoved: 0, bytesMoved: 0, sameVolume: false
-                                ))
-                            case .success(let preflight):
-                                continuation.resume(returning: engine.run(reversePlan, preflight))
-                            }
-                        }
-                    }
-                }
-            } onCancel: {
-                cancellationFlag.markCancelled()
-            }
-            // Re-install on EVERY exit path, mirroring the forward move's
-            // `defer` — a rollback that completed, failed, or was cancelled
-            // must never leave the profile with no launchd agent. `defer`
-            // can't be used here because the re-install has to hop back to
-            // the main actor, so it sits on the single path out of the
-            // `await` above.
-            await MainActor.run {
-                self?.reinstallAfterCacheMigration(profilesToReinstall)
-                self?.cacheMigrationProgress[profileId] = nil
-            }
-            TelemetryService.shared.endCacheMigration(
-                telemetry,
-                filesMoved: outcome.filesMoved,
-                bytesMoved: outcome.bytesMoved,
-                durationSeconds: Date().timeIntervalSince(startedAt),
-                sameVolume: outcome.sameVolume,
-                outcome: SyncManager.cacheMigrationOutcomeLabel(outcome.result)
-            )
-            return outcome
-        }
-        cacheMigrationTasks[profileId] = task
-        return task
-    }
-
-    /// Pure: did a single profile's pre-move detach succeed? Extracted out
-    /// of `migrateCacheDirectory`'s control flow so this exact decision is
-    /// behaviorally testable without a real `SyncManager`/`SyncSetupService`
-    /// (finding 9 — the prior self-test coverage only checked that certain
-    /// substrings were PRESENT somewhere in the function body, which cannot
-    /// detect an inverted or unreachable guard around this decision).
-    nonisolated static func cacheMigrationDetachSucceeded(threw: Bool, stillMountedAfterRecheck: Bool) -> Bool {
-        !threw && !stillMountedAfterRecheck
-    }
-
-    /// R4 — detach and unload every currently-installed profile among
-    /// `profiles`, so nothing writes into either cache tree while files are
-    /// being relocated.
-    ///
-    /// Shared by the forward move AND the rollback. The rollback needs it
-    /// just as badly: by the time the user sees the "Resume or roll back?"
-    /// choice, `migrateCacheDirectory`'s `defer` has already re-installed
-    /// the agent, and the mount is back up using `sourceRoot` as its
-    /// `--cache-dir` — which is exactly where a rollback writes. Relocating
-    /// files into a live `rclone nfsmount`'s cache directory is the same
-    /// corruption path the pre-move warm cancellation exists to avoid, so
-    /// Roll Back must re-detach rather than assume the forward bracket
-    /// still covers it.
-    ///
-    /// `setupService.uninstall` does the graceful volume detach but does NOT
-    /// throw when that detach genuinely fails (`diskutil unmount` and its
-    /// `force` retry both non-zero) — it logs `mount.result: failure` and
-    /// proceeds to unload the agent anyway. So both a thrown error and that
-    /// non-throwing failure are checked explicitly (finding 7), the latter
-    /// via `isMountedAfterBoundedRecheck` rather than one `isMounted`
-    /// sample, since a stale mount-table entry or a `KeepAlive` remount race
-    /// would otherwise abort the whole run on a single bad reading
-    /// (finding 4).
-    ///
-    /// - Returns: the profiles that were unloaded and therefore MUST be
-    ///   passed to `reinstallAfterCacheMigration` on every exit path, and
-    ///   whether the detach failed (in which case the caller must abort
-    ///   without touching a file).
-    private func detachForCacheMigration(_ profiles: [SyncProfile]) -> (toReinstall: [SyncProfile], failed: Bool) {
-        let installed = profiles.filter { setupService.isInstalled(profile: $0) }
-        for profile in installed {
-            do {
-                try setupService.uninstall(profile: profile)
-            } catch {
-                return (installed, true)
-            }
-            let stillMounted = profile.isMountMode && setupService.isMountedAfterBoundedRecheck(profile: profile)
-            guard Self.cacheMigrationDetachSucceeded(threw: false, stillMountedAfterRecheck: stillMounted) else {
-                // `uninstall` returned normally but the volume is still
-                // attached — the graceful/forced `diskutil unmount` both
-                // failed. Abort rather than move files out from under it.
-                return (installed, true)
-            }
-        }
-        return (installed, false)
-    }
-
-    /// Re-install everything `detachForCacheMigration` unloaded and re-push
-    /// the FinderSync App Group data (R7). Always installs from the CURRENT
-    /// persisted profile, so a `vfsCachePath` the move just persisted is the
-    /// one the re-installed agent mounts with.
-    private func reinstallAfterCacheMigration(_ profiles: [SyncProfile]) {
-        for profile in profiles {
-            let latest = profileStore.profile(for: profile.id) ?? profile
-            try? setupService.install(profile: latest)
-        }
-        updateAppGroupMountPaths()
-    }
-
-    /// The full orchestration: cancel any in-flight warm for the affected
-    /// profiles (R5), detach/uninstall before the move (R4), run the engine
-    /// off the main actor (R10), persist `vfsCachePath` ONLY on `.completed`
-    /// (R20), then re-install on EVERY exit path and re-push the FinderSync
-    /// App Group data (R7).
-    private func migrateCacheDirectory(
-        for profileId: UUID,
-        destination: String,
-        coMigrate: Set<UUID>
-    ) async -> CacheMigrationOutcome {
-        guard let movingProfile = profileStore.profile(for: profileId) else {
-            return CacheMigrationOutcome(result: .cancelled, filesMoved: 0, bytesMoved: 0, sameVolume: false)
-        }
-        let allProfiles = profileStore.profiles
-        let startedAt = Date()
-
-        // R5 — cancel any warm reading through the mount BEFORE any file is touched.
-        let affectedIds = [profileId] + coMigrate
-        for id in affectedIds { cancelWarm(for: id) }
-
-        // Started BEFORE the detach loop (not after it, as before) so a
-        // detach-failure abort below still emits a span/metrics instead of
-        // silently producing no telemetry at all (finding 4).
-        let telemetry = TelemetryService.shared.beginCacheMigration(
-            profileId: profileId,
-            profileName: movingProfile.name
-        )
-
-        // R4 — detach/uninstall the moving profile (and any co-migrating
-        // installed profile) BEFORE the move, so nothing writes into the
-        // cache mid-move. `setupService.uninstall` already performs the
-        // graceful volume detach for a mount-mode profile — but it does NOT
-        // throw when that detach genuinely fails (`diskutil unmount` and its
-        // `force` retry both non-zero): it logs `mount.result: failure`
-        // telemetry and proceeds anyway to unload the agent and delete the
-        // profile's files. A `try?` here previously swallowed both a real
-        // thrown error AND that non-throwing failure, letting the move
-        // proceed against a still-mounted, still-writable volume (finding
-        // 7). Guard against both explicitly. The post-uninstall recheck
-        // uses `isMountedAfterBoundedRecheck` rather than a single
-        // `isMounted` sample, since a stale mount-table entry or a
-        // `KeepAlive` remount race can otherwise false-positive and abort
-        // the WHOLE migration on one bad sample (finding 4).
-        let detach = detachForCacheMigration([movingProfile] + coMigrate.compactMap { profileStore.profile(for: $0) })
-        let profilesToReinstall = detach.toReinstall
-        let detachFailed = detach.failed
-
-        defer {
-            // Re-install on EVERY exit path — completed, failed, cancelled,
-            // a detach failure, or a thrown error above — so a profile is
-            // never left with no launchd agent (`optimize-approach(plan)`
-            // proposal P2).
-            reinstallAfterCacheMigration(profilesToReinstall)
-        }
-
-        guard !detachFailed else {
-            cacheMigrationProgress[profileId] = nil
-            let outcome = CacheMigrationOutcome(result: .failed(.mountDetachFailed, rolledBack: false), filesMoved: 0, bytesMoved: 0, sameVolume: false)
-            TelemetryService.shared.endCacheMigration(
-                telemetry,
-                filesMoved: 0,
-                bytesMoved: 0,
-                durationSeconds: Date().timeIntervalSince(startedAt),
-                sameVolume: false,
-                outcome: Self.cacheMigrationOutcomeLabel(outcome.result)
-            )
-            return outcome
-        }
-
-        var progress = CacheMigrationProgress()
-        cacheMigrationProgress[profileId] = progress
-
-        let cancellationFlag = CacheMigrationCancellationFlag()
-        let fs = CacheMigrationFileSystem.production(isCancelled: { cancellationFlag.isCancelled })
-
-        let result: (plan: CacheMigrationPlan?, outcome: CacheMigrationOutcome) = await withTaskCancellationHandler {
-            await withCheckedContinuation { continuation in
-                DispatchQueue.global(qos: .utility).async { [weak self] in
-                    let runResult = CacheMigrationRunner.migrate(
-                        moving: movingProfile,
-                        allProfiles: allProfiles,
-                        destination: destination,
-                        coMigrate: coMigrate,
-                        fs: fs,
-                        isCancelled: { cancellationFlag.isCancelled },
-                        onPreflight: { preflight in
-                            DispatchQueue.main.async {
-                                guard let self, var p = self.cacheMigrationProgress[profileId] else { return }
-                                p.filesTotal = preflight.totalFiles
-                                p.bytesTotal = preflight.totalBytes
-                                p.sameVolume = preflight.sameVolume
-                                self.cacheMigrationProgress[profileId] = p
-                            }
-                        },
-                        onProgress: { filesDone, bytesDone, currentFile in
-                            DispatchQueue.main.async {
-                                guard let self, var p = self.cacheMigrationProgress[profileId] else { return }
-                                p.phase = .moving
-                                p.filesDone = filesDone
-                                p.bytesDone = bytesDone
-                                p.currentFile = currentFile
-                                self.cacheMigrationProgress[profileId] = p
-                            }
-                        }
-                    )
-                    continuation.resume(returning: runResult)
-                }
-            }
-        } onCancel: {
-            cancellationFlag.markCancelled()
-        }
-        let plan = result.plan
-        let outcome = result.outcome
-        progress = cacheMigrationProgress[profileId] ?? progress
-        progress.filesTotal = max(progress.filesTotal, outcome.filesMoved)
-        progress.bytesTotal = max(progress.bytesTotal, outcome.bytesMoved)
-        progress.sameVolume = outcome.sameVolume
-        progress.finishedAt = Date()
-
-        // `shouldPersist` is the ACTUAL gate, not a `where` clause on a
-        // `.completed` pattern that had already decided the answer. It
-        // covers both persisting outcomes — a completed move, and
-        // `.nothingToMove` (an empty source is nothing to lose, so the
-        // user's directory choice must not be silently dropped; R20 only
-        // guards against persisting an INCOMPLETE cache). The two branches
-        // were previously hand-copied, which is how they drifted apart from
-        // the gate in the first place.
-        if CacheMigrationPersistDecision.shouldPersist(outcome) {
-            progress.phase = .completed
-            // Re-read each profile from the store instead of writing back
-            // `movingProfile`. That snapshot was taken before a move that
-            // can run for hours; writing it back wholesale would silently
-            // revert any edit the UI or `ConfigFileWatcher` made in the
-            // meantime. `vfsCachePath` is the only field this migration
-            // owns. (The sibling loop already worked this way — the moving
-            // profile itself was the outlier.)
-            var idsToRewrite = plan?.profileIdsToRewrite ?? []
-            if !idsToRewrite.contains(profileId) { idsToRewrite.append(profileId) }
-            for id in idsToRewrite {
-                guard var latest = profileStore.profile(for: id) else { continue }
-                latest.vfsCachePath = destination
-                profileStore.update(latest)
-            }
-        } else {
-            switch outcome.result {
-            case .cancelled:
-                progress.phase = .cancelled
-            case .failed(let reason, _):
-                progress.phase = .failed(reason.rawValue)
-            default:
-                progress.phase = .failed("rejected")
-            }
-        }
-        cacheMigrationProgress[profileId] = progress
-
-        TelemetryService.shared.endCacheMigration(
-            telemetry,
-            filesMoved: outcome.filesMoved,
-            bytesMoved: outcome.bytesMoved,
-            durationSeconds: progress.elapsed,
-            sameVolume: outcome.sameVolume,
-            outcome: Self.cacheMigrationOutcomeLabel(outcome.result)
-        )
-
-        return outcome
-    }
-
-    /// Pure — `nonisolated` so the rollback Task can label its own
-    /// outcome without an extra main-actor hop just to read a switch.
-    nonisolated private static func cacheMigrationOutcomeLabel(_ result: CacheMigrationOutcome.Result) -> String {
-        switch result {
-        case .completed: return "completed"
-        // `.nothingToMove` is persisted exactly like `.completed` above (see
-        // the switch in `migrateCacheDirectory`) — labeling it "completed"
-        // here too keeps telemetry's success/failure split consistent with
-        // what actually happened to the profile, and lets
-        // `TelemetryService.endCacheMigration`'s span status use a simple
-        // `outcome == "completed"` check instead of re-deriving this same
-        // persist decision a third time (finding 13).
-        case .preflightRejected(.nothingToMove): return "completed"
-        case .cancelled: return "cancelled"
-        case .failed(let reason, let rolledBack): return rolledBack ? "\(reason.rawValue)_rolled_back" : reason.rawValue
-        case .preflightRejected: return "preflight_rejected"
-        }
-    }
-
-    /// Warm (download into the VFS content cache) a profile's pinned folders, publishing
-    /// live progress via `warmProgress[profileId]`.
-    ///
-    /// Every warm entry point routes through `startWarm` into here — the manual "Sync All"
-    /// button, the post-mount startup warm, and Finder pin requests — so all three surface the
-    /// same progress UI. Concurrent runs for one profile are coalesced: a call while a run is
-    /// active is ignored. The run stops promptly when its task is cancelled (cache cleared /
-    /// unmounted): the directory loop and `warmDirectory` both check `Task.isCancelled`. Emits
-    /// a `synctray warm` span + metrics (with a `warm.outcome` of completed/cancelled) so a run
-    /// is measurable in telemetry (throughput is the signal for the slow-fallback case).
-    ///
-    /// - Parameters:
-    ///   - profileId: The mount-mode profile to warm.
-    ///   - specificDirs: Warm only these directories (e.g. the paths from a Finder pin);
-    ///     when nil, warm all of the profile's pinned directories.
-    ///   - trigger: What started the run (manual / startup / finder_pin) — recorded on the span.
-    func warmPinnedDirectories(for profileId: UUID, dirs specificDirs: [String]? = nil, trigger: String = "manual") async {
-        guard warmProgress[profileId]?.isActive != true else { return }  // coalesce
-        guard let profile = profileStore.profile(for: profileId) else { return }
-        let targets = specificDirs ?? profile.pinnedDirectories
-        guard !targets.isEmpty else { return }
-
-        var progress = WarmProgress()
-        warmProgress[profileId] = progress
-
-        let telemetry = TelemetryService.shared.beginWarm(
-            profileId: profileId,
-            profileName: profile.name,
-            directoryCount: targets.count,
-            concurrency: profile.downloadConnections,
-            trigger: trigger
-        )
-
-        // Estimate work up front (metadata-only walk) so the bar can be determinate. The
-        // walk can hit the network on an NFS mount, so run it off the main actor.
-        let estimate = await Task.detached(priority: .utility) {
-            targets.reduce(into: (files: 0, bytes: Int64(0), cachedFiles: 0, cachedBytes: Int64(0))) { acc, dir in
-                let e = VFSCacheService.shared.estimateWarmWork(dir, for: profile)
-                acc.files += e.files
-                acc.bytes += e.bytes
-                acc.cachedFiles += e.cachedFiles
-                acc.cachedBytes += e.cachedBytes
-            }
-        }.value
-
-        progress.filesTotal = estimate.files
-        progress.bytesTotal = estimate.bytes
-        progress.filesAlreadyCached = estimate.cachedFiles
-        progress.bytesAlreadyCached = estimate.cachedBytes
-        progress.phase = .downloading
-        warmProgress[profileId] = progress
-
-        for dir in targets {
-            if Task.isCancelled { break }  // cache cleared or profile unmounted mid-run
-            await cacheService.warmDirectory(dir, for: profile, concurrency: profile.downloadConnections, isStillPinned: { [weak self] in
-                await self?.isDirectoryPinned(dir, profileId: profileId) ?? false
-            }, onStart: { [weak self] name in
-                await MainActor.run {
-                    guard let self, var p = self.warmProgress[profileId] else { return }
-                    p.currentDirectory = dir
-                    p.inFlightFiles.append(name)
-                    self.warmProgress[profileId] = p
-                }
-            }, onProgress: { [weak self] bytes in
-                await MainActor.run {
-                    guard let self, var p = self.warmProgress[profileId] else { return }
-                    p.bytesDone += bytes    // advances mid-file, per chunk
-                    self.warmProgress[profileId] = p
-                }
-            }, onFileComplete: { [weak self] name in
-                await MainActor.run {
-                    guard let self, var p = self.warmProgress[profileId] else { return }
-                    p.filesDone += 1
-                    if let idx = p.inFlightFiles.firstIndex(of: name) {
-                        p.inFlightFiles.remove(at: idx)
-                    }
-                    self.warmProgress[profileId] = p
-                }
-            })
-            // Warming populated the VFS cache — nudge the extension so folder badges flip
-            // from cloud to the "downloaded" checkmark as each directory finishes.
-            notifyFinderSyncReload()
-        }
-
-        let cancelled = Task.isCancelled
-        if var p = warmProgress[profileId] {
-            let files = p.filesDone
-            let bytes = p.bytesDone
-            let elapsed = p.elapsed
-            if cancelled {
-                // Drop the row — the cache was cleared or the mount went away, so a lingering
-                // "completed" summary would be misleading.
-                warmProgress[profileId] = nil
-            } else {
-                p.phase = .completed
-                p.finishedAt = Date()
-                p.inFlightFiles = []
-                warmProgress[profileId] = p
-            }
-            TelemetryService.shared.endWarm(
-                telemetry,
-                filesWarmed: files,
-                bytesWarmed: bytes,
-                durationSeconds: elapsed,
-                outcome: cancelled ? "cancelled" : "completed"
-            )
-        }
-    }
-
-    /// Wake the FinderSync extension to reload App Group data and repaint badges.
-    ///
-    /// Reuses the pin-request Darwin notification as a bidirectional "pin state changed"
-    /// signal: the extension observes it and calls `loadMountPaths()`, which re-reads the
-    /// pinned dirs and repaints badges. Our own observer also fires but finds no pending
-    /// request file (we post only after deleting it), so it's a harmless no-op.
-    private func notifyFinderSyncReload() {
-        CFNotificationCenterPostNotification(
-            CFNotificationCenterGetDistributedCenter(),
-            CFNotificationName(kPinRequestNotificationName as CFString),
-            nil,
-            nil,
-            true
-        )
-    }
-
-    /// Live (main-actor) check of whether `path` is still pinned for the given profile.
-    /// Used by `VFSCacheService.warmDirectory` to honour an unpin that arrives mid-warm.
-    @MainActor
-    private func isDirectoryPinned(_ path: String, profileId: UUID) -> Bool {
-        profileStore.profile(for: profileId)?.pinnedDirectories.contains(path) ?? false
-    }
-
-    /// Write active mount paths to App Group UserDefaults so the FinderSync extension
-    /// can register them via `FIFinderSyncController.setDirectoryURLs`.
-    ///
-    /// Also writes per-profile data (profileId, pinnedDirectories, vfsCachePath) so the
-    /// extension can determine pin state and show the correct contextual menu item.
-    func updateAppGroupMountPaths() {
-        guard let defaults = UserDefaults(suiteName: kAppGroupID) else {
-            SyncTraySettings.debugLog("updateAppGroupMountPaths: App Group UserDefaults not accessible")
-            return
-        }
-
-        let mountedProfiles = profileStore.enabledProfiles.filter {
-            $0.isMountMode && profileMountStates[$0.id] == .mounted
-        }
-
-        let mountPaths = mountedProfiles.map { $0.localSyncPath }
-        defaults.set(mountPaths, forKey: kMountPathsKey)
-
-        // Write per-profile data for badge state computation in the extension.
-        let profileDataArray = mountedProfiles.map { profile -> [String: Any] in
-            [
-                "localSyncPath": profile.localSyncPath,
-                "profileId": profile.id.uuidString,
-                "pinnedDirectories": profile.pinnedDirectories,
-                "vfsCachePath": cacheDirectory(for: profile) ?? ""
-            ]
-        }
-        defaults.set(profileDataArray, forKey: kProfileDataKey)
-
-        // Wake the extension so it re-registers `directoryURLs` (and re-badges) with the
-        // paths just written. Without this, a race after login/upgrade could leave the
-        // extension loaded with stale/empty paths: the app relaunches Finder before the
-        // NFS mount finishes establishing, the extension reads empty mount paths, and
-        // nothing tells it to re-read once the mount comes up — so the menu never appears.
-        notifyFinderSyncReload()
-
-        SyncTraySettings.debugLog("updateAppGroupMountPaths: wrote \(mountPaths.count) mount path(s)")
-    }
-
-    /// Helper to get the VFS cache directory for a profile (delegates to VFSCacheService).
-    private func cacheDirectory(for profile: SyncProfile) -> String? {
-        cacheService.cacheDirectory(for: profile)
-    }
-
-    /// Periodically reconcile mount-mode UI state with reality. A mount can be
-    /// established or torn down out-of-band — launchd's KeepAlive (re)starting the
-    /// daemon, an external drive event, or the user ejecting the volume in Finder —
-    /// none of which flow through mountProfile/unmountProfile. Without this, the UI
-    /// can show "Not mounted" while the volume is actually mounted (and vice versa).
-    private func startMountStateMonitor() {
-        mountStateMonitorTimer?.cancel()
-        let timer = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
-        timer.schedule(deadline: .now() + 5, repeating: 5)  // every 5 seconds
-        timer.setEventHandler { [weak self] in
-            DispatchQueue.main.async { self?.reconcileMountStatesOffMain() }
-        }
-        mountStateMonitorTimer = timer
-        timer.resume()
-    }
-
-    /// Poll each mounted Stream profile's rclone RC `/core/stats` endpoint for live
-    /// download activity and surface it through `profileProgress`, so streaming shows the
-    /// same transfer bar and per-file list that sync/bisync profiles show. A mount emits no
-    /// `--stats` log JSON, so this RC poll is its only live-progress signal. The handler
-    /// no-ops (no network) when nothing is mounted, so the 2s cadence is cheap at rest.
-    private func startMountProgressMonitor() {
-        mountProgressTimer?.cancel()
-        let timer = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
-        timer.schedule(deadline: .now() + 2, repeating: 2)  // match sync/bisync --stats 2s
-        timer.setEventHandler { [weak self] in
-            DispatchQueue.main.async { self?.pollMountProgress() }
-        }
-        mountProgressTimer = timer
-        timer.resume()
-    }
-
-    private func pollMountProgress() {
-        let mounted = Set(profileStore.enabledProfiles.filter {
-            $0.isMountMode && profileMountStates[$0.id] == .mounted
-        }.map { $0.id })
-
-        // A profile we were showing progress for is no longer mounted → clear it.
-        for id in mountProgressActive.subtracting(mounted) {
-            profileProgress[id] = nil
-        }
-        mountProgressActive.formIntersection(mounted)
-
-        guard !mounted.isEmpty else { return }
-        for profile in profileStore.enabledProfiles where mounted.contains(profile.id) {
-            let port = profile.rcPort
-            let id = profile.id
-            Task { [weak self] in
-                let stats = await self?.cacheService.getCoreStats(port: port)
-                self?.applyMountProgress(stats, for: id)
-            }
-        }
-    }
-
-    /// Map a mount's live RC `/core/stats` into `profileProgress`. Only the *active*
-    /// transfers drive the bar: the aggregate byte counters `/core/stats` returns are
-    /// cumulative since mount start (they'd read near 100% forever), so the "downloading
-    /// now" bar is summed from the in-flight `transferring[]` entries instead. When nothing
-    /// is transferring the entry is cleared so an idle mount stays quiet.
-    private func applyMountProgress(_ stats: RcloneStats?, for profileId: UUID) {
-        guard profileMountStates[profileId] == .mounted,
-              let transferring = stats?.transferring, !transferring.isEmpty else {
-            if mountProgressActive.contains(profileId) {
-                profileProgress[profileId] = nil
-                mountProgressActive.remove(profileId)
-            }
-            return
-        }
-
-        // rclone reports an unknown transfer size as a negative value; clamp so it never
-        // drags the aggregate total below the bytes already read.
-        let downloaded = transferring.reduce(Int64(0)) { $0 + max(0, $1.bytes ?? 0) }
-        let total = transferring.reduce(Int64(0)) { $0 + max(0, $1.size ?? 0) }
-
-        // Speed and ETA come from the in-flight transfers too, never from `stats.speed`/
-        // `stats.eta`: those are cumulative averages since mount start, so on a long-lived
-        // mount they'd show a misleadingly slow rate and inflated ETA next to the live bar.
-        // Aggregate speed is the sum of the active per-file rates; the batch finishes when
-        // its slowest concurrent transfer does, so ETA is the longest remaining per-file ETA.
-        let speed = transferring.compactMap { $0.speed ?? $0.speedAvg }.reduce(0, +)
-        let eta = transferring.compactMap { $0.eta }.max()
-
-        profileProgress[profileId] = SyncProgress(
-            bytesTransferred: downloaded,
-            totalBytes: total,
-            eta: eta,
-            speed: speed > 0 ? speed : nil,
-            transfersDone: 0,
-            totalTransfers: 0,  // suppress the "Files: 0 / N" line; the per-file rows tell the story
-            transferringFiles: transferring
-        )
-        mountProgressActive.insert(profileId)
-    }
-
-    /// Periodically check whether a mounted Stream profile that fell back to its
-    /// secondary remote can return to the primary, and remount it on the primary once
-    /// the primary is reachable again.
-    ///
-    /// Unlike sync/bisync profiles (which re-evaluate the primary on every scheduled
-    /// run via `StartInterval`), a mount is a long-lived `rclone nfsmount` that picks
-    /// its remote once at mount time — so a live fallback mount would otherwise stay on
-    /// the fallback until the next relaunch/login/manual remount. This restores the
-    /// "prefer the primary when available" behaviour for mounts.
-    private func startPrimaryRecoveryMonitor() {
-        primaryRecoveryTimer?.cancel()
-        let timer = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
-        timer.schedule(deadline: .now() + 120, repeating: 120)  // every 2 minutes
-        timer.setEventHandler { [weak self] in
-            DispatchQueue.main.async { self?.checkPrimaryRecovery() }
-        }
-        primaryRecoveryTimer = timer
-        timer.resume()
-    }
-
-    private func isOnFallback(_ transport: ActiveTransport?) -> Bool {
-        if case .fallback = transport { return true }
-        return false
-    }
-
-    /// For each mounted mount-mode profile currently on its fallback, probe the primary
-    /// (off the main thread) and remount on the primary if it's reachable again.
-    private func checkPrimaryRecovery() {
-        let candidates = profileStore.enabledProfiles.filter {
-            $0.isMountMode
-                && $0.hasFallback
-                && profileMountStates[$0.id] == .mounted
-                && isOnFallback(profileTransports[$0.id])
-                && !recoveringToPrimary.contains($0.id)
-        }
-        // Drop stale streaks for profiles that are no longer on a fallback mount, so a
-        // future fallback episode starts counting from zero.
-        let candidateIds = Set(candidates.map { $0.id })
-        primaryRecoveryStreak = primaryRecoveryStreak.filter { candidateIds.contains($0.key) }
-        guard !candidates.isEmpty else { return }
-
-        for profile in candidates {
-            let primaryRemote = profile.rcloneRemote
-            let profileId = profile.id
-            recoveringToPrimary.insert(profileId)
-            DispatchQueue.global(qos: .utility).async { [weak self] in
-                guard let self else { return }
-                let reachable = self.isRemoteReachable(primaryRemote)
-                DispatchQueue.main.async {
-                    defer { self.recoveringToPrimary.remove(profileId) }
-
-                    // A single unreachable probe resets the streak — the primary must be
-                    // continuously reachable, not merely reachable right now.
-                    guard reachable,
-                          self.profileMountStates[profileId] == .mounted,
-                          self.isOnFallback(self.profileTransports[profileId]),
-                          let current = self.profileStore.profile(for: profileId) else {
-                        self.primaryRecoveryStreak[profileId] = 0
-                        return
-                    }
-
-                    let streak = (self.primaryRecoveryStreak[profileId] ?? 0) + 1
-                    guard streak >= self.primaryRecoveryRequiredStreak else {
-                        self.primaryRecoveryStreak[profileId] = streak
-                        SyncTraySettings.debugLog(
-                            "Primary '\(primaryRemote)' reachable for '\(current.name)' "
-                                + "(\(streak)/\(self.primaryRecoveryRequiredStreak)) — "
-                                + "waiting for it to stay up before remounting")
-                        return
-                    }
-
-                    self.primaryRecoveryStreak[profileId] = 0
-                    SyncTraySettings.debugLog(
-                        "Primary '\(primaryRemote)' stable — remounting '\(current.name)' on primary")
-                    self.remountOnPrimary(current)
-                }
-            }
-        }
-    }
-
-    /// Quick reachability probe for a remote, with a hard timeout — some backends (SMB)
-    /// hang well past their own `--contimeout`/`--timeout`, so we also cap wall-clock.
-    private func isRemoteReachable(_ remoteName: String) -> Bool {
-        let bare = remoteName.hasSuffix(":") ? String(remoteName.dropLast()) : remoteName
-        guard !bare.isEmpty else { return false }
-        guard let rclone = RcloneLocator.resolve() else { return false }
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: rclone)
-        proc.arguments = ["lsd", "\(bare):", "--contimeout", "3s", "--timeout", "8s", "--max-depth", "0"]
-        proc.standardOutput = Pipe()
-        proc.standardError = Pipe()
-        do { try proc.run() } catch { return false }
-        let deadline = Date().addingTimeInterval(12)
-        while proc.isRunning && Date() < deadline {
-            Thread.sleep(forTimeInterval: 0.2)
-        }
-        if proc.isRunning {
-            proc.terminate()
-            return false
-        }
-        return proc.terminationStatus == 0
-    }
-
-    /// Remount a profile so the sync script re-evaluates the remote and picks the primary
-    /// (now reachable). Unmount first — the running fallback rclone chose its remote at
-    /// launch and won't switch in place.
-    private func remountOnPrimary(_ profile: SyncProfile) {
-        Task {
-            try? self.setupService.unmount(profile: profile)
-            try? await Task.sleep(nanoseconds: 1_500_000_000)  // let the unmount settle
-            await MainActor.run { self.mountProfile(profile) }
-        }
-    }
-
-    /// Decide whether a mount-monitor tick should trigger a one-time auto-warm for a
-    /// profile, updating the already-warmed set in place. Pure and static so the self-test
-    /// can drive the "warm exactly once per mount session" invariant without a real mount.
-    ///
-    /// Returns true exactly once per mount session — the first tick a pinned profile is seen
-    /// mounted — and false on every later tick while it stays mounted. Seeing it unmounted
-    /// re-arms it (removes it from the set), so a subsequent remount warms again and picks up
-    /// files added on the remote in the meantime. A profile with no pinned directories never
-    /// warms and is never added.
-    static func shouldAutoWarmOnMount(
-        isMounted: Bool,
-        hasPinnedDirs: Bool,
-        profileId: UUID,
-        alreadyWarmed: inout Set<UUID>
-    ) -> Bool {
-        guard isMounted else {
-            alreadyWarmed.remove(profileId)   // re-arm for the next mount
-            return false
-        }
-        guard hasPinnedDirs else { return false }
-        return alreadyWarmed.insert(profileId).inserted
-    }
-
-    /// Reconcile mount states without blocking the main thread: snapshot the mount
-    /// profiles on the main actor, probe `/sbin/mount` on a background queue, then
-    /// merge results back on the main actor. Used by the repeating 5s monitor so the
-    /// probe never stalls the UI — unlike updateMountStates(), whose synchronous
-    /// probe is fine for one-shot init/onAppear calls. No-ops (no subprocess) when
-    /// there are no mount profiles.
-    private func reconcileMountStatesOffMain() {
-        let mountProfiles = profileStore.enabledProfiles.filter { $0.isMountMode }
-        guard !mountProfiles.isEmpty else { return }
-        DispatchQueue.global(qos: .utility).async { [weak self] in
-            guard let self else { return }
-            let mounted = mountProfiles.reduce(into: [UUID: Bool]()) { acc, profile in
-                acc[profile.id] = self.setupService.isMounted(profile: profile)
-            }
-            DispatchQueue.main.async {
-                let before = Set(self.profileMountStates.filter { $0.value == .mounted }.keys)
-                for profile in mountProfiles {
-                    let isMounted = mounted[profile.id] == true
-                    if isMounted {
-                        self.profileMountStates[profile.id] = .mounted
-                    } else if self.profileMountStates[profile.id] == nil
-                                || self.profileMountStates[profile.id] == .mounted {
-                        self.profileMountStates[profile.id] = .unmounted
-                    }
-                    // A launchd mount at login/reboot (RunAtLoad), an externally-driven mount,
-                    // or a slow fallback that established after mountProfile's poll gave up
-                    // never ran a warm, so new remote files were never pulled into the offline
-                    // cache. Warm such a mount once per session; the app-driven mount path sets
-                    // the same flag so this can't double-fire. Decided independently of the
-                    // UI-state transition above, so a profile stuck in `.failed` still re-arms
-                    // once it is actually unmounted.
-                    if Self.shouldAutoWarmOnMount(
-                        isMounted: isMounted,
-                        hasPinnedDirs: !profile.pinnedDirectories.isEmpty,
-                        profileId: profile.id,
-                        alreadyWarmed: &self.autoWarmedMounts
-                    ) {
-                        self.startWarm(for: profile.id, trigger: "startup")
-                    }
-                }
-                // Republish to the FinderSync extension whenever the set of mounted
-                // profiles changes. Without this, a mount the monitor detects — a slow
-                // fallback that established after the initial poll, a launchd/externally
-                // mounted profile, or one that recovered from .failed — never reaches the
-                // extension, so its right-click menu and badges silently never appear.
-                let after = Set(self.profileMountStates.filter { $0.value == .mounted }.keys)
-                if before != after {
-                    self.updateAppGroupMountPaths()
-                }
-            }
-        }
-    }
-
-    /// Start a 5-minute session heartbeat for availability monitoring
-    private func startSessionHeartbeat() {
-        heartbeatTimer?.cancel()
-        let timer = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
-        timer.schedule(deadline: .now() + 300, repeating: 300)  // every 5 minutes
-        timer.setEventHandler { [weak self] in
-            DispatchQueue.main.async {
-                guard let self = self else { return }
-                let enabled = self.profileStore.enabledProfiles.count
-                let syncing = self.profileStates.values.filter { $0 == .syncing }.count
-                let paused = self.pausedProfiles.count
-                let errors = self.profileStates.values.filter {
-                    if case .error = $0 { return true }; return false
-                }.count
-                TelemetryService.shared.recordSessionHeartbeat(
-                    enabledProfiles: enabled,
-                    syncingProfiles: syncing,
-                    pausedProfiles: paused,
-                    errorProfiles: errors
-                )
-            }
-        }
-        heartbeatTimer = timer
-        timer.resume()
-    }
 
     /// Find which profile a log watcher belongs to
     private func profileId(for watcher: LogWatcher) -> UUID? {

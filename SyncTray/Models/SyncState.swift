@@ -186,86 +186,6 @@ enum SyncState: Equatable {
     }
 }
 
-/// Mount state for mount mode profiles
-enum MountState: Equatable {
-    case unmounted
-    case mounting
-    case mounted
-    case failed(String)
-
-    var iconName: String {
-        switch self {
-        case .unmounted:
-            return "externaldrive.badge.icloud"
-        case .mounting:
-            return "externaldrive.badge.icloud"
-        case .mounted:
-            return "externaldrive.fill.badge.checkmark"
-        case .failed:
-            return "externaldrive.badge.xmark"
-        }
-    }
-
-    var iconColor: Color {
-        switch self {
-        case .unmounted:
-            return .secondary
-        case .mounting:
-            return .blue
-        case .mounted:
-            return .green
-        case .failed:
-            return .red
-        }
-    }
-
-    var statusText: String {
-        switch self {
-        case .unmounted:
-            return "Not mounted"
-        case .mounting:
-            return "Mounting..."
-        case .mounted:
-            return "Mounted"
-        case .failed(let message):
-            return "Mount failed: \(message)"
-        }
-    }
-}
-
-/// Which transport is currently active for a profile's sync
-enum ActiveTransport: Equatable {
-    case primary
-    case fallback(remoteName: String)
-    case unknown
-
-    var isPrimary: Bool {
-        if case .primary = self { return true }
-        return false
-    }
-
-    var isFallback: Bool {
-        if case .fallback = self { return true }
-        return false
-    }
-
-    var iconName: String {
-        switch self {
-        case .primary: return "wifi"
-        case .fallback: return "antenna.radiowaves.left.and.right"
-        case .unknown: return "questionmark.circle"
-        }
-    }
-
-    var label: String {
-        switch self {
-        case .primary: return "Primary"
-        case .fallback(let name): return "Fallback (\(name))"
-        case .unknown: return "Unknown"
-        }
-    }
-}
-
 struct FileChange: Identifiable, Equatable {
     let id = UUID()
     let timestamp: Date
@@ -334,24 +254,19 @@ enum SyncLogPatterns {
 
     /// Patterns indicating sync has started
     static func isSyncStarted(_ message: String) -> Bool {
-        let lower = message.lowercased()
-        return lower.contains("starting bisync") || lower.contains("starting sync")
+        message.lowercased().contains("starting sync")
     }
 
     /// Patterns indicating sync completed successfully
     static func isSyncCompleted(_ message: String) -> Bool {
         let lower = message.lowercased()
-        return lower.contains("bisync successful") ||
-               lower.contains("completed successfully") ||
+        return lower.contains("completed successfully") ||
                lower.contains("sync complete")
     }
 
     /// Patterns indicating sync failed
     static func isSyncFailed(_ message: String) -> Bool {
-        let lower = message.lowercased()
-        return lower.contains("bisync failed") ||
-               lower.contains("failed with exit code") ||
-               lower.contains("failed to bisync")
+        message.lowercased().contains("failed with exit code")
     }
 
     /// Patterns indicating drive not mounted
@@ -367,117 +282,40 @@ enum SyncLogPatterns {
 
     /// Patterns indicating a scheduled run exited early WITHOUT syncing because
     /// the remote failed the read-only pre-flight reachability check.
-    /// Matches "Remote unreachable, skipping sync ..." but deliberately NOT the
-    /// fallback message "Primary remote unreachable, using fallback: ..." (which
-    /// is a transport change, handled separately) — the discriminator is the
-    /// ", skipping" clause.
+    /// Matches "Remote unreachable, skipping sync ..." — the discriminator is
+    /// the ", skipping" clause.
     static func isSyncSkipped(_ message: String) -> Bool {
         message.lowercased().contains("unreachable, skipping")
     }
 
-    /// Error pattern that triggers automatic recovery via --resync.
-    /// Matches the canonical bisync "out of sync" messages that require --resync.
-    /// NOTE: Do NOT match bare "--resync" as a substring — rclone error output from a
-    /// *failed* resync can itself contain "--resync" at critical level, which would
-    /// re-trigger auto-fix and create a feedback loop.
-    /// NOTE: "cannot find prior listing" is the full rclone phrase; matching only the
-    /// "cannot find prior" prefix would also catch unrelated rclone warnings.
-    static func isOutOfSyncError(_ message: String) -> Bool {
-        message.contains("out of sync") ||
-        message.contains("resync to recover") ||
-        message.contains("cannot find prior listing")
-    }
-
     // MARK: - Error Categorization
 
-    /// Transient "all files changed" error that should be ignored.
-    /// This is expected after a `--resync` and resolves on the next sync.
+    /// Transient "all files changed" safety-abort error that should be ignored.
+    /// rclone aborts a sync that looks like it would change every file (e.g. a
+    /// clock/timezone shift making every mtime appear different) rather than
+    /// risk a mass unwanted overwrite; this resolves on the next sync.
     static func isTransientAllFilesChangedError(_ message: String) -> Bool {
         message.contains("all files were changed") || message.contains("Safety abort")
     }
 
-    /// Generic messages that don't provide useful error info
-    static func isGenericAbortMessage(_ message: String) -> Bool {
-        message.contains("Bisync aborted") || message.contains("Failed to bisync")
-    }
-
     /// Critical/actionable errors that tell the user what to do
     static func isCriticalError(_ message: String) -> Bool {
-        message.contains("out of sync") ||
-        message.contains("resync") ||
         message.contains("critical") ||
         message.contains("lock file") ||
-        message.contains("check file") ||
-        message.contains("Access test failed") ||
         message.contains("Failed to initialise") ||
-        message.contains("malformed rule") ||
-        message.contains("not empty") ||
-        message.contains("FUSE") ||
-        message.contains("failed to mount")
+        message.contains("malformed rule")
     }
 
     // MARK: - Error Message Cleanup
 
     /// Prefixes to strip from error messages for cleaner display
     static func cleanErrorMessage(_ message: String) -> String {
-        var cleaned = message
-
-        // Strip common prefixes
-        let prefixes = [
-            "Bisync critical error: ",
-            "Bisync aborted. ",
-            "Fatal error: failed to mount FUSE fs: "
-        ]
-
-        for prefix in prefixes {
-            if let range = cleaned.range(of: prefix) {
-                cleaned = String(cleaned[range.upperBound...])
-                break
-            }
-        }
-
-        // Provide user-friendly mount error messages
-        if cleaned.contains("is not empty") {
-            return "Mount point folder is not empty. Choose an empty folder or clear its contents first."
-        }
-        if cleaned.contains("not supported on MacOS when rclone is installed via Homebrew") {
-            return "The macFUSE backend requires the official rclone binary from rclone.org "
-                + "(Homebrew's rclone can't mount). Switch this profile's Mount Backend to "
-                + "NFS to stream without macFUSE."
-        }
-        if cleaned.contains("macfuse") || cleaned.contains("FUSE") || cleaned.contains("fuse") {
-            if cleaned.contains("not found") || cleaned.contains("not installed") {
-                return "macFUSE is required for the macFUSE backend. Install via "
-                    + "`brew install --cask macfuse`, or switch this profile's Mount Backend "
-                    + "to NFS to stream without it."
-            }
-        }
-
-        return cleaned
-    }
-
-    // MARK: - Transport Detection
-
-    /// Check if message indicates fallback transport was activated
-    static func isFallbackActivated(_ message: String) -> Bool {
-        message.contains("using fallback:")
-    }
-
-    /// Check if message indicates primary transport is in use
-    static func isPrimaryTransport(_ message: String) -> Bool {
-        message.contains("Using primary remote:")
-    }
-
-    /// Extract the fallback remote name from a fallback log message
-    static func extractFallbackRemoteName(from message: String) -> String? {
-        // Format: "Primary remote unreachable, using fallback: synology-sftp"
-        guard let range = message.range(of: "using fallback: ") else { return nil }
-        return String(message[range.upperBound...]).trimmingCharacters(in: .whitespaces)
+        message
     }
 
     // MARK: - Exit Code Extraction
 
-    /// Extract exit code from a failure message like "Bisync failed with exit code 1"
+    /// Extract exit code from a failure message like "Sync failed with exit code 1"
     static func extractExitCode(from message: String) -> Int? {
         let pattern = #"exit code (\d+)"#
         guard let regex = try? NSRegularExpression(pattern: pattern),

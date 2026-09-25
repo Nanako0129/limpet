@@ -149,8 +149,7 @@ extension RcloneLogEntry {
             }
         }
 
-        // Fall back to parsing bisync-style messages
-        return parseBisyncFileChange(from: cleanMsg)
+        return nil
     }
 
     private func stripANSICodes(_ text: String) -> String {
@@ -159,32 +158,6 @@ extension RcloneLogEntry {
         guard let regex = try? NSRegularExpression(pattern: pattern) else { return text }
         let range = NSRange(text.startIndex..., in: text)
         return regex.stringByReplacingMatches(in: text, range: range, withTemplate: "")
-    }
-
-    /// Parse bisync-style messages like:
-    /// - "- Path1    File was deleted          - KAIJU/file.mp4"
-    /// - "- Path2    File is new               - folder/newfile.txt"
-    private func parseBisyncFileChange(from message: String) -> FileChange? {
-        let pattern = #"- Path[12]\s+(.+?)\s+-\s+(.+)$"#
-        guard let regex = try? NSRegularExpression(pattern: pattern),
-              let match = regex.firstMatch(in: message, range: NSRange(message.startIndex..., in: message)),
-              let opRange = Range(match.range(at: 1), in: message),
-              let pathRange = Range(match.range(at: 2), in: message) else {
-            return nil
-        }
-
-        let opText = String(message[opRange]).lowercased()
-        let filePath = String(message[pathRange])
-            .trimmingCharacters(in: .whitespaces)
-            .trimmingCharacters(in: CharacterSet(charactersIn: "\""))
-
-        let operation: FileChange.Operation?
-        if opText.contains("deleted") { operation = .deleted }
-        else if opText.contains("new") { operation = .copied }
-        else if opText.contains("changed") || opText.contains("newer") || opText.contains("older") { operation = .updated }
-        else { return nil }
-
-        return FileChange(timestamp: date ?? Date(), path: filePath, operation: operation!)
     }
 
     private func parseOperation(from message: String) -> FileChange.Operation? {

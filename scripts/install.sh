@@ -14,10 +14,8 @@ echo "Cleaning build artifacts..."
 rm -rf "$BUILD_DIR"
 
 echo "Building $APP_NAME (full rebuild)..."
-# DASH0_AUTH_TOKEN is embedded in Info.plist if set in environment
 xcodebuild -scheme SyncTray -configuration Debug \
     -derivedDataPath "$BUILD_DIR" \
-    DASH0_AUTH_TOKEN="${DASH0_AUTH_TOKEN:-}" \
     build 2>&1 | grep -E "(error:|warning:.*error|BUILD)" || true
 
 if [ ! -d "$BUILD_PATH" ]; then

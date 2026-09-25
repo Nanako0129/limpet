@@ -4,9 +4,6 @@ struct AppSettingsView: View {
     @EnvironmentObject var syncManager: SyncManager
 
     @State private var debugLogging = SyncTraySettings.debugLoggingEnabled
-    @State private var telemetryEnabled = SyncTraySettings.telemetryEnabled
-    @State private var autoFixSyncIssues = SyncTraySettings.autoFixSyncIssues
-    @State private var showingTelemetryDetails: Bool = false
     @State private var rcloneVersion: String?
 
     var body: some View {
@@ -17,22 +14,6 @@ struct AppSettingsView: View {
                 GroupBox("General") {
                     VStack(alignment: .leading, spacing: 12) {
                         launchAtLoginToggle
-                    }
-                    .padding(4)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                }
-
-                GroupBox("Privacy") {
-                    VStack(alignment: .leading, spacing: 12) {
-                        telemetryToggle
-                    }
-                    .padding(4)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                }
-
-                GroupBox("Sync") {
-                    VStack(alignment: .leading, spacing: 12) {
-                        autoFixToggle
                     }
                     .padding(4)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -86,7 +67,6 @@ struct AppSettingsView: View {
                 } else {
                     syncManager.disableLoginItem()
                 }
-                TelemetryService.shared.recordSettingChanged(name: "launch_at_login", enabled: enabled)
             }
         )) {
             VStack(alignment: .leading, spacing: 2) {
@@ -95,62 +75,6 @@ struct AppSettingsView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
-        }
-    }
-
-    // MARK: - Privacy
-
-    private var telemetryToggle: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Toggle(isOn: $telemetryEnabled) {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Share anonymous usage data")
-                    Text("Sync results, error types, and feature usage. No file names, paths, or credentials.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-            }
-            .onChange(of: telemetryEnabled) { newValue in
-                if newValue {
-                    SyncTraySettings.telemetryEnabled = newValue
-                    TelemetryService.shared.configure()
-                    TelemetryService.shared.recordSettingChanged(name: "telemetry", enabled: true)
-                } else {
-                    // Record the opt-out while telemetry is still enabled, then disable —
-                    // otherwise the method no-ops and the opt-out is never captured.
-                    TelemetryService.shared.recordSettingChanged(name: "telemetry", enabled: false)
-                    SyncTraySettings.telemetryEnabled = newValue
-                }
-                syncManager.refreshSettingsFile()
-            }
-
-            Button("Learn more") {
-                showingTelemetryDetails = true
-            }
-            .buttonStyle(.link)
-            .font(.caption)
-            .padding(.leading, 20) // Align with toggle label
-        }
-        .sheet(isPresented: $showingTelemetryDetails) {
-            TelemetryDetailsSheet()
-        }
-    }
-
-    // MARK: - Sync
-
-    private var autoFixToggle: some View {
-        Toggle(isOn: $autoFixSyncIssues) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text("Automatically recover from sync conflicts")
-                Text("Runs --resync when bisync detects out-of-sync state. Recommended.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-        }
-        .onChange(of: autoFixSyncIssues) { newValue in
-            SyncTraySettings.autoFixSyncIssues = newValue
-            TelemetryService.shared.recordSettingChanged(name: "auto_fix", enabled: newValue)
-            syncManager.refreshSettingsFile()
         }
     }
 
@@ -167,7 +91,6 @@ struct AppSettingsView: View {
         }
         .onChange(of: debugLogging) { newValue in
             SyncTraySettings.debugLoggingEnabled = newValue
-            TelemetryService.shared.recordSettingChanged(name: "debug_logging", enabled: newValue)
             syncManager.refreshSettingsFile()
         }
     }
