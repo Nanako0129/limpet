@@ -774,9 +774,14 @@ struct SetupWizardView: View {
         do {
             try SyncSetupService.shared.install(profile: profileToInstall)
         } catch {
-            // Saved, but not running: say so instead of closing silently.
+            // Saved, but not running: keep it disabled so it never shows as an
+            // enabled profile with no agent; a retry re-enables it (profileToSave).
+            var disabled = profileToInstall
+            disabled.isEnabled = false
+            profileStore.update(disabled)
+            savedProfile = disabled
             isLoading = false
-            errorMessage = "Saved, but the background sync could not be installed: \(error.localizedDescription)"
+            errorMessage = "Saved as disabled: the background sync could not be installed: \(error.localizedDescription)"
             return
         }
 
