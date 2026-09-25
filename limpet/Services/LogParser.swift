@@ -150,6 +150,12 @@ final class LogParser {
     }
 
     private func parseEventType(from message: String) -> ParsedLogEvent.EventType {
+        // First: this line embeds the user's path, which may itself contain
+        // text the substring matchers below look for (e.g. ".../Sync Complete").
+        if SyncLogPatterns.isSourceMissing(message) {
+            return .sourceMissing(SyncLogPatterns.extractSourceMissingPath(from: message) ?? "")
+        }
+
         if SyncLogPatterns.isSyncStarted(message) {
             return .syncStarted
         }
@@ -169,10 +175,6 @@ final class LogParser {
 
         if SyncLogPatterns.isSyncAlreadyRunning(message) {
             return .syncAlreadyRunning
-        }
-
-        if SyncLogPatterns.isSourceMissing(message) {
-            return .sourceMissing(SyncLogPatterns.extractSourceMissingPath(from: message) ?? "")
         }
 
         return .unknown

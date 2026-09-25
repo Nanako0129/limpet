@@ -3764,6 +3764,13 @@ enum ConfigSelfTest {
             return report(id, slug, false, "(script line did not parse to .sourceMissing(\"/some/path\"))")
         }
 
+        // The path is user text: one that contains another matcher's phrase
+        // must still parse as source-missing, not as that phrase.
+        let trickyLine = "2026-09-26 12:00:03 - Source missing: /Volumes/Backup/Sync Complete"
+        guard case .some(.some("/Volumes/Backup/Sync Complete")) = missingPath(trickyLine) else {
+            return report(id, slug, false, "(a path containing \"Sync Complete\" did not parse as .sourceMissing)")
+        }
+
         let normalLine = "2026-09-26 12:00:02 - Starting sync (local → remote)"
         guard case .some(.none) = missingPath(normalLine) else {
             return report(id, slug, false, "(a normal line was mismatched as .sourceMissing)")
