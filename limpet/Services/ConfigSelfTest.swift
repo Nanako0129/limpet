@@ -65,6 +65,8 @@ enum ConfigSelfTest {
             testWatchScheduler,
             testGeneratedScriptText,
             testGeneratedPlistShape,
+            testMissingSourceIsNotCreated,
+            testTransfersChangeReinstalls,
         ]
 
         for check in checks {
@@ -1422,14 +1424,47 @@ enum ConfigSelfTest {
 
     // MARK: - AC-W3 — generated launchd plist shape (limpet-plan.md L3(c))
 
+    // MARK: - AC-W4 — a missing localToRemote source is refused, never created
+
+    /// Creating a missing source would hand the watcher an empty directory, and the
+    /// first sync would delete everything on the remote. Only the localToRemote branch
+    /// is exercised: it returns before `cleanupLegacyCheckFiles`, which would run rclone.
+    private static func testMissingSourceIsNotCreated() -> Bool {
+        var profile = sampleProfile()
+        profile.localSyncPath = (selfTestRoot as NSString).appendingPathComponent("missing-source")
+        profile.syncDirection = .localToRemote
+        try? FileManager.default.removeItem(atPath: profile.localSyncPath)
+
+        let error = SyncSetupService.shared.initializeSyncPaths(for: profile)
+        guard error != nil else {
+            return report("AC-W4", "missing-source-not-created", false, "(expected an error for a missing source)")
+        }
+        guard !FileManager.default.fileExists(atPath: profile.localSyncPath) else {
+            return report("AC-W4", "missing-source-not-created", false, "(the missing source directory was created)")
+        }
+        return report("AC-W4", "missing-source-not-created", true)
+    }
+
+    // MARK: - AC-W5 — changing only `transfers` reinstalls the agent
+
+    private static func testTransfersChangeReinstalls() -> Bool {
+        let current = sampleProfile()
+        var updated = current
+        updated.transfers = current.transfers + 8
+        let action = SyncManager.reconcileAction(from: current, to: updated)
+        return report("AC-W5", "transfers-change-reinstalls", action == .reinstall, "(got \(action))")
+    }
+
     private static func testGeneratedPlistShape() -> Bool {
         let profile = sampleProfile()
         let plist = SyncSetupService.shared.generateLaunchdPlist(for: profile)
 
-        guard plist.contains("<key>KeepAlive</key>"), plist.contains("<true/>") else {
+        // Match the key together with its value: a bare `contains("<true/>")` is also
+        // satisfied by RunAtLoad's value and would pass with KeepAlive set to false.
+        guard plist.range(of: #"<key>KeepAlive</key>\s*<true/>"#, options: .regularExpression) != nil else {
             return report("AC-W3", "watch-plist-shape", false, "(missing KeepAlive true)")
         }
-        guard plist.contains("<key>RunAtLoad</key>") else {
+        guard plist.range(of: #"<key>RunAtLoad</key>\s*<true/>"#, options: .regularExpression) != nil else {
             return report("AC-W3", "watch-plist-shape", false, "(missing RunAtLoad)")
         }
         guard !plist.contains("StartInterval") else {

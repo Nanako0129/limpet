@@ -59,7 +59,18 @@ enum SyncWatchDaemon {
 
         let recheckTimer = DispatchSource.makeTimerSource(queue: .main)
         recheckTimer.schedule(deadline: .now() + 30, repeating: 30)
-        recheckTimer.setEventHandler { startWatcherIfNeeded() }
+        // Catch-up sync whenever the source goes from missing to present (e.g. an
+        // external drive remounted, or the folder was moved back). Tracking the
+        // transition rather than only the first watcher start also covers a source
+        // that disappears and returns while the watcher is already running; without
+        // it, changes made meanwhile would wait for the periodic safety sync.
+        var sourceWasMissing = !FileManager.default.fileExists(atPath: profile.localSyncPath)
+        recheckTimer.setEventHandler {
+            let exists = FileManager.default.fileExists(atPath: profile.localSyncPath)
+            startWatcherIfNeeded()
+            if exists && sourceWasMissing { scheduler.trigger() }
+            sourceWasMissing = !exists
+        }
         recheckTimer.resume()
 
         // Catch-up sync at start.

@@ -121,7 +121,7 @@ enum LimpetCLI {
       reinstall <name|id>          Regenerate script+plist and reinstall the agent
 
     Operate:
-      sync <name|id>                          Run a sync now and wait for it to finish
+      sync <name|id>                          Ask the profile's watcher to sync now (returns immediately)
       watch <name|id>                         Run as the profile's realtime watcher (launchd only; never exits)
 
     profile set keys: name, rcloneRemote, remotePath, localSyncPath,

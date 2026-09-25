@@ -216,8 +216,16 @@ final class SyncSetupService {
     func initializeSyncPaths(for profile: SyncProfile) -> String? {
         let fileManager = FileManager.default
 
-        // 1. Create local directory if needed
+        // 1. Local directory. For localToRemote it is the source of truth: creating a
+        // missing one would hand the watcher an empty source, and the first sync would
+        // delete everything on the remote. So refuse instead. For remoteToLocal it is
+        // the destination, and creating it is correct.
         if !fileManager.fileExists(atPath: profile.localSyncPath) {
+            if profile.syncDirection == .localToRemote {
+                return "Local folder does not exist: \(profile.localSyncPath). "
+                    + "limpet will not create a source folder, because syncing an empty "
+                    + "source would delete everything on the remote."
+            }
             do {
                 try fileManager.createDirectory(
                     atPath: profile.localSyncPath, withIntermediateDirectories: true)
