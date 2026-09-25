@@ -99,7 +99,7 @@ struct MenuBarView: View {
                                     .foregroundColor(.red)
                             }
                             .buttonStyle(.plain)
-                            .help("Delete limit reached: sync stopped. Check the remote, then click to clear the limit and sync again")
+                            .help("Delete limit reached: sync stopped. Check the remote, then click to clear the limit and sync again. Each clear allows one more batch of deletions up to the limit")
                         }
 
                         // Settings button - opens profile settings

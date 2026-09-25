@@ -187,7 +187,11 @@ fatal error on delete: --max-delete threshold reached`. On 76 the watcher
 writes `profiles/{shortId}.delete-limit` and refuses every later run —
 including after a respawn, login or reinstall — while staying alive and idle.
 `limpet profile clear-delete-limit <name|shortId>` or the menu's red octagon
-button removes the marker and sends the watcher SIGUSR1. B2 is not limited
+button removes the marker and sends the watcher SIGUSR1. A clear is not a
+bypass: the next run still carries `--max-delete N`, so with more than N
+deletions pending it deletes N and trips again (measured live on S4
+2026-09-26 with N=2: draining the backlog after a trip took two clears).
+This is intended — each clear releases one batch. B2 is not limited
 (it hides instead of deleting); `limpet doctor` warns when a B2 bucket has no
 `daysFromHidingToDeleting` lifecycle rule. `maxDelete` is decided when the
 profile is INSTALLED; after changing a remote's provider (or the profile's
