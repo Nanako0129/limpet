@@ -97,8 +97,19 @@ enum SyncWatchDaemon {
             scheduleAfter: { seconds, action in
                 DispatchQueue.main.asyncAfter(deadline: .now() + seconds, execute: action)
             },
-            logSourceMissing: { appendSourceMissingLine(profile: profile) }
+            logSourceMissing: { appendProfileLogLine("Source missing: \(profile.localSyncPath)", profile: profile) },
+            refusalReason: { refusalReason(for: profile, profilesDirectory: SyncProfile.configDirectory) },
+            logRefusal: { appendProfileLogLine("Refusing to sync: \($0)", profile: profile) }
         )
+    }
+
+    /// F4/F6 gate the watcher asks before every run (limpet-plan.md L4). Re-reads
+    /// every profile file each time: a profile created or edited since this
+    /// watcher started must be seen. Not private so `ConfigSelfTest` drives the
+    /// exact production closure against a scratch profiles directory.
+    static func refusalReason(for profile: SyncProfile, profilesDirectory: String) -> String? {
+        profile.validationError ?? SyncProfile.overlapError(
+            profile, among: ProfileStore.profilesOnDisk(in: profilesDirectory))
     }
 
     /// Run the shared sync script as a child. stdout/stderr go to
@@ -121,14 +132,15 @@ enum SyncWatchDaemon {
         return process.terminationStatus
     }
 
-    /// Append the fixed `YYYY-MM-DD HH:MM:SS - Source missing: <path>` line to
-    /// the PROFILE log — the file `LogWatcher`/the GUI reads — never the
-    /// separate launchd stdout log, so a missing source is visible in the
-    /// same place every other sync outcome is (limpet-plan.md L3(a)).
-    private static func appendSourceMissingLine(profile: SyncProfile) {
+    /// Append a fixed `YYYY-MM-DD HH:MM:SS - <message>` line (e.g. `Source
+    /// missing: <path>`) to the PROFILE log — the file `LogWatcher`/the GUI
+    /// reads — never the separate launchd stdout log, so the watcher's own
+    /// outcomes are visible in the same place every sync outcome is
+    /// (limpet-plan.md L3(a)).
+    private static func appendProfileLogLine(_ message: String, profile: SyncProfile) {
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
-        let line = "\(formatter.string(from: Date())) - Source missing: \(profile.localSyncPath)\n"
+        let line = "\(formatter.string(from: Date())) - \(message)\n"
         guard let data = line.data(using: .utf8) else { return }
 
         let fm = FileManager.default

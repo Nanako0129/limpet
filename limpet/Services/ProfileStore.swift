@@ -155,6 +155,11 @@ final class ProfileStore: ObservableObject {
     /// same byte format the app does — the write counterpart to
     /// `profilesOnDisk(in:)`, keeping one source of truth for the on-disk shape.
     nonisolated static func writeProfileFile(_ profile: SyncProfile, in directory: String) -> String? {
+        // F4: a refused value is never written (limpet-plan.md L4).
+        if let error = profile.validationError {
+            print("Refusing to write profile \(profile.shortId): \(error)")
+            return nil
+        }
         let fm = FileManager.default
         guard (try? fm.createDirectory(
             atPath: directory, withIntermediateDirectories: true)) != nil else { return nil }
@@ -206,6 +211,9 @@ final class ProfileStore: ObservableObject {
     /// Add a new profile. Only the new profile's `.profile.json` is written
     /// (existing profiles' files are untouched — see `save(only:)`).
     func add(_ profile: SyncProfile) {
+        // F4: never held in memory either, or `save()` would put it in the
+        // UserDefaults blob mirror.
+        guard profile.validationError == nil else { return }
         profiles.append(profile)
         save(only: profile)
     }
@@ -213,7 +221,8 @@ final class ProfileStore: ObservableObject {
     /// Update an existing profile. Only the edited profile's `.profile.json`
     /// is written (existing profiles' files are untouched — see `save(only:)`).
     func update(_ profile: SyncProfile) {
-        guard let index = profiles.firstIndex(where: { $0.id == profile.id }) else {
+        guard profile.validationError == nil,
+              let index = profiles.firstIndex(where: { $0.id == profile.id }) else {
             return
         }
         profiles[index] = profile

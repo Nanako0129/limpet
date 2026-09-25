@@ -77,6 +77,11 @@ enum ConfigSelfTest {
             testTransfersChangeReinstalls,
             testTranslocatedAppRefused,
             testInstallRefusesNonOwnedShim,
+            testRemoteSpecRefusedAtDecodeAndWrite,
+            testRemoteSpecRefusedAtCLI,
+            testRefusedAtInstall,
+            testOverlapRefused,
+            testWatcherRefusesBeforeEveryRun,
         ]
 
         for check in checks {
@@ -566,6 +571,7 @@ enum ConfigSelfTest {
         let outcome = SyncManager.applyExternalCreateIfNeeded(
             decoded: profile,
             isKnownId: false,
+            existing: [],
             persist: { _ in persistCalls += 1 },
             install: { _ in installCalls += 1 }
         )
@@ -588,6 +594,7 @@ enum ConfigSelfTest {
             var installCalls = 0
             let outcome = SyncManager.applyExternalCreateIfNeeded(
                 decoded: profile, isKnownId: false,
+                existing: [],
                 persist: { _ in persistCalls += 1 },
                 install: { _ in installCalls += 1 }
             )
@@ -621,6 +628,7 @@ enum ConfigSelfTest {
         var installCalls = 0
         let outcome = SyncManager.applyExternalCreateIfNeeded(
             decoded: nil, isKnownId: false,
+            existing: [],
             persist: { _ in persistCalls += 1 },
             install: { _ in installCalls += 1 }
         )
@@ -665,6 +673,7 @@ enum ConfigSelfTest {
         let outcome = SyncManager.applyExternalCreateIfNeeded(
             decoded: profile,
             isKnownId: false,
+            existing: [],
             persist: { p in
                 let store = ProfileStore(
                     profilesDirectory: dir,
@@ -1268,7 +1277,9 @@ enum ConfigSelfTest {
             runChild: { completion in completion(exitCode()) },
             now: { clock.now },
             scheduleAfter: { seconds, action in clock.scheduleAfter(seconds, action) },
-            logSourceMissing: { onLogSourceMissing?() }
+            logSourceMissing: { onLogSourceMissing?() },
+            refusalReason: { nil },
+            logRefusal: { _ in }
         )
     }
 
@@ -1285,7 +1296,9 @@ enum ConfigSelfTest {
                 runChild: { completion in pendingCompletions.append(completion) },
                 now: { clock.now },
                 scheduleAfter: { s, a in clock.scheduleAfter(s, a) },
-                logSourceMissing: {}
+                logSourceMissing: {},
+                refusalReason: { nil },
+                logRefusal: { _ in }
             )
             let scheduler = SyncWatchScheduler(runner: runner)
             scheduler.trigger()  // run 1 starts, held open
@@ -1315,7 +1328,9 @@ enum ConfigSelfTest {
                 runChild: { completion in pendingCompletions.append(completion) },
                 now: { clock.now },
                 scheduleAfter: { s, a in clock.scheduleAfter(s, a) },
-                logSourceMissing: {}
+                logSourceMissing: {},
+                refusalReason: { nil },
+                logRefusal: { _ in }
             )
             let scheduler = SyncWatchScheduler(runner: runner)
             scheduler.trigger()
@@ -1344,7 +1359,9 @@ enum ConfigSelfTest {
                 runChild: { completion in pendingCompletions.append(completion) },
                 now: { clock.now },
                 scheduleAfter: { s, a in clock.scheduleAfter(s, a) },
-                logSourceMissing: {}
+                logSourceMissing: {},
+                refusalReason: { nil },
+                logRefusal: { _ in }
             )
             let scheduler = SyncWatchScheduler(runner: runner)
             scheduler.trigger()          // run 1 (e.g. FSEvents)
@@ -2086,6 +2103,299 @@ enum ConfigSelfTest {
         }
 
         return report("AC-W7", "install-refuses-nonowned-shim", true)
+    }
+
+    // MARK: - L4 validation fixtures (limpet-plan.md L4 F4/F6)
+
+    /// A connection string carrying a recognisable fake secret, so every
+    /// assertion below can also check the value never reached a file or output.
+    private static let connectionStringSecret = "SEKRET-connstr-7f3a"
+    private static var connectionStringRemote: String {
+        ":s3,access_key_id=AKID,secret_access_key=\(connectionStringSecret):bucket"
+    }
+    private static let translocatedExecutable =
+        "/private/tmp/AppTranslocation/ABCDEF12-3456/d/limpet.app/Contents/MacOS/limpet"
+
+    /// JSON for `profile` with `rcloneRemote` replaced — built from a dict so a
+    /// refused value can be written without going through the (refusing) encoder.
+    private static func profileJSON(_ profile: SyncProfile, rcloneRemote: String) -> String {
+        let dict: [String: Any] = [
+            "id": profile.id.uuidString, "name": profile.name, "rcloneRemote": rcloneRemote,
+            "remotePath": profile.remotePath, "localSyncPath": profile.localSyncPath, "isEnabled": true,
+        ]
+        let data = (try? JSONSerialization.data(withJSONObject: dict)) ?? Data()
+        return String(decoding: data, as: UTF8.self)
+    }
+
+    // MARK: - AC-L4-1 — refused remote specs never decode, never get written
+
+    private static func testRemoteSpecRefusedAtDecodeAndWrite() -> Bool {
+        let id = "AC-L4-1", slug = "remote-spec-refused-at-decode-and-write"
+        let base = sampleProfile()
+        for refused in [connectionStringRemote, ":local:", "myremote,x=y:", "a=b"] {
+            let json = profileJSON(base, rcloneRemote: refused)
+            if (try? JSONDecoder().decode(SyncProfile.self, from: Data(json.utf8))) != nil {
+                return report(id, slug, false, "(\(refused.debugDescription) decoded)")
+            }
+        }
+        for accepted in ["b2-home", "b2-home:", "limpet_test_s4"] {
+            let json = profileJSON(base, rcloneRemote: accepted)
+            guard (try? JSONDecoder().decode(SyncProfile.self, from: Data(json.utf8))) != nil else {
+                return report(id, slug, false, "(\(accepted.debugDescription) was refused)")
+            }
+        }
+
+        // Write seam: a profile built in memory (bypassing decode) is never written.
+        let dir = "\(selfTestRoot)/ac-l4-1"
+        try? FileManager.default.removeItem(atPath: dir)
+        var bad = base
+        bad.rcloneRemote = connectionStringRemote
+        guard ProfileStore.writeProfileFile(bad, in: dir) == nil,
+              !FileManager.default.fileExists(atPath: "\(dir)/\(bad.shortId).profile.json") else {
+            return report(id, slug, false, "(writeProfileFile wrote a connection-string profile)")
+        }
+        // The app's store keeps it out of memory too, so the blob mirror never gets it.
+        let defaults = UserDefaults(suiteName: "com.nanako.limpet.selftest.l4-1.\(UUID().uuidString)")!
+        let store = ProfileStore(profilesDirectory: dir, defaults: defaults)
+        store.add(bad)
+        let blob = defaults.data(forKey: ProfileStore.profilesKey).map { String(decoding: $0, as: UTF8.self) } ?? ""
+        guard store.profiles.isEmpty, !blob.contains(connectionStringSecret) else {
+            return report(id, slug, false, "(ProfileStore.add kept a connection-string profile)")
+        }
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L4-2 — CLI profile create / set refuse a connection string
+
+    private static func testRemoteSpecRefusedAtCLI() -> Bool {
+        let id = "AC-L4-2", slug = "remote-spec-refused-at-cli"
+        let existing = sampleProfile(name: "Existing")
+        var output = "", wrote = false, installed = false
+        let env = fakeCLIEnvironment(
+            readProfiles: { [existing] },
+            writeProfile: { _ in wrote = true; return true },
+            installProfile: { _ in installed = true; return nil },
+            readStdin: { profileJSON(sampleProfile(name: "New"), rcloneRemote: connectionStringRemote) },
+            stdout: { output += $0 },
+            stderr: { output += $0 }
+        )
+        guard LimpetCLI.execute(["profile", "create", "-"], env: env) == 65, !wrote, !installed else {
+            return report(id, slug, false, "(profile create accepted a connection string)")
+        }
+        guard LimpetCLI.execute(["profile", "set", existing.shortId, "rcloneRemote", connectionStringRemote], env: env) == 65,
+              !wrote, !installed else {
+            return report(id, slug, false, "(profile set accepted a connection string)")
+        }
+        guard !output.contains(connectionStringSecret) else {
+            return report(id, slug, false, "(the refused value was echoed to stdout/stderr)")
+        }
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L4-3 — install and a reconcile-driven reinstall refuse before any side effect
+
+    /// `install` is called with a TRANSLOCATED executable path on purpose: F4/F6
+    /// run before the translocation guard, so a passing run throws
+    /// `.refusedProfile`, and a regression throws `.translocatedApp` instead —
+    /// either way nothing real under ~/.local or ~/Library is ever written.
+    private static func testRefusedAtInstall() -> Bool {
+        let id = "AC-L4-3", slug = "refused-at-install"
+        func installError(_ profile: SyncProfile, others: [SyncProfile]) -> Error? {
+            do {
+                try SyncSetupService.shared.install(
+                    profile: profile, loadAgent: false,
+                    executablePath: translocatedExecutable, otherProfiles: others)
+                return nil
+            } catch { return error }
+        }
+        func isRefusal(_ error: Error?) -> Bool {
+            if case .refusedProfile? = error as? SyncSetupService.SetupError { return true }
+            return false
+        }
+        var bad = sampleProfile()
+        bad.rcloneRemote = connectionStringRemote
+        let badError = installError(bad, others: [])
+        guard isRefusal(badError), !"\(badError!)".contains(connectionStringSecret) else {
+            return report(id, slug, false, "(install did not refuse a connection string: \(String(describing: badError)))")
+        }
+        let first = sampleProfile(name: "First")
+        var nested = sampleProfile(name: "Nested")
+        nested.remotePath = first.remotePath + "/inner"
+        guard isRefusal(installError(nested, others: [first])) else {
+            return report(id, slug, false, "(install did not refuse an overlapping profile)")
+        }
+
+        // Reconcile-driven reinstall: `limpet reinstall` routes uninstall → install;
+        // the install step is the real one, so the refusal surfaces as a failed reinstall.
+        var reinstallErr = ""
+        let env = fakeCLIEnvironment(
+            readProfiles: { [bad] },
+            installProfile: { profile in
+                installError(profile, others: []).map { "\($0)" }
+            },
+            stderr: { reinstallErr += $0 }
+        )
+        guard LimpetCLI.execute(["reinstall", bad.shortId], env: env) == 1,
+              reinstallErr.contains("refusedProfile") else {
+            return report(id, slug, false, "(reinstall of a connection-string profile was not refused: \(reinstallErr))")
+        }
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L4-4 — overlapping remote paths refused at create, set and file drop
+
+    private static func testOverlapRefused() -> Bool {
+        let id = "AC-L4-4", slug = "overlap-refused"
+        let first = sampleProfile(name: "First")  // selftest-fixture-remote: / SelfTest
+
+        // The pure rule: equal, nested (either way), trailing/double slashes and
+        // remote-name case all overlap; a sibling prefix or another remote does not.
+        func overlaps(remote: String, path: String) -> Bool {
+            var other = sampleProfile(name: "Other")
+            other.rcloneRemote = remote
+            other.remotePath = path
+            return SyncProfile.overlapError(other, among: [first]) != nil
+        }
+        let expectOverlap = [("selftest-fixture-remote:", "SelfTest"), ("selftest-fixture-remote", "SelfTest/"),
+                             ("SELFTEST-fixture-remote:", "SelfTest//a"), ("selftest-fixture-remote:", "")]
+        for (remote, path) in expectOverlap where !overlaps(remote: remote, path: path) {
+            return report(id, slug, false, "(\(remote)\(path) was not seen as overlapping)")
+        }
+        for (remote, path) in [("selftest-fixture-remote:", "SelfTest2"), ("other-remote:", "SelfTest")]
+        where overlaps(remote: remote, path: path) {
+            return report(id, slug, false, "(\(remote)\(path) was wrongly seen as overlapping)")
+        }
+        guard SyncProfile.overlapError(first, among: [first]) == nil else {
+            return report(id, slug, false, "(a profile overlapped with itself)")
+        }
+
+        // CLI create.
+        var wrote = false, installed = false
+        var nested = sampleProfile(name: "Nested")
+        nested.remotePath = "SelfTest/inner"
+        guard let nestedJSON = try? JSONEncoder().encode(nested) else {
+            return report(id, slug, false, "(could not encode fixture)")
+        }
+        let createEnv = fakeCLIEnvironment(
+            readProfiles: { [first] },
+            writeProfile: { _ in wrote = true; return true },
+            installProfile: { _ in installed = true; return nil },
+            readStdin: { String(decoding: nestedJSON, as: UTF8.self) }
+        )
+        guard LimpetCLI.execute(["profile", "create", "-"], env: createEnv) == 65, !wrote, !installed else {
+            return report(id, slug, false, "(profile create accepted an overlapping profile)")
+        }
+
+        // CLI profile set: moving a disjoint profile under the first one.
+        var disjoint = sampleProfile(name: "Disjoint")
+        disjoint.remotePath = "Elsewhere"
+        let setEnv = fakeCLIEnvironment(
+            readProfiles: { [first, disjoint] },
+            writeProfile: { _ in wrote = true; return true },
+            installProfile: { _ in installed = true; return nil },
+            uninstallProfile: { _ in installed = true; return nil }
+        )
+        guard LimpetCLI.execute(["profile", "set", disjoint.shortId, "remotePath", "SelfTest/moved"], env: setEnv) == 65,
+              !wrote, !installed else {
+            return report(id, slug, false, "(profile set accepted an overlapping remotePath)")
+        }
+
+        // File drop.
+        var persisted = 0, dropInstalled = 0
+        let outcome = SyncManager.applyExternalCreateIfNeeded(
+            decoded: nested, isKnownId: false, existing: [first],
+            persist: { _ in persisted += 1 }, install: { _ in dropInstalled += 1 })
+        guard outcome == .refusedOverlap, persisted == 0, dropInstalled == 0 else {
+            return report(id, slug, false, "(file drop: \(outcome), persist=\(persisted) install=\(dropInstalled))")
+        }
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L4-5 — the watcher refuses before every run (catch-up, trigger, SIGUSR1, retry)
+
+    /// Drives `SyncWatchScheduler` with the PRODUCTION refusal closure
+    /// (`SyncWatchDaemon.refusalReason`) over a scratch profiles directory: the
+    /// overlapping profile file appears only after a first, allowed run, so the
+    /// gate must be re-evaluated per attempt, not once at start.
+    private static func testWatcherRefusesBeforeEveryRun() -> Bool {
+        let id = "AC-L4-5", slug = "watcher-refuses-before-every-run"
+        let dir = "\(selfTestRoot)/ac-l4-5-profiles"
+        try? FileManager.default.removeItem(atPath: dir)
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let mine = sampleProfile(name: "Mine")
+
+        var childRuns = 0, refusalLogs = 0, exitCode: Int32 = 75
+        let clock = VirtualClock()
+        let runner = SchedulerRunner(
+            sourceExists: { true },
+            runChild: { completion in childRuns += 1; completion(exitCode) },
+            now: { clock.now },
+            scheduleAfter: { s, a in clock.scheduleAfter(s, a) },
+            logSourceMissing: {},
+            refusalReason: { SyncWatchDaemon.refusalReason(for: mine, profilesDirectory: dir) },
+            logRefusal: { _ in refusalLogs += 1 }
+        )
+        let scheduler = SyncWatchScheduler(runner: runner)
+        scheduler.trigger()  // catch-up: allowed, exits 75 → backoff
+        guard childRuns == 1 else {
+            return report(id, slug, false, "(catch-up run did not start: \(childRuns))")
+        }
+        // Another profile on the same remote path appears on disk.
+        var twin = sampleProfile(name: "Twin")
+        twin.remotePath = mine.remotePath
+        guard ProfileStore.writeProfileFile(twin, in: dir) != nil else {
+            return report(id, slug, false, "(fixture write failed)")
+        }
+        exitCode = 0
+        clock.advance(by: 11)          // post-backoff retry
+        scheduler.trigger()            // FSEvents / periodic
+        scheduler.trigger()            // SIGUSR1 goes through the same trigger()
+        clock.advance(by: 60)
+        guard childRuns == 1, refusalLogs >= 1, scheduler.state == .idle else {
+            return report(id, slug, false, "(overlap: childRuns=\(childRuns) logs=\(refusalLogs) state=\(scheduler.state))")
+        }
+
+        // A refused field value (built in memory; decode would never produce it).
+        var bad = sampleProfile(name: "Bad")
+        bad.rcloneRemote = connectionStringRemote
+        var badRuns = 0
+        let badScheduler = SyncWatchScheduler(runner: SchedulerRunner(
+            sourceExists: { true },
+            runChild: { completion in badRuns += 1; completion(0) },
+            now: { clock.now },
+            scheduleAfter: { s, a in clock.scheduleAfter(s, a) },
+            logSourceMissing: {},
+            refusalReason: { SyncWatchDaemon.refusalReason(for: bad, profilesDirectory: "\(dir)-empty") },
+            logRefusal: { _ in }
+        ))
+        badScheduler.trigger()
+        badScheduler.trigger()
+        guard badRuns == 0 else {
+            return report(id, slug, false, "(connection-string profile ran \(badRuns) time(s))")
+        }
+
+        // Regression: a pending rerun that finds the source gone must leave the
+        // scheduler idle, so the next trigger (source back) runs again.
+        var present = true, pendingCompletion: ((Int32) -> Void)?, runs = 0
+        let stuckScheduler = SyncWatchScheduler(runner: SchedulerRunner(
+            sourceExists: { present },
+            runChild: { completion in runs += 1; pendingCompletion = completion },
+            now: { clock.now },
+            scheduleAfter: { s, a in clock.scheduleAfter(s, a) },
+            logSourceMissing: {},
+            refusalReason: { nil },
+            logRefusal: { _ in }
+        ))
+        stuckScheduler.trigger()
+        stuckScheduler.trigger()       // pending
+        present = false
+        pendingCompletion?(0)          // pending rerun finds no source
+        present = true
+        stuckScheduler.trigger()
+        guard runs == 2 else {
+            return report(id, slug, false, "(scheduler stuck after a missing-source rerun: runs=\(runs), state=\(stuckScheduler.state))")
+        }
+        return report(id, slug, true)
     }
 
 }

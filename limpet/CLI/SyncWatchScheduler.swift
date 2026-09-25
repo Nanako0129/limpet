@@ -25,6 +25,14 @@ struct SchedulerRunner {
     /// throttled to at most once per `missingSourceRecheckInterval` by the
     /// scheduler, so this closure just needs to append the log line.
     var logSourceMissing: () -> Void
+    /// Why this profile must not run right now (F4 refused value, F6 overlap
+    /// with another profile on disk — limpet-plan.md L4), or `nil`. Asked
+    /// before EVERY run attempt: catch-up, trigger, SIGUSR1 and post-backoff
+    /// retry all go through the same gate, and production re-reads every
+    /// profile file each time.
+    var refusalReason: () -> String?
+    /// Log a refusal; throttled like `logSourceMissing`.
+    var logRefusal: (String) -> Void
 }
 
 /// Pure idle/running/(running+pending) scheduler for one profile's realtime
@@ -61,6 +69,7 @@ final class SyncWatchScheduler {
     private let backoffInterval: TimeInterval
     private let missingSourceRecheckInterval: TimeInterval
     private var lastMissingSourceLogAt: TimeInterval?
+    private var lastRefusalLogAt: TimeInterval?
 
     init(
         runner: SchedulerRunner,
@@ -78,7 +87,7 @@ final class SyncWatchScheduler {
     func trigger() {
         switch state {
         case .idle:
-            startRun()
+            attemptRun(pending: false)
         case .running:
             state = .running(pending: true)
         case .backoff:
@@ -86,12 +95,23 @@ final class SyncWatchScheduler {
         }
     }
 
-    private func startRun() {
-        guard runner.sourceExists() else {
-            maybeLogSourceMissing()
-            return  // stays .idle — no run, per limpet-plan.md L3(a).
+    /// The single place a run starts — from idle, from a pending rerun, and
+    /// after a lock-held backoff — so every gate applies to every path. A
+    /// refused or missing-source attempt leaves the scheduler `.idle` (a
+    /// pending rerun that hits a missing source used to leave it stuck in
+    /// `.running`, swallowing every later trigger).
+    private func attemptRun(pending: Bool) {
+        if let reason = runner.refusalReason() {
+            if throttle(&lastRefusalLogAt) { runner.logRefusal(reason) }
+            state = .idle
+            return
         }
-        state = .running(pending: false)
+        guard runner.sourceExists() else {
+            if throttle(&lastMissingSourceLogAt) { runner.logSourceMissing() }
+            state = .idle  // no run, per limpet-plan.md L3(a).
+            return
+        }
+        state = .running(pending: pending)
         runCount += 1
         runner.runChild { [weak self] code in
             self?.handleExit(code: code)
@@ -113,23 +133,14 @@ final class SyncWatchScheduler {
         // from a non-75 failure: either way, a pending trigger earns exactly
         // one rerun, otherwise the profile goes idle.
         if currentPending() {
-            startRun()
+            attemptRun(pending: false)
         } else {
             state = .idle
         }
     }
 
     private func retryAfterBackoff() {
-        guard runner.sourceExists() else {
-            maybeLogSourceMissing()
-            state = .idle
-            return
-        }
-        state = .running(pending: currentPending())
-        runCount += 1
-        runner.runChild { [weak self] code in
-            self?.handleExit(code: code)
-        }
+        attemptRun(pending: currentPending())
     }
 
     private func currentPending() -> Bool {
@@ -140,10 +151,11 @@ final class SyncWatchScheduler {
         }
     }
 
-    private func maybeLogSourceMissing() {
+    /// At most one log line per `missingSourceRecheckInterval` per kind.
+    private func throttle(_ lastLogAt: inout TimeInterval?) -> Bool {
         let now = runner.now()
-        if let last = lastMissingSourceLogAt, now - last < missingSourceRecheckInterval { return }
-        lastMissingSourceLogAt = now
-        runner.logSourceMissing()
+        if let last = lastLogAt, now - last < missingSourceRecheckInterval { return false }
+        lastLogAt = now
+        return true
     }
 }

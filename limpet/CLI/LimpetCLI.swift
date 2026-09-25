@@ -680,6 +680,11 @@ enum LimpetCLI {
             env.stderr("error: profile \(profile.shortId) already exists; edit its file or use 'profile enable/disable'\n")
             return 1
         }
+        // F6: decode already refused F4 values; overlap needs the other profiles.
+        if let reason = SyncProfile.overlapError(profile, among: existing) {
+            env.stderr("error: \(reason)\n")
+            return 65
+        }
 
         guard env.writeProfile(profile) else {
             env.stderr("error: failed to write profile file\n")
@@ -801,7 +806,8 @@ enum LimpetCLI {
     /// `error:` and rewrites NOTHING (all assignments are validated against a copy
     /// before any write).
     private static func runProfileSet(_ target: String, assignments: [ProfileAssignment], env: CLIEnvironment) -> Int32 {
-        guard let original = resolveProfile(target, in: env.readProfiles()) else {
+        let all = env.readProfiles()
+        guard let original = resolveProfile(target, in: all) else {
             env.stderr("error: no profile matches \"\(target)\"\n")
             return 1
         }
@@ -813,6 +819,11 @@ enum LimpetCLI {
                 env.stderr("error: \(err)\n")
                 return 65  // EX_DATAERR
             }
+        }
+        // F4/F6 on the result as a whole: the overlap depends on remote and path together.
+        if let reason = updated.validationError ?? SyncProfile.overlapError(updated, among: all) {
+            env.stderr("error: \(reason)\n")
+            return 65
         }
 
         guard updated != original else {

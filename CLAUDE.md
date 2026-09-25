@@ -132,6 +132,18 @@ The profile files are also credential-free: rclone remotes and secrets live in
 `~/.config/rclone/rclone.conf`, never here, so a malicious drop can schedule an
 agent but can't exfiltrate or forge credentials through this path.
 
+**Refused values (limpet-plan.md L4 F4/F6).** An `rcloneRemote` that starts
+with `:` (an on-the-fly backend) or contains `,` or `=` (a connection string)
+can carry a credential in plain text, so it is refused by the decoder, by every
+profile write (`ProfileStore.writeProfileFile`/`add`/`update`), by
+`SyncSetupService.install` and by the watcher before every run — a dropped
+file carrying one simply does not load. Two profiles whose remote paths on the
+same remote are equal or nested (`SyncProfile.overlapError`) are refused at
+`profile create`/`profile set` (exit 65), file-drop create
+(`applyExternalCreateIfNeeded` → `.refusedOverlap`), `install`, and by the
+watcher, which re-reads every profile file before each run and logs
+`Refusing to sync: …` into the profile log instead of running.
+
 **Self-write suppression.** `ConfigSelfWriteRegistry` tracks the content hash
 of every file limpet itself writes; `ConfigFileWatcher.shouldReconcile`
 drops an FSEvent whose file content hash matches a just-noted self-write, so

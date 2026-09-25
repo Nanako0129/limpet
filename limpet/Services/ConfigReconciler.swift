@@ -25,6 +25,9 @@ enum ExternalCreateOutcome: Equatable {
     /// Not a create: decode failed upstream, or the id was already known (the
     /// caller's existing edit path handles that case instead).
     case ignored
+    /// A create that would sync an equal or nested remote path of an existing
+    /// profile (F6, limpet-plan.md L4): neither persisted nor installed.
+    case refusedOverlap
 }
 
 extension SyncManager {
@@ -39,13 +42,21 @@ extension SyncManager {
     /// - decoded, unknown id, `isEnabled && isValid` → `persist` then
     ///   `install`, exactly once each → `.createdAndInstalled`.
     /// - decoded, unknown id, otherwise → `persist` only → `.createdOnly`.
+    /// - decoded, unknown id, remote path equal to or nested with one of
+    ///   `existing` → neither → `.refusedOverlap` (F6).
     static func applyExternalCreateIfNeeded(
         decoded: SyncProfile?,
         isKnownId: Bool,
+        existing: [SyncProfile],
         persist: (SyncProfile) -> Void,
         install: (SyncProfile) -> Void
     ) -> ExternalCreateOutcome {
         guard let profile = decoded, !isKnownId else { return .ignored }
+
+        if let reason = SyncProfile.overlapError(profile, among: existing) {
+            print("Refusing to create profile \(profile.shortId) from a dropped file: \(reason)")
+            return .refusedOverlap
+        }
 
         persist(profile)
 

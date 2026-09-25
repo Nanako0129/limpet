@@ -107,11 +107,23 @@ final class SyncSetupService {
     ///   - executablePath: The running app's own executable path. Overridable so
     ///     `ConfigSelfTest` can exercise the translocation guard without a real
     ///     translocated launch; the app never needs to pass this itself.
+    ///   - otherProfiles: every profile on disk, read fresh per install, for the
+    ///     F6 overlap refusal. Overridable for `ConfigSelfTest`.
     func install(
         profile: SyncProfile,
         loadAgent: Bool = true,
-        executablePath: String = Bundle.main.executablePath ?? ""
+        executablePath: String = Bundle.main.executablePath ?? "",
+        otherProfiles: [SyncProfile] = ProfileStore.profilesOnDisk(in: SyncProfile.configDirectory)
     ) throws {
+        // F4/F6 (limpet-plan.md L4) come FIRST, before anything is written. The
+        // self-test relies on this order: it calls install with a refused profile
+        // AND a translocated executable path, so if this check ever went missing
+        // the translocation guard below still stops install before it touches a
+        // real file, and the test sees the wrong error instead of side effects.
+        if let reason = profile.validationError ?? SyncProfile.overlapError(profile, among: otherProfiles) {
+            throw SetupError.refusedProfile(reason)
+        }
+
         // Refuse a translocated launch outright — see `CLIShimInstaller.isTranslocated`.
         // AppTranslocation is a randomized, non-persistent Gatekeeper mount; an agent
         // whose shim was refreshed from it would work until the mount disappears.
@@ -743,6 +755,7 @@ final class SyncSetupService {
         case translocatedApp
         case shimNotOwned
         case shimInstallFailed
+        case refusedProfile(String)
 
         var errorDescription: String? {
             switch self {
@@ -765,6 +778,8 @@ final class SyncSetupService {
                     + "won't be overwritten. Move or remove that file, then try again."
             case .shimInstallFailed:
                 return "Failed to write the limpet CLI shim at ~/.local/bin/limpet"
+            case .refusedProfile(let reason):
+                return "Refusing to install: \(reason)"
             }
         }
     }

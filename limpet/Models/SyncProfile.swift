@@ -86,6 +86,48 @@ struct SyncProfile: Identifiable, Codable, Equatable {
         !name.isEmpty && !rcloneRemote.isEmpty && !remotePath.isEmpty && !localSyncPath.isEmpty
     }
 
+    /// F4 (limpet-plan.md L4): an rclone remote spec starting with `:` is an
+    /// on-the-fly backend, and a `,` or `=` is a connection-string parameter.
+    /// Either can carry a credential in plain text, so neither may ever land
+    /// in profile JSON, a derived config or a log. The message never echoes
+    /// the value, since the value may be exactly that credential.
+    static func remoteSpecError(_ remote: String) -> String? {
+        guard remote.hasPrefix(":") || remote.contains(",") || remote.contains("=") else { return nil }
+        return "rcloneRemote must name a configured rclone remote; on-the-fly backends (leading ':') "
+            + "and connection strings (',' or '=') are refused because they can carry credentials in plain text"
+    }
+
+    /// Field-level refusal shared by every seam a profile crosses: decode,
+    /// every profile write, `SyncSetupService.install` and the watcher before
+    /// each run. `nil` means acceptable.
+    var validationError: String? {
+        Self.remoteSpecError(rcloneRemote)
+    }
+
+    /// F6 (limpet-plan.md L4): two profiles syncing equal or nested paths on
+    /// the same remote delete each other's files (each one's `rclone sync`
+    /// removes what only the other one uploaded). Remote names compare
+    /// case-insensitively (a false match only refuses, it never deletes);
+    /// paths compare by `/`-separated components, so `a/b`, `a/b/` and `a//b`
+    /// are the same path and `a/bc` does not nest under `a/b`.
+    static func overlapError(_ profile: SyncProfile, among others: [SyncProfile]) -> String? {
+        let mine = profile.remoteLocation
+        for other in others where other.id != profile.id {
+            let theirs = other.remoteLocation
+            guard mine.remote == theirs.remote,
+                  mine.components.starts(with: theirs.components)
+                    || theirs.components.starts(with: mine.components) else { continue }
+            return "remote path \(profile.fullRemotePath) overlaps profile \"\(other.name)\" (\(other.shortId)) "
+                + "at \(other.fullRemotePath); two syncs on equal or nested remote paths delete each other's files"
+        }
+        return nil
+    }
+
+    private var remoteLocation: (remote: String, components: [Substring]) {
+        let name = rcloneRemote.hasSuffix(":") ? String(rcloneRemote.dropLast()) : rcloneRemote
+        return (name.lowercased(), remotePath.split(separator: "/"))
+    }
+
     // MARK: - Local Directory Inspection
 
     /// Counts items in a local directory that a user would recognise as "their files",
@@ -173,6 +215,13 @@ extension SyncProfile {
         syncDirection = try container.decodeIfPresent(SyncDirection.self, forKey: .syncDirection) ?? .localToRemote
         // Backwards compatibility: default to 16 if not present.
         transfers = try container.decodeIfPresent(Int.self, forKey: .transfers) ?? 16
+
+        // F4: a refused value never becomes a SyncProfile, so it can never be
+        // written back out, installed, or run by a watcher.
+        if let error = validationError {
+            throw DecodingError.dataCorrupted(
+                DecodingError.Context(codingPath: [], debugDescription: error))
+        }
     }
 }
 

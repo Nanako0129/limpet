@@ -374,6 +374,7 @@ final class SyncManager: ObservableObject {
         let outcome = Self.applyExternalCreateIfNeeded(
             decoded: decoded,
             isKnownId: false,
+            existing: profileStore.profiles,
             persist: { [weak self] profile in
                 self?.profileStore.add(profile)
                 self?.clearError(for: profile.id)
@@ -394,7 +395,7 @@ final class SyncManager: ObservableObject {
             }
         )
 
-        guard outcome != .ignored else { return }
+        guard outcome != .ignored, outcome != .refusedOverlap else { return }
 
         updateAggregateState()
     }
