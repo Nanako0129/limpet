@@ -399,6 +399,28 @@ final class SyncSetupService {
                 exit 1
             fi
 
+            # additionalFlags is whitespace-separated and passed to rclone as literal
+            # argv elements (documented in CLAUDE.md and the profile schema) — never
+            # re-parsed as shell syntax, so there is no quoting or expansion left for
+            # a flag to use. A quoted flag like `--exclude "*.tmp"` would otherwise
+            # reach rclone as the single literal token `"*.tmp"` (quotes included),
+            # which matches nothing and silently starts syncing files meant to be
+            # excluded; `--log-file ~/x.log` would create a directory literally named
+            # `~`. Refuse instead of doing either silently: a quote, $, backtick, or
+            # a token starting with ~ exits 64 before rclone is ever invoked. Write
+            # flags as --flag=value, e.g. --exclude=*.tmp.
+            if [[ -n "$ADDITIONAL_FLAGS" ]]; then
+                read -r -a ADDITIONAL_FLAGS_ARRAY <<< "$ADDITIONAL_FLAGS"
+            else
+                ADDITIONAL_FLAGS_ARRAY=()
+            fi
+            for flag_token in "${ADDITIONAL_FLAGS_ARRAY[@]}"; do
+                if [[ "$flag_token" == *'"'* || "$flag_token" == *"'"* || "$flag_token" == *'`'* || "$flag_token" == *'$'* || "$flag_token" == '~'* ]]; then
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') - Refusing to sync: additionalRcloneFlags contains quotes, dollar signs, backticks or ~, which limpet passes to rclone literally. Write flags as --flag=value without quotes, e.g. --exclude=*.tmp" >> "$LOG_FILE"
+                    exit 64
+                fi
+            done
+
             # Find rclone binary. Cover the common package-manager locations,
             # including nix-darwin's system and per-user profiles which live outside
             # Homebrew's dirs (issue #53). $USER can be unset under launchd, so derive
@@ -517,14 +539,10 @@ final class SyncSetupService {
                 cmd+=("$NO_CHECK_CERT")
             fi
 
-            # additionalFlags is whitespace-separated (documented in the profile
-            # schema/CLAUDE.md); each token becomes its own argv element via word
-            # splitting, never re-parsed as shell syntax, so a flag VALUE cannot
-            # contain a space and quotes/backticks/$ in it are passed through
-            # literally to rclone instead of being expanded.
-            if [[ -n "$ADDITIONAL_FLAGS" ]]; then
-                read -r -a additional_flags_array <<< "$ADDITIONAL_FLAGS"
-                cmd+=("${additional_flags_array[@]}")
+            # additionalFlags was already validated and split into
+            # ADDITIONAL_FLAGS_ARRAY above; append its tokens as-is.
+            if [[ ${#ADDITIONAL_FLAGS_ARRAY[@]} -gt 0 ]]; then
+                cmd+=("${ADDITIONAL_FLAGS_ARRAY[@]}")
             fi
 
             # Run sync command

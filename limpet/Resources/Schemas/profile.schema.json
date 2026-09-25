@@ -41,7 +41,7 @@
     },
     "additionalRcloneFlags": {
       "type": "string",
-      "description": "Extra flags appended to the rclone command. Whitespace-separated (split on IFS, not shell-parsed); a flag's value cannot contain a space."
+      "description": "Extra flags appended to the rclone command. Whitespace-separated (split on IFS, not shell-parsed) and passed to rclone as literal argv elements, so write them as --flag=value (e.g. --exclude=*.tmp --bwlimit=5M): no shell quoting or expansion, a flag's value cannot contain a space, and a quote, $, backtick, or a token starting with ~ is refused (sync exits 64) rather than passed through."
     },
     "isEnabled": {
       "type": "boolean",

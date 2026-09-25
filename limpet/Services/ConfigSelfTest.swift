@@ -67,6 +67,8 @@ enum ConfigSelfTest {
             testGeneratedScriptNoEval,
             testGeneratedScriptRunsWithoutExpandingConfigValues,
             testGeneratedScriptPropagatesRcloneExitCode,
+            testGeneratedScriptRefusesQuotedAdditionalFlags,
+            testGeneratedScriptAcceptsFlagEqualsValueForm,
             testGeneratedPlistShape,
             testMissingSourceIsNotCreated,
             testShimQuotesHostilePath,
@@ -1621,6 +1623,194 @@ enum ConfigSelfTest {
                           "(expected exit 7, got \(process.terminationStatus): \(stderr))")
         }
         return report("AC-W11", "watch-script-exit-code", true)
+    }
+
+    // MARK: - AC-W12 — a quoted/hostile additionalRcloneFlags is refused, not passed through
+
+    /// Regression found by /code-review on the array-based rebuild: `read -r -a`
+    /// passes quotes, `$` and `~` in additionalFlags to rclone LITERALLY, where the
+    /// old `eval` form used to interpret them — so `--exclude "*.tmp"` used to reach
+    /// rclone as the two shell-parsed tokens `--exclude` and `*.tmp`, but now arrives
+    /// as `--exclude` and the single literal token `"*.tmp"` (quotes included),
+    /// which matches nothing and silently starts syncing files meant to be excluded.
+    /// The script now refuses (exit 64) before ever invoking rclone whenever a
+    /// token contains a quote, backtick, `$`, or starts with `~`.
+    private static func testGeneratedScriptRefusesQuotedAdditionalFlags() -> Bool {
+        let fm = FileManager.default
+        let root = (selfTestRoot as NSString).appendingPathComponent("ac-w12-refuse-flags")
+        try? fm.removeItem(atPath: root)
+        try? fm.createDirectory(atPath: root, withIntermediateDirectories: true)
+
+        let localPath = (root as NSString).appendingPathComponent("source")
+        do {
+            try fm.createDirectory(atPath: localPath, withIntermediateDirectories: true)
+        } catch {
+            return report("AC-W12", "watch-script-refuses-quoted-flags", false, "(fixture setup failed: \(error))")
+        }
+
+        let scriptPath = (root as NSString).appendingPathComponent("limpet-sync.sh")
+        let configPath = (root as NSString).appendingPathComponent("profile.json")
+        let filterPath = (root as NSString).appendingPathComponent("exclude.txt")
+        let logPath = (root as NSString).appendingPathComponent("sync.log")
+        let lockPath = (root as NSString).appendingPathComponent("sync.lock")
+        let rcloneStubPath = (root as NSString).appendingPathComponent("rclone-stub.sh")
+        let argvPath = (root as NSString).appendingPathComponent("recorded-argv.txt")
+
+        let script = SyncSetupService.shared.generateSyncScript()
+        let config: [String: Any] = [
+            "remote": "selftest-fixture-remote:SelfTest",
+            "localPath": localPath,
+            "logPath": logPath,
+            "lockFile": lockPath,
+            "drivePath": "",
+            "additionalFlags": "--exclude \"*.tmp\"",
+            "filterPath": filterPath,
+            "syncDirection": "localToRemote",
+            "remotePath": "SelfTest",
+            "transfers": 4,
+        ]
+        let rcloneStub = """
+            #!/bin/sh
+            for arg in "$@"; do
+                printf '%s\\n' "$arg"
+            done > "\(argvPath)"
+            exit 0
+            """
+
+        do {
+            try "".write(toFile: filterPath, atomically: true, encoding: .utf8)
+            try script.write(toFile: scriptPath, atomically: true, encoding: .utf8)
+            try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: scriptPath)
+            let configData = try JSONSerialization.data(withJSONObject: config)
+            try configData.write(to: URL(fileURLWithPath: configPath))
+            try rcloneStub.write(toFile: rcloneStubPath, atomically: true, encoding: .utf8)
+            try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: rcloneStubPath)
+        } catch {
+            return report("AC-W12", "watch-script-refuses-quoted-flags", false, "(fixture setup failed: \(error))")
+        }
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/bash")
+        process.arguments = [scriptPath, configPath]
+        var env = ProcessInfo.processInfo.environment
+        env["RCLONE_BIN"] = rcloneStubPath
+        process.environment = env
+        let stderrPipe = Pipe()
+        process.standardError = stderrPipe
+        do {
+            try process.run()
+        } catch {
+            return report("AC-W12", "watch-script-refuses-quoted-flags", false, "(could not run script: \(error))")
+        }
+        process.waitUntilExit()
+        let stderr = String(data: stderrPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+
+        guard process.terminationStatus == 64 else {
+            return report("AC-W12", "watch-script-refuses-quoted-flags", false,
+                          "(expected exit 64, got \(process.terminationStatus): \(stderr))")
+        }
+        guard !fm.fileExists(atPath: argvPath) else {
+            return report("AC-W12", "watch-script-refuses-quoted-flags", false, "(rclone stub was invoked)")
+        }
+        guard let logText = try? String(contentsOfFile: logPath, encoding: .utf8),
+              logText.contains("Refusing to sync") else {
+            return report("AC-W12", "watch-script-refuses-quoted-flags", false, "(no refusal line in the log)")
+        }
+        return report("AC-W12", "watch-script-refuses-quoted-flags", true)
+    }
+
+    // MARK: - AC-W13 — a well-formed --flag=value additionalRcloneFlags still works
+
+    /// Positive counterpart to AC-W12: flags written the documented way
+    /// (`--flag=value`, no quotes/spaces inside a value) must still reach rclone,
+    /// unmodified, as their own argv elements.
+    private static func testGeneratedScriptAcceptsFlagEqualsValueForm() -> Bool {
+        let fm = FileManager.default
+        let root = (selfTestRoot as NSString).appendingPathComponent("ac-w13-flag-equals-value")
+        try? fm.removeItem(atPath: root)
+        try? fm.createDirectory(atPath: root, withIntermediateDirectories: true)
+
+        let localPath = (root as NSString).appendingPathComponent("source")
+        do {
+            try fm.createDirectory(atPath: localPath, withIntermediateDirectories: true)
+        } catch {
+            return report("AC-W13", "watch-script-accepts-flag-equals-value", false, "(fixture setup failed: \(error))")
+        }
+
+        let scriptPath = (root as NSString).appendingPathComponent("limpet-sync.sh")
+        let configPath = (root as NSString).appendingPathComponent("profile.json")
+        let filterPath = (root as NSString).appendingPathComponent("exclude.txt")
+        let logPath = (root as NSString).appendingPathComponent("sync.log")
+        let lockPath = (root as NSString).appendingPathComponent("sync.lock")
+        let rcloneStubPath = (root as NSString).appendingPathComponent("rclone-stub.sh")
+        let argvPath = (root as NSString).appendingPathComponent("recorded-argv.txt")
+
+        let script = SyncSetupService.shared.generateSyncScript()
+        let config: [String: Any] = [
+            "remote": "selftest-fixture-remote:SelfTest",
+            "localPath": localPath,
+            "logPath": logPath,
+            "lockFile": lockPath,
+            "drivePath": "",
+            "additionalFlags": "--exclude=*.tmp --bwlimit=5M",
+            "filterPath": filterPath,
+            "syncDirection": "localToRemote",
+            "remotePath": "SelfTest",
+            "transfers": 4,
+        ]
+        let rcloneStub = """
+            #!/bin/sh
+            for arg in "$@"; do
+                printf '%s\\n' "$arg"
+            done > "\(argvPath)"
+            exit 0
+            """
+
+        do {
+            try "".write(toFile: filterPath, atomically: true, encoding: .utf8)
+            try script.write(toFile: scriptPath, atomically: true, encoding: .utf8)
+            try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: scriptPath)
+            let configData = try JSONSerialization.data(withJSONObject: config)
+            try configData.write(to: URL(fileURLWithPath: configPath))
+            try rcloneStub.write(toFile: rcloneStubPath, atomically: true, encoding: .utf8)
+            try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: rcloneStubPath)
+        } catch {
+            return report("AC-W13", "watch-script-accepts-flag-equals-value", false, "(fixture setup failed: \(error))")
+        }
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/bash")
+        process.arguments = [scriptPath, configPath]
+        var env = ProcessInfo.processInfo.environment
+        env["RCLONE_BIN"] = rcloneStubPath
+        process.environment = env
+        let stderrPipe = Pipe()
+        process.standardError = stderrPipe
+        do {
+            try process.run()
+        } catch {
+            return report("AC-W13", "watch-script-accepts-flag-equals-value", false, "(could not run script: \(error))")
+        }
+        process.waitUntilExit()
+        let stderr = String(data: stderrPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+
+        guard process.terminationStatus == 0 else {
+            return report("AC-W13", "watch-script-accepts-flag-equals-value", false,
+                          "(script exited \(process.terminationStatus): \(stderr))")
+        }
+        guard let argvData = try? String(contentsOfFile: argvPath, encoding: .utf8) else {
+            return report("AC-W13", "watch-script-accepts-flag-equals-value", false, "(rclone stub was never invoked)")
+        }
+        // split(separator:) already drops the trailing empty element from the
+        // stub's final trailing newline, so `suffix(2)` is the last two real args.
+        let argv = argvData.split(separator: "\n").map(String.init)
+        // The last two argv elements must be exactly these two literal tokens —
+        // proof the flags reached rclone as their own elements, untouched.
+        guard argv.count >= 2, Array(argv.suffix(2)) == ["--exclude=*.tmp", "--bwlimit=5M"] else {
+            return report("AC-W13", "watch-script-accepts-flag-equals-value", false,
+                          "(unexpected argv tail: \(argv))")
+        }
+        return report("AC-W13", "watch-script-accepts-flag-equals-value", true)
     }
 
     // MARK: - AC-W3 — generated launchd plist shape (limpet-plan.md L3(c))
