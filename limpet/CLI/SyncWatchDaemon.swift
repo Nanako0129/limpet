@@ -105,7 +105,13 @@ enum SyncWatchDaemon {
             },
             logSourceMissing: { appendProfileLogLine("Source missing: \(profile.localSyncPath)", profile: profile) },
             refusalReason: { refusalReason(for: profile, profilesDirectory: SyncProfile.configDirectory) },
-            logRefusal: { appendProfileLogLine("Refusing to sync: \($0)", profile: profile) }
+            logRefusal: { appendProfileLogLine("Refusing to sync: \($0)", profile: profile) },
+            deleteLimitReached: { FileManager.default.fileExists(atPath: profile.deleteLimitMarkerPath) },
+            recordDeleteLimit: {
+                FileManager.default.createFile(
+                    atPath: profile.deleteLimitMarkerPath,
+                    contents: Data("rclone stopped at --max-delete; remove this file (or run 'limpet profile clear-delete-limit \(profile.shortId)') to sync again\n".utf8))
+            }
         )
     }
 

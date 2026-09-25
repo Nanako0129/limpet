@@ -14,6 +14,13 @@ struct SyncProfile: Identifiable, Codable, Equatable {
     var isMuted: Bool                   // whether notifications are muted for this profile
     var syncDirection: SyncDirection    // direction for one-way sync
     var transfers: Int                  // rclone --transfers (checkers = 2x this); default: 16
+    /// rclone `--max-delete` for this profile when its remote does not keep
+    /// deleted versions (limpet-plan.md L4 F6); default 100.
+    var maxDelete: Int
+    /// The user's statement that the remote keeps deleted versions (bucket
+    /// versioning on). Lifts `--max-delete` for AWS/MinIO/Other s3 remotes;
+    /// never for MEGA S4 or Cloudflare R2, which have none.
+    var remoteVersioning: Bool
 
     /// Short ID for file naming (first 8 chars of UUID)
     var shortId: String {
@@ -69,6 +76,14 @@ struct SyncProfile: Identifiable, Codable, Equatable {
         "/tmp/limpet-sync-\(shortId).lock"
     }
 
+    /// Persistent "delete limit reached" marker (limpet-plan.md L4 F6). Written
+    /// by the watcher when a run exits 76 and checked before EVERY run, so a
+    /// KeepAlive respawn, a login or a reinstall never syncs again until
+    /// `limpet profile clear-delete-limit` or the menu action removes it.
+    var deleteLimitMarkerPath: String {
+        "\(Self.configDirectory)/\(shortId).delete-limit"
+    }
+
     // MARK: - Full Remote Path
 
     /// Full remote path for rclone (e.g., "synology-kaiju:Kaiju")
@@ -101,7 +116,9 @@ struct SyncProfile: Identifiable, Codable, Equatable {
     /// every profile write, `SyncSetupService.install` and the watcher before
     /// each run. `nil` means acceptable.
     var validationError: String? {
-        Self.remoteSpecError(rcloneRemote)
+        if let error = Self.remoteSpecError(rcloneRemote) { return error }
+        if maxDelete < 1 { return "maxDelete must be at least 1" }
+        return nil
     }
 
     /// F6 (limpet-plan.md L4): two profiles syncing equal or nested paths on
@@ -163,7 +180,9 @@ struct SyncProfile: Identifiable, Codable, Equatable {
         isEnabled: Bool = false,
         isMuted: Bool = false,
         syncDirection: SyncDirection = .localToRemote,
-        transfers: Int = 16
+        transfers: Int = 16,
+        maxDelete: Int = 100,
+        remoteVersioning: Bool = false
     ) {
         self.id = id
         self.name = name
@@ -177,6 +196,8 @@ struct SyncProfile: Identifiable, Codable, Equatable {
         self.isMuted = isMuted
         self.syncDirection = syncDirection
         self.transfers = transfers
+        self.maxDelete = maxDelete
+        self.remoteVersioning = remoteVersioning
     }
 
     /// Create a new profile with default values
@@ -192,6 +213,7 @@ extension SyncProfile {
         case id, name, rcloneRemote, remotePath, localSyncPath
         case drivePathToMonitor, syncIntervalMinutes, additionalRcloneFlags
         case isEnabled, isMuted, syncDirection, transfers
+        case maxDelete, remoteVersioning
     }
 
     init(from decoder: Decoder) throws {
@@ -215,6 +237,8 @@ extension SyncProfile {
         syncDirection = try container.decodeIfPresent(SyncDirection.self, forKey: .syncDirection) ?? .localToRemote
         // Backwards compatibility: default to 16 if not present.
         transfers = try container.decodeIfPresent(Int.self, forKey: .transfers) ?? 16
+        maxDelete = try container.decodeIfPresent(Int.self, forKey: .maxDelete) ?? 100
+        remoteVersioning = try container.decodeIfPresent(Bool.self, forKey: .remoteVersioning) ?? false
 
         // F4: a refused value never becomes a SyncProfile, so it can never be
         // written back out, installed, or run by a watcher.

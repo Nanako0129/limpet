@@ -158,6 +158,21 @@ same remote are equal or nested (`SyncProfile.overlapError`) are refused at
 watcher, which re-reads every profile file before each run and logs
 `Refusing to sync: …` into the profile log instead of running.
 
+**Delete limit (limpet-plan.md L4 F6).** For remotes that keep no deleted
+versions — s3 `provider = Mega` (MEGA S4) and `Cloudflare` (R2) always, any
+other s3 provider unless the profile sets `remoteVersioning: true` — the
+derived config carries `maxDelete` (profile field, default 100;
+`SyncSetupService.maxDeleteArgument`) and the script adds `--max-delete N`.
+rclone 1.75.1 then deletes at most N files and exits 7 (measured); the script
+turns that into exit 76 only when the run's own output also contains `Got
+fatal error on delete: --max-delete threshold reached`. On 76 the watcher
+writes `profiles/{shortId}.delete-limit` and refuses every later run —
+including after a respawn, login or reinstall — while staying alive and idle.
+`limpet profile clear-delete-limit <name|shortId>` or the menu's red octagon
+button removes the marker and sends the watcher SIGUSR1. B2 is not limited
+(it hides instead of deleting); `limpet doctor` warns when a B2 bucket has no
+`daysFromHidingToDeleting` lifecycle rule.
+
 **Self-write suppression.** `ConfigSelfWriteRegistry` tracks the content hash
 of every file limpet itself writes; `ConfigFileWatcher.shouldReconcile`
 drops an FSEvent whose file content hash matches a just-noted self-write, so
@@ -254,6 +269,7 @@ isn't limpet's own.
 | `limpet profile disable <name\|shortId>` | Set `isEnabled=false`, rewrite the file, uninstall the agent. |
 | `limpet profile set <name\|shortId> <key> <value> [<key> <value> …]` | Edit fields on an existing profile from a BOUNDED key set (mirrors `SyncProfile.CodingKeys` minus `id`/`isEnabled`; positional `key value` pairs), rewrite the authoritative `.profile.json`, then drive the launchd delta `SyncManager.reconcileAction` dictates (reinstall as needed). Validates ALL assignments against a copy first — an unknown key or invalid value exits `65` and writes nothing. Use `enable`/`disable` for `isEnabled`. |
 | `limpet profile delete <name\|shortId>` | Uninstall the agent and remove the `.profile.json`. |
+| `limpet profile clear-delete-limit <name\|shortId>` | Remove the persistent `{shortId}.delete-limit` marker a `--max-delete` trip left (exit 76), then send the watcher SIGUSR1. Check the remote first: up to `maxDelete` files were already deleted in the run that tripped. |
 | `limpet install <name\|shortId>` | Install an already-enabled profile's launchd agent (idempotent; runs `SyncSetupService.install`). Complements `profile enable`, which early-returns without installing when the profile is ALREADY enabled — so `install` re-creates an agent that went missing. Refuses a disabled or incomplete profile. Never flips `isEnabled`. |
 | `limpet reinstall <name\|shortId>` | Regenerate script+plist and reinstall the agent (uninstall → install), i.e. the settings-save reinstall path. Works for any sync mode. Refuses a disabled profile. |
 | `limpet remote add <name> --type s3\|b2 --access-key-id <id> [--provider <p>] [--endpoint <https url>] [--region <r>]` | Create a keychain-backed remote through `RcloneConfigService.addKeychainRemote`, the same function the wizard uses. The secret is read from stdin — a no-echo prompt on a terminal, otherwise one line from the pipe — never from an argument. Writes the non-secret section plus `limpet_keychain = true` to rclone.conf (appended; nothing else rewritten) and stores the secret with `/usr/bin/security -i` (`add-generic-password -s limpet -a <name> -T /usr/bin/security`, secret hex-encoded on stdin). Names are `[A-Za-z0-9_]+` and may not collide case-insensitively with any rclone.conf section; endpoints must be https; `--provider Mega --region <r>` derives `s3.<r>.megas4.com`. |

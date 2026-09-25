@@ -60,6 +60,15 @@
       "type": "integer",
       "minimum": 1,
       "description": "rclone --transfers for this profile's sync (--checkers is 2x this value). Default 16."
+    },
+    "maxDelete": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "rclone --max-delete for this profile when its remote keeps no deleted versions: MEGA S4 and Cloudflare R2 always, AWS/MinIO/other S3 unless remoteVersioning is true. When a run hits the limit, rclone stops after this many deletions, the sync exits 76 and limpet stops syncing the profile until `limpet profile clear-delete-limit` (or the menu action) clears it. Default 100."
+    },
+    "remoteVersioning": {
+      "type": "boolean",
+      "description": "Set to true only if the S3 bucket keeps deleted versions (versioning on); lifts maxDelete for AWS/MinIO/other S3 remotes. Ignored for MEGA S4 and Cloudflare R2. Default false."
     }
   },
   "required": [

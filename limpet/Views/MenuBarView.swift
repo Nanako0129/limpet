@@ -81,6 +81,17 @@ struct MenuBarView: View {
 
                     // Action buttons (order: settings, mute, folder, pause/play)
                     HStack(spacing: 4) {
+                        // Delete limit reached: this profile is stopped until cleared.
+                        if syncManager.isDeleteLimitReached(for: profile) {
+                            Button(action: { syncManager.clearDeleteLimit(for: profile) }) {
+                                Image(systemName: "exclamationmark.octagon.fill")
+                                    .font(.system(size: 10))
+                                    .foregroundColor(.red)
+                            }
+                            .buttonStyle(.plain)
+                            .help("Delete limit reached: sync stopped. Check the remote, then click to clear the limit and sync again")
+                        }
+
                         // Settings button - opens profile settings
                         Button(action: { openSettingsForProfile(profile.id) }) {
                             Image(systemName: "gearshape")

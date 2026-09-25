@@ -88,7 +88,9 @@ extension SyncManager {
             current.syncIntervalMinutes != updated.syncIntervalMinutes ||
             current.additionalRcloneFlags != updated.additionalRcloneFlags ||
             current.syncDirection != updated.syncDirection ||
-            current.transfers != updated.transfers
+            current.transfers != updated.transfers ||
+            current.maxDelete != updated.maxDelete ||
+            current.remoteVersioning != updated.remoteVersioning
 
         return needsReinstall ? .reinstall : .none
     }

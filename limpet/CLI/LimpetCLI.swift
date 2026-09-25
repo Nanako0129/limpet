@@ -39,6 +39,7 @@ enum CLICommand: Equatable {
     case profileDelete(String)
     case profileSet(target: String, assignments: [ProfileAssignment])
     case profileSetEnabled(target: String, enabled: Bool)
+    case profileClearDeleteLimit(String)
     case remoteAdd(RemoteAddRequest)
     case help
 }
@@ -78,6 +79,8 @@ struct CLIEnvironment {
     var runLaunchctl: (_ args: [String]) -> (Int32, String)
     /// Whether the JSON schema files are installed under the config directory.
     var schemaFilesPresent: () -> Bool
+    /// The rclone.conf section of a remote (`type` included), or `nil`.
+    var remoteSection: (_ remoteName: String) -> [String: String]?
     /// Persist a profile's authoritative `{shortId}.profile.json`. Returns
     /// `true` on success. Same byte format the app writes (`ProfileStore`).
     var writeProfile: (SyncProfile) -> Bool
@@ -89,6 +92,8 @@ struct CLIEnvironment {
     var uninstallProfile: (SyncProfile) -> String?
     /// Delete the authoritative `{shortId}.profile.json`.
     var deleteProfileFile: (SyncProfile) -> Void
+    /// Remove a file (the delete-limit marker). Returns whether it succeeded.
+    var removeFile: (String) -> Bool
     /// Read all of stdin (for `profile create -`). `nil` on read failure.
     var readStdin: () -> String?
     /// Read a file's contents as UTF-8 text. `nil` if missing/unreadable.
@@ -134,6 +139,8 @@ enum LimpetCLI {
       profile delete <name|id>     Delete a profile and its launchd agent
       profile set <name|id> <key> <value> [<key> <value> ...]
                                    Edit fields on an existing profile and reconcile
+      profile clear-delete-limit <name|id>
+                                   Resume a profile stopped by --max-delete, and sync now
       install <name|id>            Install an enabled profile's launchd agent (idempotent)
       reinstall <name|id>          Regenerate script+plist and reinstall the agent
       remote add <name> --type s3|b2 --access-key-id <id> [--provider <p>] [--endpoint <https url>] [--region <r>]
@@ -147,7 +154,8 @@ enum LimpetCLI {
     profile set keys: name, rcloneRemote, remotePath, localSyncPath,
       drivePathToMonitor, additionalRcloneFlags,
       syncDirection (localToRemote|remoteToLocal), syncIntervalMinutes,
-      transfers, isMuted. Use enable/disable for isEnabled.
+      transfers, isMuted, maxDelete, remoteVersioning.
+      Use enable/disable for isEnabled.
 
     Profiles author JSON against schema/profile.schema.json under the config
     directory; the same file an agent can drop in or edit directly.
@@ -299,6 +307,12 @@ enum LimpetCLI {
             }
             return .success(.profileDelete(target))
 
+        case "clear-delete-limit":
+            guard let target = args.first(where: { !$0.hasPrefix("-") }) else {
+                return .failure(CLIUsageError(message: "usage: limpet profile clear-delete-limit <name|shortId>"))
+            }
+            return .success(.profileClearDeleteLimit(target))
+
         default:
             return .failure(CLIUsageError(message: "unknown 'profile' subcommand: \(sub)\n" + usage))
         }
@@ -393,6 +407,8 @@ enum LimpetCLI {
             return runProfileSet(target, assignments: assignments, env: env)
         case .profileSetEnabled(let target, let enabled):
             return runProfileSetEnabled(target, enabled: enabled, env: env)
+        case .profileClearDeleteLimit(let target):
+            return runClearDeleteLimit(target, env: env)
         case .remoteAdd(let request):
             return runRemoteAdd(request, env: env)
         case .help:
@@ -483,6 +499,27 @@ enum LimpetCLI {
                 ? DoctorCheck(name: label, status: .ok, detail: "remote reachable")
                 : DoctorCheck(name: label, status: .fail, detail: "remote unreachable: \(remoteErr)")
         )
+
+        // limpet-plan.md L4 F6, B2: warn (never fail) when the bucket has no
+        // daysFromHidingToDeleting lifecycle rule. The output shape is rclone
+        // 1.75.1's own `rclone backend help b2` example (`[]` when there are no
+        // rules, else objects with "daysFromHidingToDeleting": N); it was not
+        // measured against a live bucket here.
+        let remoteName = String(profile.rcloneRemote.prefix { $0 != ":" })
+        if env.remoteSection(remoteName)?["type"] == "b2" {
+            let bucket = profile.remotePath.split(separator: "/").first.map(String.init) ?? ""
+            let (code, rules, _) = env.runRclone(
+                ["backend", "lifecycle", "\(remoteName):\(bucket)"], profile.fullRemotePath, 10)
+            let advice = "use a bucket-scoped application key without deleteFiles"
+            if code != 0 {
+                checks.append(DoctorCheck(name: label, status: .warn,
+                    detail: "could not read the B2 lifecycle rules of \(bucket); \(advice)"))
+            } else if rules.range(of: #""daysFromHidingToDeleting"\s*:\s*[1-9]"#, options: .regularExpression) == nil {
+                checks.append(DoctorCheck(name: label, status: .warn,
+                    detail: "B2 bucket \(bucket) has no daysFromHidingToDeleting lifecycle rule, so deleted "
+                        + "and overwritten files are kept as hidden versions indefinitely; \(advice)"))
+            }
+        }
 
         return checks
     }
@@ -953,6 +990,12 @@ enum LimpetCLI {
         case "transfers":
             guard let n = int(value), n >= 1 else { return "transfers must be an integer ≥ 1" }
             profile.transfers = n
+        case "maxDelete":
+            guard let n = int(value), n >= 1 else { return "maxDelete must be an integer ≥ 1" }
+            profile.maxDelete = n
+        case "remoteVersioning":
+            guard let b = bool(value) else { return "remoteVersioning must be true or false" }
+            profile.remoteVersioning = b
 
         // Bools.
         case "isMuted":
@@ -976,6 +1019,30 @@ enum LimpetCLI {
             return "unknown key \"\(key)\" (see 'limpet help' for the profile set key list)"
         }
         return nil
+    }
+
+    // MARK: - profile clear-delete-limit
+
+    /// Remove the persistent delete-limit marker (limpet-plan.md L4 F6), then
+    /// ask the watcher to sync now — the same SIGUSR1 request `limpet sync` sends.
+    private static func runClearDeleteLimit(_ target: String, env: CLIEnvironment) -> Int32 {
+        guard let profile = resolveProfile(target, in: env.readProfiles()) else {
+            env.stderr("error: no profile matches \"\(target)\"\n")
+            return 1
+        }
+        let marker = profile.deleteLimitMarkerPath
+        guard env.fileExists(marker) else {
+            env.stdout("no delete limit is set for \(profile.name) (\(profile.shortId))\n")
+            return 0
+        }
+        guard env.removeFile(marker) else {
+            env.stderr("error: could not remove \(marker)\n")
+            return 1
+        }
+        let (exitCode, _) = env.runLaunchctl(["kill", "SIGUSR1", "gui/\(getuid())/\(profile.launchdLabel)"])
+        env.stdout("cleared the delete limit for \(profile.name) (\(profile.shortId)); "
+            + (exitCode == 0 ? "sync requested\n" : "no watcher running, it syncs when its agent next starts\n"))
+        return 0
     }
 
     // MARK: - remote add
@@ -1031,6 +1098,7 @@ extension CLIEnvironment {
                     FileManager.default.fileExists(atPath: "\(ConfigSchemaInstaller.schemaDirectory())/\($0)")
                 }
             },
+            remoteSection: { RcloneConfigService.shared.section(named: $0) },
             writeProfile: { profile in
                 ProfileStore.writeProfileFile(profile, in: SyncProfile.configDirectory) != nil
             },
@@ -1046,6 +1114,7 @@ extension CLIEnvironment {
                 let path = "\(SyncProfile.configDirectory)/\(profile.shortId).profile.json"
                 try? FileManager.default.removeItem(atPath: path)
             },
+            removeFile: { (try? FileManager.default.removeItem(atPath: $0)) != nil },
             readStdin: {
                 let data = FileHandle.standardInput.readDataToEndOfFile()
                 return String(data: data, encoding: .utf8)

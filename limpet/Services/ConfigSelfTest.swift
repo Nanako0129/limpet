@@ -87,6 +87,11 @@ enum ConfigSelfTest {
             testSecretInjectionHelper,
             testCLIRemoteAdd,
             testWizardProvidersRemapAndRoute,
+            testScriptMapsMaxDeleteTo76,
+            testMaxDeleteOnlyForNonVersionedProviders,
+            testWatcherStopsAtDeleteLimit,
+            testCLIClearDeleteLimit,
+            testDoctorWarnsB2WithoutLifecycle,
         ]
 
         for check in checks {
@@ -160,14 +165,16 @@ enum ConfigSelfTest {
 
     private static func testDerivedJSONFrozen() -> Bool {
         let profile = sampleProfile()
-        let json = SyncSetupService.shared.generateProfileConfig(for: profile)
+        // A scratch rclone.conf, so the self-test never reads the user's real one.
+        let json = SyncSetupService.shared.generateProfileConfig(
+            for: profile, rcloneConfig: RcloneConfigService(configPath: "\(selfTestRoot)/ac2-absent-rclone.conf"))
 
         let forbidden = ["\"isEnabled\"", "\"isMuted\""]
         for key in forbidden where json.contains(key) {
             return report("AC-2", "derived-json-frozen", false, "(unexpectedly contains \(key))")
         }
 
-        let requiredFrozenKeys = ["\"profileId\"", "\"remote\"", "\"localPath\"", "\"syncIntervalMinutes\""]
+        let requiredFrozenKeys = ["\"profileId\"", "\"remote\"", "\"localPath\"", "\"syncIntervalMinutes\"", "\"maxDelete\""]
         for key in requiredFrozenKeys where !json.contains(key) {
             return report("AC-2", "derived-json-frozen", false, "(missing frozen key \(key))")
         }
@@ -728,10 +735,12 @@ enum ConfigSelfTest {
         fileExists: @escaping (String) -> Bool = { _ in false },
         runLaunchctl: @escaping (_ args: [String]) -> (Int32, String) = { _ in (0, "") },
         schemaFilesPresent: @escaping () -> Bool = { true },
+        remoteSection: @escaping (String) -> [String: String]? = { _ in nil },
         writeProfile: @escaping (SyncProfile) -> Bool = { _ in true },
         installProfile: @escaping (SyncProfile) -> String? = { _ in nil },
         uninstallProfile: @escaping (SyncProfile) -> String? = { _ in nil },
         deleteProfileFile: @escaping (SyncProfile) -> Void = { _ in },
+        removeFile: @escaping (String) -> Bool = { _ in true },
         readStdin: @escaping () -> String? = { nil },
         readFile: @escaping (String) -> String? = { _ in nil },
         readSecret: @escaping (String) -> String? = { _ in nil },
@@ -745,10 +754,12 @@ enum ConfigSelfTest {
             fileExists: fileExists,
             runLaunchctl: runLaunchctl,
             schemaFilesPresent: schemaFilesPresent,
+            remoteSection: remoteSection,
             writeProfile: writeProfile,
             installProfile: installProfile,
             uninstallProfile: uninstallProfile,
             deleteProfileFile: deleteProfileFile,
+            removeFile: removeFile,
             readStdin: readStdin,
             readFile: readFile,
             readSecret: readSecret,
@@ -1288,7 +1299,9 @@ enum ConfigSelfTest {
             scheduleAfter: { seconds, action in clock.scheduleAfter(seconds, action) },
             logSourceMissing: { onLogSourceMissing?() },
             refusalReason: { nil },
-            logRefusal: { _ in }
+            logRefusal: { _ in },
+            deleteLimitReached: { false },
+            recordDeleteLimit: { true }
         )
     }
 
@@ -1307,7 +1320,9 @@ enum ConfigSelfTest {
                 scheduleAfter: { s, a in clock.scheduleAfter(s, a) },
                 logSourceMissing: {},
                 refusalReason: { nil },
-                logRefusal: { _ in }
+                logRefusal: { _ in },
+                deleteLimitReached: { false },
+                recordDeleteLimit: { true }
             )
             let scheduler = SyncWatchScheduler(runner: runner)
             scheduler.trigger()  // run 1 starts, held open
@@ -1339,7 +1354,9 @@ enum ConfigSelfTest {
                 scheduleAfter: { s, a in clock.scheduleAfter(s, a) },
                 logSourceMissing: {},
                 refusalReason: { nil },
-                logRefusal: { _ in }
+                logRefusal: { _ in },
+                deleteLimitReached: { false },
+                recordDeleteLimit: { true }
             )
             let scheduler = SyncWatchScheduler(runner: runner)
             scheduler.trigger()
@@ -1370,7 +1387,9 @@ enum ConfigSelfTest {
                 scheduleAfter: { s, a in clock.scheduleAfter(s, a) },
                 logSourceMissing: {},
                 refusalReason: { nil },
-                logRefusal: { _ in }
+                logRefusal: { _ in },
+                deleteLimitReached: { false },
+                recordDeleteLimit: { true }
             )
             let scheduler = SyncWatchScheduler(runner: runner)
             scheduler.trigger()          // run 1 (e.g. FSEvents)
@@ -1893,8 +1912,8 @@ enum ConfigSelfTest {
     /// not be set up; otherwise the script's exit status, whether the stub ran, and
     /// the profile log text.
     private static func runScriptFixture(
-        name: String, overrides: [String: Any]
-    ) -> (status: Int32, stubRan: Bool, log: String)? {
+        name: String, overrides: [String: Any], stubTail: String = "exit 0\n"
+    ) -> (status: Int32, stubRan: Bool, log: String, argv: [String])? {
         let fm = FileManager.default
         let root = (selfTestRoot as NSString).appendingPathComponent(name)
         try? fm.removeItem(atPath: root)
@@ -1905,6 +1924,7 @@ enum ConfigSelfTest {
         let logPath = (root as NSString).appendingPathComponent("sync.log")
         let stubPath = (root as NSString).appendingPathComponent("rclone-stub.sh")
         let ranPath = (root as NSString).appendingPathComponent("stub-ran")
+        let argvPath = (root as NSString).appendingPathComponent("stub-argv")
         var config: [String: Any] = [
             "remote": "selftest-fixture-remote:SelfTest",
             "localPath": localPath,
@@ -1923,7 +1943,8 @@ enum ConfigSelfTest {
             try "".write(toFile: filterPath, atomically: true, encoding: .utf8)
             try SyncSetupService.shared.generateSyncScript().write(toFile: scriptPath, atomically: true, encoding: .utf8)
             try JSONSerialization.data(withJSONObject: config).write(to: URL(fileURLWithPath: configPath))
-            try "#!/bin/sh\ntouch \"\(ranPath)\"\nexit 0\n".write(toFile: stubPath, atomically: true, encoding: .utf8)
+            try ("#!/bin/sh\ntouch \"\(ranPath)\"\nprintf '%s\\n' \"$@\" > \"\(argvPath)\"\n" + stubTail)
+                .write(toFile: stubPath, atomically: true, encoding: .utf8)
             try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: stubPath)
         } catch {
             return nil
@@ -1939,7 +1960,9 @@ enum ConfigSelfTest {
         guard (try? process.run()) != nil else { return nil }
         process.waitUntilExit()
         let log = (try? String(contentsOfFile: logPath, encoding: .utf8)) ?? ""
-        return (process.terminationStatus, fm.fileExists(atPath: ranPath), log)
+        let argv = ((try? String(contentsOfFile: argvPath, encoding: .utf8)) ?? "")
+            .split(separator: "\n").map(String.init)
+        return (process.terminationStatus, fm.fileExists(atPath: ranPath), log, argv)
     }
 
     // MARK: - AC-W14 — `transfers` is never evaluated as shell arithmetic
@@ -2697,6 +2720,216 @@ enum ConfigSelfTest {
         return report(id, slug, true)
     }
 
+    // MARK: - AC-L4-11 — exit 76 only when rclone's exit code AND its max-delete message match
+
+    private static func testScriptMapsMaxDeleteTo76() -> Bool {
+        let id = "AC-L4-11", slug = "script-maps-max-delete-to-76"
+        // The exact line rclone 1.75.1 logged per refused delete (measured 2026-09-26).
+        let tripped = "echo '{\"level\":\"error\",\"msg\":\"Got fatal error on delete: --max-delete threshold reached\",\"object\":\"f3.txt\"}' >&2\n"
+        let otherFatal = "echo '{\"level\":\"error\",\"msg\":\"Fatal error received - not attempting retries\"}' >&2\n"
+        let cases: [(String, String, Int32)] = [
+            ("ac-l4-11-a", tripped + "exit 7\n", 76),     // code + message → 76
+            ("ac-l4-11-b", otherFatal + "exit 7\n", 7),   // same code, no message → 7
+            ("ac-l4-11-c", tripped + "exit 1\n", 1),      // message, other code → 1
+        ]
+        for (name, tail, expected) in cases {
+            guard let result = runScriptFixture(name: name, overrides: ["maxDelete": 5], stubTail: tail) else {
+                return report(id, slug, false, "(fixture setup failed)")
+            }
+            guard result.status == expected,
+                  result.log.contains("Delete limit reached") == (expected == 76) else {
+                return report(id, slug, false, "(\(name): status \(result.status), expected \(expected))")
+            }
+        }
+        // --max-delete N reaches rclone when set, and is absent at 0.
+        guard let on = runScriptFixture(name: "ac-l4-11-on", overrides: ["maxDelete": 5]),
+              let off = runScriptFixture(name: "ac-l4-11-off", overrides: ["maxDelete": 0]),
+              let bad = runScriptFixture(name: "ac-l4-11-bad", overrides: ["maxDelete": "5 --dry-run"]) else {
+            return report(id, slug, false, "(fixture setup failed)")
+        }
+        guard let flag = on.argv.firstIndex(of: "--max-delete"), on.argv.indices.contains(flag + 1),
+              on.argv[flag + 1] == "5", !off.argv.contains("--max-delete") else {
+            return report(id, slug, false, "(--max-delete argv wrong: on=\(on.argv) off=\(off.argv))")
+        }
+        guard bad.status == 64, !bad.stubRan else {
+            return report(id, slug, false, "(a non-numeric maxDelete was not refused: \(bad.status))")
+        }
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L4-12 — --max-delete only where a delete cannot be undone
+
+    private static func testMaxDeleteOnlyForNonVersionedProviders() -> Bool {
+        let id = "AC-L4-12", slug = "max-delete-only-non-versioned"
+        var profile = sampleProfile()
+        profile.maxDelete = 42
+        var versioned = profile
+        versioned.remoteVersioning = true
+        let matrix: [([String: String]?, SyncProfile, Int)] = [
+            (["type": "s3", "provider": "Mega"], profile, 42),
+            (["type": "s3", "provider": "Mega"], versioned, 42),        // S4 has no versioning
+            (["type": "s3", "provider": "Cloudflare"], versioned, 42),  // nor has R2
+            (["type": "s3", "provider": "AWS"], profile, 42),
+            (["type": "s3", "provider": "AWS"], versioned, 0),
+            (["type": "s3", "provider": "Minio"], versioned, 0),
+            (["type": "s3", "provider": "Other"], profile, 42),
+            (["type": "b2"], profile, 0),
+            (["type": "webdav"], profile, 0),
+            (nil, profile, 0),
+        ]
+        for (section, candidate, expected) in matrix
+        where SyncSetupService.maxDeleteArgument(for: candidate, remoteSection: section) != expected {
+            return report(id, slug, false, "(\(String(describing: section)) versioning=\(candidate.remoteVersioning) expected \(expected))")
+        }
+        // Wired into the derived config from the remote's rclone.conf section.
+        let confPath = "\(selfTestRoot)/ac-l4-12-rclone.conf"
+        try? "[s4]\ntype = s3\nprovider = Mega\n\n[bb]\ntype = b2\n".write(toFile: confPath, atomically: true, encoding: .utf8)
+        let service = RcloneConfigService(configPath: confPath)
+        func derivedMaxDelete(_ remote: String) -> Int? {
+            var p = profile
+            p.rcloneRemote = remote
+            let json = SyncSetupService.shared.generateProfileConfig(for: p, rcloneConfig: service)
+            let dict = (try? JSONSerialization.jsonObject(with: Data(json.utf8))) as? [String: Any]
+            return dict?["maxDelete"] as? Int
+        }
+        guard derivedMaxDelete("s4:") == 42, derivedMaxDelete("bb:") == 0, derivedMaxDelete("absent:") == 0 else {
+            return report(id, slug, false, "(derived maxDelete wrong)")
+        }
+        // maxDelete is at least 1 at decode, write and profile set.
+        var zero = profile
+        zero.maxDelete = 0
+        guard zero.validationError != nil,
+              LimpetCLI.applyProfileAssignment(&zero, key: "maxDelete", value: "0") != nil,
+              LimpetCLI.applyProfileAssignment(&zero, key: "maxDelete", value: "250") == nil, zero.maxDelete == 250,
+              LimpetCLI.applyProfileAssignment(&zero, key: "remoteVersioning", value: "true") == nil, zero.remoteVersioning,
+              SyncManager.reconcileAction(from: profile, to: versioned) == .reinstall else {
+            return report(id, slug, false, "(maxDelete/remoteVersioning validation or reconcile wrong)")
+        }
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L4-13 — the watcher stops for good at the delete limit
+
+    private static func testWatcherStopsAtDeleteLimit() -> Bool {
+        let id = "AC-L4-13", slug = "watcher-stops-at-delete-limit"
+        func scheduler(marker: @escaping () -> Bool, record: @escaping () -> Bool,
+                       clock: VirtualClock, runs: @escaping () -> Void) -> SyncWatchScheduler {
+            SyncWatchScheduler(runner: SchedulerRunner(
+                sourceExists: { true },
+                runChild: { completion in runs(); completion(SyncWatchScheduler.deleteLimitExitCode) },
+                now: { clock.now },
+                scheduleAfter: { s, a in clock.scheduleAfter(s, a) },
+                logSourceMissing: {},
+                refusalReason: { nil },
+                logRefusal: { _ in },
+                deleteLimitReached: marker,
+                recordDeleteLimit: record))
+        }
+        // A run exits 76 → marker written → no further run for any number of triggers.
+        let clock = VirtualClock()
+        var marker = false, runs = 0
+        let first = scheduler(marker: { marker }, record: { marker = true; return true }, clock: clock, runs: { runs += 1 })
+        first.trigger()
+        for _ in 0..<20 { first.trigger() }
+        clock.advance(by: 3600)
+        first.trigger()
+        guard runs == 1, marker, first.state == .idle else {
+            return report(id, slug, false, "(after a 76: runs=\(runs) marker=\(marker))")
+        }
+        // A new scheduler (a respawned watcher) with the marker present runs 0 times.
+        var respawnRuns = 0
+        let respawned = scheduler(marker: { marker }, record: { true }, clock: clock, runs: { respawnRuns += 1 })
+        for _ in 0..<5 { respawned.trigger() }
+        guard respawnRuns == 0 else {
+            return report(id, slug, false, "(respawned watcher ran \(respawnRuns) time(s) with the marker present)")
+        }
+        // Cleared (marker removed) + "sync now" → it runs again.
+        marker = false
+        respawned.trigger()
+        guard respawnRuns == 1 else {
+            return report(id, slug, false, "(did not run after the marker was cleared)")
+        }
+        // The marker cannot be written → still stopped for the life of the process.
+        var unwrittenRuns = 0
+        let unwritten = scheduler(marker: { false }, record: { false }, clock: clock, runs: { unwrittenRuns += 1 })
+        for _ in 0..<5 { unwritten.trigger() }
+        guard unwrittenRuns == 1 else {
+            return report(id, slug, false, "(ran \(unwrittenRuns) time(s) after a 76 whose marker could not be written)")
+        }
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L4-14 — limpet profile clear-delete-limit
+
+    private static func testCLIClearDeleteLimit() -> Bool {
+        let id = "AC-L4-14", slug = "cli-clear-delete-limit"
+        let profile = sampleProfile()
+        guard case .success(.profileClearDeleteLimit(profile.shortId)) =
+                LimpetCLI.parse(["profile", "clear-delete-limit", profile.shortId]) else {
+            return report(id, slug, false, "(did not parse)")
+        }
+        var removed: [String] = [], killed: [[String]] = []
+        func env(markerExists: Bool, removeSucceeds: Bool) -> CLIEnvironment {
+            fakeCLIEnvironment(
+                readProfiles: { [profile] },
+                fileExists: { $0 == profile.deleteLimitMarkerPath && markerExists },
+                runLaunchctl: { killed.append($0); return (0, "") },
+                removeFile: { removed.append($0); return removeSucceeds })
+        }
+        guard LimpetCLI.execute(["profile", "clear-delete-limit", profile.shortId], env: env(markerExists: true, removeSucceeds: true)) == 0,
+              removed == [profile.deleteLimitMarkerPath],
+              killed == [["kill", "SIGUSR1", "gui/\(getuid())/\(profile.launchdLabel)"]] else {
+            return report(id, slug, false, "(clear did not remove the marker and signal the watcher: \(removed) \(killed))")
+        }
+        removed = []; killed = []
+        guard LimpetCLI.execute(["profile", "clear-delete-limit", profile.shortId], env: env(markerExists: true, removeSucceeds: false)) == 1,
+              killed.isEmpty else {
+            return report(id, slug, false, "(a failed removal still signalled the watcher)")
+        }
+        removed = []; killed = []
+        guard LimpetCLI.execute(["profile", "clear-delete-limit", profile.shortId], env: env(markerExists: false, removeSucceeds: true)) == 0,
+              removed.isEmpty, killed.isEmpty else {
+            return report(id, slug, false, "(no marker: something was removed or signalled)")
+        }
+        guard profile.deleteLimitMarkerPath == "\(SyncProfile.configDirectory)/\(profile.shortId).delete-limit" else {
+            return report(id, slug, false, "(unexpected marker path \(profile.deleteLimitMarkerPath))")
+        }
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L4-15 — doctor warns (never fails) on a B2 bucket without daysFromHidingToDeleting
+
+    private static func testDoctorWarnsB2WithoutLifecycle() -> Bool {
+        let id = "AC-L4-15", slug = "doctor-warns-b2-without-lifecycle"
+        var profile = sampleProfile(isEnabled: false)
+        profile.rcloneRemote = "bb:"
+        profile.remotePath = "bucket/sub"
+        func checks(lifecycleOutput: String) -> ([DoctorCheck], [[String]]) {
+            var calls: [[String]] = []
+            let env = fakeCLIEnvironment(
+                runRclone: { args, _, _ in
+                    calls.append(args)
+                    if args.first == "version" { return (0, "rclone v1.75.1", "") }
+                    return args.first == "backend" ? (0, lifecycleOutput, "") : (0, "", "")
+                },
+                readProfiles: { [profile] },
+                fileExists: { $0 == profile.configPath },
+                remoteSection: { $0 == "bb" ? ["type": "b2"] : nil })
+            return (LimpetCLI.doctorChecks(env: env), calls)
+        }
+        let (noRule, calls) = checks(lifecycleOutput: "[]\n")
+        guard calls.contains(["backend", "lifecycle", "bb:bucket"]),
+              noRule.contains(where: { $0.status == .warn && $0.detail.contains("daysFromHidingToDeleting") }),
+              !noRule.contains(where: { $0.status == .fail }) else {
+            return report(id, slug, false, "(no warning for a bucket without a rule: \(noRule.map(\.line)))")
+        }
+        let (withRule, _) = checks(lifecycleOutput: "[\n    {\n        \"daysFromHidingToDeleting\": 1,\n        \"fileNamePrefix\": \"\"\n    }\n]\n")
+        guard !withRule.contains(where: { $0.detail.contains("daysFromHidingToDeleting") }) else {
+            return report(id, slug, false, "(warned although the rule exists)")
+        }
+        return report(id, slug, true)
+    }
+
     // MARK: - AC-L4-5 — the watcher refuses before every run (catch-up, trigger, SIGUSR1, retry)
 
     /// Drives `SyncWatchScheduler` with the PRODUCTION refusal closure
@@ -2719,7 +2952,9 @@ enum ConfigSelfTest {
             scheduleAfter: { s, a in clock.scheduleAfter(s, a) },
             logSourceMissing: {},
             refusalReason: { SyncWatchDaemon.refusalReason(for: mine, profilesDirectory: dir) },
-            logRefusal: { _ in refusalLogs += 1 }
+            logRefusal: { _ in refusalLogs += 1 },
+            deleteLimitReached: { false },
+            recordDeleteLimit: { true }
         )
         let scheduler = SyncWatchScheduler(runner: runner)
         scheduler.trigger()  // catch-up: allowed, exits 75 → backoff
@@ -2752,7 +2987,9 @@ enum ConfigSelfTest {
             scheduleAfter: { s, a in clock.scheduleAfter(s, a) },
             logSourceMissing: {},
             refusalReason: { SyncWatchDaemon.refusalReason(for: bad, profilesDirectory: "\(dir)-empty") },
-            logRefusal: { _ in }
+            logRefusal: { _ in },
+            deleteLimitReached: { false },
+            recordDeleteLimit: { true }
         ))
         badScheduler.trigger()
         badScheduler.trigger()
@@ -2770,7 +3007,9 @@ enum ConfigSelfTest {
             scheduleAfter: { s, a in clock.scheduleAfter(s, a) },
             logSourceMissing: {},
             refusalReason: { nil },
-            logRefusal: { _ in }
+            logRefusal: { _ in },
+            deleteLimitReached: { false },
+            recordDeleteLimit: { true }
         ))
         stuckScheduler.trigger()
         stuckScheduler.trigger()       // pending

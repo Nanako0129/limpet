@@ -128,6 +128,26 @@ final class SyncManager: ObservableObject {
         }
     }
 
+    /// Whether `profile` is stopped by the persistent delete-limit marker
+    /// (limpet-plan.md L4 F6).
+    func isDeleteLimitReached(for profile: SyncProfile) -> Bool {
+        FileManager.default.fileExists(atPath: profile.deleteLimitMarkerPath)
+    }
+
+    /// The menu action twin of `limpet profile clear-delete-limit`: remove the
+    /// marker, then send the watcher the same "sync now" request.
+    func clearDeleteLimit(for profile: SyncProfile) {
+        do {
+            try FileManager.default.removeItem(atPath: profile.deleteLimitMarkerPath)
+        } catch {
+            profileErrors[profile.id] = "could not clear the delete limit: \(error.localizedDescription)"
+            return
+        }
+        clearError(for: profile.id)
+        sendSyncNowSignal(to: profile)
+        objectWillChange.send()
+    }
+
     /// `launchctl kill SIGUSR1 gui/<uid>/<label>` — addressed by label, not
     /// PID, so this never races a launchd respawn. A non-zero exit means no
     /// watcher is currently loaded for that profile; reported to the user as

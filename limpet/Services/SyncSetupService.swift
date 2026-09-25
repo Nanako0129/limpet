@@ -433,6 +433,14 @@ final class SyncSetupService {
             fi
             CHECKERS=$((TRANSFERS * 2))
 
+            # maxDelete (0 = no limit) is written by limpet from an Int; anything
+            # else in the derived config is refused rather than passed on.
+            MAX_DELETE=$(parse_json "maxDelete" "0")
+            if [[ ! "$MAX_DELETE" =~ ^(0|[1-9][0-9]*)$ ]]; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S') - Refusing to sync: maxDelete must be a whole number" >> "$LOG_FILE"
+                exit 64
+            fi
+
             # `read -r -a` only consumes the first line, so a flag after a newline would
             # be dropped silently (turning `--exclude=*.tmp` + newline + `--dry-run` into
             # a real sync). Refuse instead.
@@ -571,16 +579,39 @@ final class SyncSetupService {
                 cmd+=("$NO_CHECK_CERT")
             fi
 
+            if [[ "$MAX_DELETE" != "0" ]]; then
+                cmd+=(--max-delete "$MAX_DELETE")
+            fi
+
             # additionalFlags was already validated and split into
             # ADDITIONAL_FLAGS_ARRAY above; append its tokens as-is.
             if [[ ${#ADDITIONAL_FLAGS_ARRAY[@]} -gt 0 ]]; then
                 cmd+=("${ADDITIONAL_FLAGS_ARRAY[@]}")
             fi
 
+            # This run's own output, so the delete-limit check below reads only
+            # this run and never an older run's lines in the profile log.
+            RUN_OUTPUT=$(mktemp "${TMPDIR:-/tmp}/limpet-run.XXXXXX") || {
+                echo "$(date '+%Y-%m-%d %H:%M:%S') - Refusing to sync: could not create a temporary file" >> "$LOG_FILE"
+                exit 1
+            }
+            trap 'rm -f "$LOCK_FILE" "$RUN_OUTPUT"' EXIT
+
             # Run sync command
-            "${cmd[@]}" 2>&1 | tee -a "$LOG_FILE"
+            "${cmd[@]}" 2>&1 | tee -a "$LOG_FILE" "$RUN_OUTPUT"
 
             EXIT_CODE=${PIPESTATUS[0]}
+
+            # --max-delete tripped: stop for good (exit 76, the watcher then keeps
+            # a persistent marker). Measured 2026-09-26 with rclone 1.75.1, local to
+            # local, 5 files removed from the source, --max-delete 2: exit 7, exactly
+            # 2 files deleted, each refused delete logged as "Got fatal error on
+            # delete: --max-delete threshold reached" (text and JSON log alike).
+            # Exit 7 is every fatal error, so the code AND the message must match.
+            if [[ $EXIT_CODE -eq 7 ]] && grep -qF -- 'Got fatal error on delete: --max-delete threshold reached' "$RUN_OUTPUT"; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S') - Delete limit reached: rclone stopped at --max-delete $MAX_DELETE; limpet will not sync this profile again until the limit is cleared (limpet profile clear-delete-limit, or the menu)" >> "$LOG_FILE"
+                EXIT_CODE=76
+            fi
 
             if [[ $EXIT_CODE -eq 0 ]]; then
                 echo "$(date '+%Y-%m-%d %H:%M:%S') - Sync completed successfully" >> "$LOG_FILE"
@@ -594,11 +625,26 @@ final class SyncSetupService {
             """
     }
 
+    /// `--max-delete` for `profile`, or 0 for none (limpet-plan.md L4 F6): only
+    /// where a wrong delete cannot be undone. MEGA S4 and Cloudflare R2 keep no
+    /// deleted versions, so always; any other s3 provider (AWS, MinIO, Other)
+    /// unless the user states versioning is on. B2 hides instead of deleting,
+    /// and other remote types keep today's behaviour. `remoteSection` is the
+    /// remote's rclone.conf section (`nil` = not found = no limit).
+    static func maxDeleteArgument(for profile: SyncProfile, remoteSection: [String: String]?) -> Int {
+        guard remoteSection?["type"] == "s3" else { return 0 }
+        let neverVersioned = ["Mega", "Cloudflare"].contains(remoteSection?["provider"] ?? "")
+        return neverVersioned || !profile.remoteVersioning ? profile.maxDelete : 0
+    }
+
     /// Generate profile-specific JSON config.
     /// Not private — `ConfigSelfTest` calls this directly to verify the
     /// derived config's key set stays frozen (AC-2) without going through
     /// the side-effecting `install(profile:)` (which touches launchd).
-    func generateProfileConfig(for profile: SyncProfile) -> String {
+    /// `rcloneConfig` is where the remote's type/provider is read for
+    /// `maxDelete`; the self-test passes a scratch one.
+    func generateProfileConfig(for profile: SyncProfile, rcloneConfig: RcloneConfigService = .shared) -> String {
+        let remoteSection = rcloneConfig.section(named: String(profile.rcloneRemote.prefix { $0 != ":" }))
         let config: [String: Any] = [
             "profileId": profile.id.uuidString,
             "name": profile.name,
@@ -613,6 +659,7 @@ final class SyncSetupService {
             "syncDirection": profile.syncDirection.rawValue,
             "remotePath": profile.remotePath,
             "transfers": profile.transfers,
+            "maxDelete": Self.maxDeleteArgument(for: profile, remoteSection: remoteSection),
         ]
 
         if let data = try? JSONSerialization.data(

@@ -33,6 +33,11 @@ struct SchedulerRunner {
     var refusalReason: () -> String?
     /// Log a refusal; throttled like `logSourceMissing`.
     var logRefusal: (String) -> Void
+    /// Whether the persistent delete-limit marker exists (limpet-plan.md L4
+    /// F6). Asked before every run, so a respawned watcher stays stopped.
+    var deleteLimitReached: () -> Bool
+    /// Write that marker after a run exited 76. Returns whether it was written.
+    var recordDeleteLimit: () -> Bool
 }
 
 /// Pure idle/running/(running+pending) scheduler for one profile's realtime
@@ -70,6 +75,12 @@ final class SyncWatchScheduler {
     private let missingSourceRecheckInterval: TimeInterval
     private var lastMissingSourceLogAt: TimeInterval?
     private var lastRefusalLogAt: TimeInterval?
+    /// A run exited 76 but the marker could not be written: stay stopped for
+    /// the life of this process rather than trust a marker that is not there.
+    private var deleteLimitUnrecorded = false
+
+    /// The sync script's exit code for "rclone stopped at --max-delete".
+    static let deleteLimitExitCode: Int32 = 76
 
     init(
         runner: SchedulerRunner,
@@ -101,6 +112,14 @@ final class SyncWatchScheduler {
     /// pending rerun that hits a missing source used to leave it stuck in
     /// `.running`, swallowing every later trigger).
     private func attemptRun(pending: Bool) {
+        if deleteLimitUnrecorded || runner.deleteLimitReached() {
+            if throttle(&lastRefusalLogAt) {
+                runner.logRefusal("delete limit reached (rclone --max-delete); clear it with "
+                    + "'limpet profile clear-delete-limit' or the menu, after checking the remote")
+            }
+            state = .idle
+            return
+        }
         if let reason = runner.refusalReason() {
             if throttle(&lastRefusalLogAt) { runner.logRefusal(reason) }
             state = .idle
@@ -119,6 +138,12 @@ final class SyncWatchScheduler {
     }
 
     private func handleExit(code: Int32) {
+        if code == Self.deleteLimitExitCode {
+            // Stop for good: a pending trigger is dropped, not rerun.
+            if !runner.recordDeleteLimit() { deleteLimitUnrecorded = true }
+            state = .idle
+            return
+        }
         if code == 75 {
             let pending = currentPending()
             state = .backoff(pending: pending)
