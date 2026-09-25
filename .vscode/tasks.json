@@ -64,12 +64,6 @@
             "problemMatcher": []
         },
         {
-            "label": "release",
-            "type": "shell",
-            "command": "npx nx run limpet:release",
-            "problemMatcher": []
-        },
-        {
             "label": "reset",
             "type": "shell",
             "command": "npx nx reset",
