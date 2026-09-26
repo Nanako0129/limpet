@@ -236,6 +236,15 @@ a `FileChange`; previously any line containing those substrings did, so a
 delete-limit trip showed the refused files as "Deleted" in the UI while they
 were still on the remote.
 
+**Exit-code text (limpet-plan.md L5.1 finding 2).** `SyncManager.exitCodeErrorText`
+is the single pure mapping from a `syncFailed` exit code to the text shown in
+`profileStates[id] = .error(...)` and, when no more specific error message is
+available, in the failure notification: 76 (the delete-limit trip, see
+**Delete limit** above) -> "Delete limit reached"; 64 (the script's
+`additionalRcloneFlags`/profile-settings refusal, see **Additional rclone
+Flags** above) -> "Refused: invalid profile settings (see log)"; every other
+code keeps the prior generic "Exit code N".
+
 **No unprompted keychain dialogs.** Before any `security` call,
 `KeychainSecretStore` asks a lock-status provider (production:
 `SecKeychainGetStatus`). While the login

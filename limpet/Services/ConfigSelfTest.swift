@@ -111,6 +111,7 @@ enum ConfigSelfTest {
             testSourceMissingParses,
             testSourceMissingClearsOnRecheck,
             testRcloneLogEntryFileChangeMapping,
+            testExitCodeErrorText,
         ]
 
         for check in checks {
@@ -3865,6 +3866,27 @@ enum ConfigSelfTest {
         let nonInfoDeleted = entry(level: "debug", msg: "Deleted", object: "c.txt")
         guard nonInfoDeleted.fileChange == nil else {
             return report(id, slug, false, "(a non-info \"Deleted\" line produced a FileChange)")
+        }
+
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L51-2 — exit-code text mapping
+
+    private static func testExitCodeErrorText() -> Bool {
+        let id = "AC-L51-2", slug = "exit-code-error-text"
+
+        let cases: [(Int, String)] = [
+            (76, "Delete limit reached"),
+            (64, "Refused: invalid profile settings (see log)"),
+            (1, "Exit code 1"),
+            (7, "Exit code 7"),
+        ]
+        for (code, expected) in cases {
+            let text = SyncManager.exitCodeErrorText(code)
+            guard text == expected else {
+                return report(id, slug, false, "(exit code \(code) mapped to \"\(text)\", expected \"\(expected)\")")
+            }
         }
 
         return report(id, slug, true)
