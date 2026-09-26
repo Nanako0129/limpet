@@ -219,6 +219,57 @@ completion sets `.idle`. `SyncManager.reduceProfileState` is the pure
 transition function for these three cases, extracted so it can be driven
 without a full `SyncManager`.
 
+**Recent Changes only reports rclone's own success lines (limpet-plan.md
+L5.1 finding 3).** `RcloneLogEntry.fileChange` (`RcloneLogEntry.swift`) is the
+only seam a `--use-json-log` line becomes a `FileChange` shown in the menu's
+Recent Changes list. It requires `level == "info"` and matches only rclone's
+own success message text (verified live against rclone 1.75.1, 2026-09-26,
+`rclone sync --use-json-log -v` between local temp dirs): any other
+`Copied (…)` — `Copied (new)`, `Copied (server-side copy)` (a 300 MiB
+local→local new file) — -> `.copied`, matched with `contains` so a prefixed
+variant is not dropped; `Copied (replaced existing)` and `Updated modification time in
+destination` -> `.updated`; `Deleted` -> `.deleted`; `Moved (server-side)
+to: ...` and `Renamed from "..."` (both lines are emitted per rename under
+`--track-renames`) -> `.renamed`. An `error`-level line mentioning "delete" or
+"copy" with an `object` set — e.g. rclone's `Got fatal error on delete:
+--max-delete threshold reached` (the same line that maps to exit 76, see
+**Delete limit** above) or a `Failed to copy: ...` failure — no longer yields
+a `FileChange`; previously any line containing those substrings did, so a
+delete-limit trip showed the refused files as "Deleted" in the UI while they
+were still on the remote.
+
+**Exit-code text (limpet-plan.md L5.1 finding 2).** `SyncManager.exitCodeErrorText`
+is the single pure mapping from a `syncFailed` exit code to the text shown in
+`profileStates[id] = .error(...)` and, when no more specific error message is
+available, in the failure notification: 76 (the delete-limit trip, see
+**Delete limit** above) -> "Delete limit reached"; every other code keeps
+the prior generic "Exit code N". A refusal (exit 64) is not mapped: the
+script exits before writing "Sync failed with exit code", so the GUI never
+sees that code — showing a refusal in the menu is open work.
+
+**Wizard remote creation (limpet-plan.md L5.1 finding 1).**
+`SetupWizardView.advanceToNextStep` returns early while `createRemote`'s
+`isLoading` is still true, so a second trigger (e.g. Return key plus a click)
+cannot start a second `addRemote` for the same in-progress remote. When
+`addRemote` throws `RcloneConfigService.ConfigError.remoteAlreadyExists`, the
+wizard shows "A remote named '<name>' already exists. Go Back and choose it
+from the list of existing remotes." — the Welcome step's "Existing Remote"
+picker is what that refers to. Unobserved until exercised in the running GUI
+(SwiftUI view; no self-test).
+
+**Menu display (limpet-plan.md L5.1 finding 4).**
+`MenuBarView.statusColor(for:)` returns `.gray` for any profile with
+`isEnabled == false` before switching on its sync state, so a disabled
+profile (including a freshly-created blank one, which defaults to `.idle`)
+never shows the green dot. `StatusHeaderView`'s "Last sync" formatter uses
+`dateTimeStyle = .named`: with the default `.numeric`, `RelativeDateTimeFormatter`
+renders every gap under one second as "in 0s" / `0秒後` (measured on macOS
+2026-09-26 for 0, -0.5 and -0.99 s; `lastSyncTime` is never in the future),
+while `.named` says "now" / `現在`, matches `.numeric` from one second to
+under a day, and names longer gaps ("yesterday" / `昨天`, "last wk." / `上週`).
+Neither change has a self-test (SwiftUI views); both are unobserved until
+exercised in the running GUI.
+
 **No unprompted keychain dialogs.** Before any `security` call,
 `KeychainSecretStore` asks a lock-status provider (production:
 `SecKeychainGetStatus`). While the login

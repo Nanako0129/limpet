@@ -969,6 +969,20 @@ final class SyncManager: ObservableObject {
         updateAggregateState()
     }
 
+    /// Pure text for a `syncFailed` exit code (limpet-plan.md L5.1 finding 2):
+    /// 76 is the script's dedicated delete-limit-trip code
+    /// (`SyncSetupService.maxDeleteArgument` / AC-L4-11); every other code
+    /// keeps the prior generic text. (No 64 case: a refusal exits before the
+    /// script writes "Sync failed with exit code", so it never reaches here.)
+    static func exitCodeErrorText(_ exitCode: Int) -> String {
+        switch exitCode {
+        case 76:
+            return "Delete limit reached"
+        default:
+            return "Exit code \(exitCode)"
+        }
+    }
+
     /// Pure state transition for the three events the source-missing clear
     /// path depends on (AC-L5-2 drives this directly, since standing up a
     /// full SyncManager needs a real profile store, workspace observers and
@@ -1040,7 +1054,7 @@ final class SyncManager: ObservableObject {
                 break
             }
 
-            profileStates[profileId] = .error("Exit code \(exitCode)")
+            profileStates[profileId] = .error(Self.exitCodeErrorText(exitCode))
             profileProgress[profileId] = nil  // Clear progress on failure
             lastSeenErrorMessage[profileId] = nil
             logWatchers[profileId]?.setActivelySyncing(false)  // Reduce polling frequency
@@ -1048,7 +1062,7 @@ final class SyncManager: ObservableObject {
             if profileErrors[profileId] == nil, let msg = message {
                 profileErrors[profileId] = msg
             }
-            let errorDescription = profileErrors[profileId] ?? message ?? "Exit code \(exitCode)"
+            let errorDescription = profileErrors[profileId] ?? message ?? Self.exitCodeErrorText(exitCode)
             if !isNotificationsMuted(for: profileId) {
                 notificationService.notifySyncError(
                     "Sync failed: \(errorDescription)",

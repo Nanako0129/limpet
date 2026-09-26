@@ -78,6 +78,11 @@ struct StatusHeaderView: View {
     private var relativeDateFormatter: RelativeDateTimeFormatter {
         let formatter = RelativeDateTimeFormatter()
         formatter.unitsStyle = .abbreviated
+        // .numeric renders any gap under 1 s as "in 0s" / `0秒後` (measured,
+        // macOS, 2026-09-26); .named says "now" / `現在` there, is the same
+        // from 1 s to under a day ("1s ago", "1m ago", "1h ago"), and names
+        // longer gaps ("yesterday" / `昨天`, "last wk." / `上週`).
+        formatter.dateTimeStyle = .named
         return formatter
     }
 

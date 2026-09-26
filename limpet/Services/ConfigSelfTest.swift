@@ -110,6 +110,8 @@ enum ConfigSelfTest {
             testKeychainLargeOutputDrained,
             testSourceMissingParses,
             testSourceMissingClearsOnRecheck,
+            testRcloneLogEntryFileChangeMapping,
+            testExitCodeErrorText,
         ]
 
         for check in checks {
@@ -3804,6 +3806,88 @@ enum ConfigSelfTest {
         state = SyncManager.reduceProfileState(state, for: .syncCompleted)
         guard state == .idle else {
             return report(id, slug, false, "(syncCompleted did not produce .idle: \(state))")
+        }
+
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L51-1 — RcloneLogEntry.fileChange only reports real success lines
+
+    private static func testRcloneLogEntryFileChangeMapping() -> Bool {
+        let id = "AC-L51-1", slug = "rclone-log-entry-file-change-mapping"
+
+        func entry(level: String, msg: String, object: String?) -> RcloneLogEntry {
+            RcloneLogEntry(
+                level: level, msg: msg, time: "2026-09-26T10:19:00.000000+08:00",
+                object: object, objectType: "*local.Object", stats: nil, source: nil, size: nil
+            )
+        }
+
+        // Success lines, verified live against rclone 1.75.1 (2026-09-26,
+        // `rclone sync --use-json-log -v` between local temp dirs under the
+        // scratchpad — see the L5.1 fix commit for the exact lines observed).
+        let successCases: [(String, FileChange.Operation)] = [
+            ("Copied (new)", .copied),
+            ("Copied (replaced existing)", .updated),
+            ("Copied (server-side copy)", .copied),
+            ("Updated modification time in destination", .updated),
+            ("Deleted", .deleted),
+            ("Moved (server-side) to: a-renamed.txt", .renamed),
+            ("Renamed from \"a.txt\"", .renamed),
+        ]
+        for (msg, expected) in successCases {
+            let e = entry(level: "info", msg: msg, object: "a.txt")
+            guard let change = e.fileChange, change.operation == expected else {
+                return report(id, slug, false, "(\"\(msg)\" did not map to .\(expected))")
+            }
+        }
+
+        // The max-delete error line (measured 2026-09-26, AC-L4-11) must never
+        // be reported as a deletion — this was the live defect (L5 finding 3).
+        let maxDeleteError = entry(
+            level: "error",
+            msg: "Got fatal error on delete: --max-delete threshold reached",
+            object: "del5.txt"
+        )
+        guard maxDeleteError.fileChange == nil else {
+            return report(id, slug, false, "(max-delete error line produced a FileChange)")
+        }
+
+        // A generic copy failure with an object must also yield nothing.
+        let copyFailure = entry(
+            level: "error",
+            msg: "Failed to copy: failed to open source object: permission denied",
+            object: "bad.txt"
+        )
+        guard copyFailure.fileChange == nil else {
+            return report(id, slug, false, "(\"Failed to copy: …\" error line produced a FileChange)")
+        }
+
+        // A non-info level mentioning "Deleted" must not count either.
+        let nonInfoDeleted = entry(level: "debug", msg: "Deleted", object: "c.txt")
+        guard nonInfoDeleted.fileChange == nil else {
+            return report(id, slug, false, "(a non-info \"Deleted\" line produced a FileChange)")
+        }
+
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L51-2 — exit-code text mapping
+
+    private static func testExitCodeErrorText() -> Bool {
+        let id = "AC-L51-2", slug = "exit-code-error-text"
+
+        let cases: [(Int, String)] = [
+            (76, "Delete limit reached"),
+            (64, "Exit code 64"),
+            (1, "Exit code 1"),
+            (7, "Exit code 7"),
+        ]
+        for (code, expected) in cases {
+            let text = SyncManager.exitCodeErrorText(code)
+            guard text == expected else {
+                return report(id, slug, false, "(exit code \(code) mapped to \"\(text)\", expected \"\(expected)\")")
+            }
         }
 
         return report(id, slug, true)
