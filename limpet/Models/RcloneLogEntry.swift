@@ -140,7 +140,7 @@ extension RcloneLogEntry {
 
         // First, try with the object field (standard rclone format)
         if let objectPath = object, !objectPath.isEmpty {
-            if let operation = parseOperation(from: cleanMsg) {
+            if let operation = parseOperation(from: cleanMsg, level: level) {
                 return FileChange(
                     timestamp: date ?? Date(),
                     path: objectPath,
@@ -160,23 +160,36 @@ extension RcloneLogEntry {
         return regex.stringByReplacingMatches(in: text, range: range, withTemplate: "")
     }
 
-    private func parseOperation(from message: String) -> FileChange.Operation? {
-        let lowercased = message.lowercased()
+    /// Maps a single rclone `--use-json-log` line to a FileChange operation.
+    ///
+    /// Only `level == "info"` lines count — an `error` line (e.g. a failed copy
+    /// or the max-delete threshold message) mentioning "delete"/"copy" and
+    /// carrying an `object` must never be reported as a completed change
+    /// (limpet-plan.md L5 finding 3). Within info lines, only rclone's own
+    /// success message text is matched, verified live against rclone 1.75.1
+    /// (2026-09-26, `rclone sync --use-json-log -v` between local temp dirs;
+    /// see the L5.1 fix commit for the exact lines observed):
+    /// "Copied (new)" -> .copied; "Copied (replaced existing)" and
+    /// "Updated modification time in destination" -> .updated; "Deleted"
+    /// -> .deleted; "Moved (server-side) to: ..." and "Renamed from \"...\""
+    /// (both emitted per rename under `--track-renames`) -> .renamed.
+    private func parseOperation(from message: String, level: String) -> FileChange.Operation? {
+        guard level == "info" else { return nil }
 
-        if lowercased.contains("copied") || lowercased.contains("copy") {
-            if lowercased.contains("new") {
-                return .copied
-            }
+        if message.hasPrefix("Copied (new)") {
+            return .copied
+        }
+        if message.hasPrefix("Copied (replaced existing)") {
             return .updated
         }
-        if lowercased.contains("deleted") || lowercased.contains("delete") {
+        if message.hasPrefix("Updated modification time in destination") {
+            return .updated
+        }
+        if message == "Deleted" {
             return .deleted
         }
-        if lowercased.contains("renamed") || lowercased.contains("rename") || lowercased.contains("moved") {
+        if message.hasPrefix("Moved (server-side) to:") || message.hasPrefix("Renamed from") {
             return .renamed
-        }
-        if lowercased.contains("updated") || lowercased.contains("update") {
-            return .updated
         }
 
         return nil

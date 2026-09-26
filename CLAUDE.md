@@ -219,6 +219,23 @@ completion sets `.idle`. `SyncManager.reduceProfileState` is the pure
 transition function for these three cases, extracted so it can be driven
 without a full `SyncManager`.
 
+**Recent Changes only reports rclone's own success lines (limpet-plan.md
+L5.1 finding 3).** `RcloneLogEntry.fileChange` (`RcloneLogEntry.swift`) is the
+only seam a `--use-json-log` line becomes a `FileChange` shown in the menu's
+Recent Changes list. It requires `level == "info"` and matches only rclone's
+own success message text (verified live against rclone 1.75.1, 2026-09-26,
+`rclone sync --use-json-log -v` between local temp dirs): `Copied (new)` ->
+`.copied`; `Copied (replaced existing)` and `Updated modification time in
+destination` -> `.updated`; `Deleted` -> `.deleted`; `Moved (server-side)
+to: ...` and `Renamed from "..."` (both lines are emitted per rename under
+`--track-renames`) -> `.renamed`. An `error`-level line mentioning "delete" or
+"copy" with an `object` set — e.g. rclone's `Got fatal error on delete:
+--max-delete threshold reached` (the same line that maps to exit 76, see
+**Delete limit** above) or a `Failed to copy: ...` failure — no longer yields
+a `FileChange`; previously any line containing those substrings did, so a
+delete-limit trip showed the refused files as "Deleted" in the UI while they
+were still on the remote.
+
 **No unprompted keychain dialogs.** Before any `security` call,
 `KeychainSecretStore` asks a lock-status provider (production:
 `SecKeychainGetStatus`). While the login
