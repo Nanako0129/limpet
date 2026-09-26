@@ -265,7 +265,8 @@ never shows the green dot. `StatusHeaderView`'s "Last sync" formatter uses
 `dateTimeStyle = .named`: with the default `.numeric`, `RelativeDateTimeFormatter`
 renders every gap under one second as "in 0s" / `0秒後` (measured on macOS
 2026-09-26 for 0, -0.5 and -0.99 s; `lastSyncTime` is never in the future),
-while `.named` says "now" / `現在` and is identical from one second on.
+while `.named` says "now" / `現在`, matches `.numeric` from one second to
+under a day, and names longer gaps ("yesterday" / `昨天`, "last wk." / `上週`).
 Neither change has a self-test (SwiftUI views); both are unobserved until
 exercised in the running GUI.
 
