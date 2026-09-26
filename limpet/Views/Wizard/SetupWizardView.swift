@@ -651,19 +651,19 @@ struct SetupWizardView: View {
                 try configService.addRemote(capturedConfig)
                 let remoteName = "\(capturedConfig.name):"
                 DispatchQueue.main.async {
-                    isLoading = false
-                    selectedRemote = remoteName
+                    self.isLoading = false
+                    self.selectedRemote = remoteName
                     completion()
                 }
             } catch RcloneConfigService.ConfigError.remoteAlreadyExists(let name) {
                 DispatchQueue.main.async {
-                    isLoading = false
-                    errorMessage = "A remote named '\(name)' already exists. Go Back and choose it from the list of existing remotes."
+                    self.isLoading = false
+                    self.errorMessage = "A remote named '\(name)' already exists. Go Back and choose it from the list of existing remotes."
                 }
             } catch {
                 DispatchQueue.main.async {
-                    isLoading = false
-                    errorMessage = error.localizedDescription
+                    self.isLoading = false
+                    self.errorMessage = error.localizedDescription
                 }
             }
         }
