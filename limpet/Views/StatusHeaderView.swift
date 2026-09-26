@@ -39,7 +39,10 @@ struct StatusHeaderView: View {
                         .font(.headline)
 
                     if let lastSync = syncManager.lastSyncTime {
-                        Text("Last sync: \(lastSync, formatter: relativeDateFormatter)")
+                        // limpet-plan.md L5 finding 4: a lastSync timestamp
+                        // slightly ahead of now (clock skew) must never render
+                        // as "in 0 seconds" — clamp to now before formatting.
+                        Text("Last sync: \(relativeDateFormatter.localizedString(for: min(lastSync, Date()), relativeTo: Date()))")
                             .font(.caption)
                             .foregroundColor(.secondary)
                     } else {

@@ -255,6 +255,16 @@ from the list of existing remotes." — the Welcome step's "Existing Remote"
 picker is what that refers to. Unobserved until exercised in the running GUI
 (SwiftUI view; no self-test).
 
+**Menu display (limpet-plan.md L5.1 finding 4).**
+`MenuBarView.statusColor(for:)` returns `.gray` for any profile with
+`isEnabled == false` before switching on its sync state, so a disabled
+profile (including a freshly-created blank one, which defaults to `.idle`)
+never shows the green dot. `StatusHeaderView`'s "Last sync" line formats
+`min(lastSync, Date())`, so a `lastSyncTime` slightly ahead of now (clock
+skew) never renders as "in 0 seconds". Neither has a self-test (SwiftUI
+views); both are a single expression, unobserved until exercised in the
+running GUI.
+
 **No unprompted keychain dialogs.** Before any `security` call,
 `KeychainSecretStore` asks a lock-status provider (production:
 `SecKeychainGetStatus`). While the login

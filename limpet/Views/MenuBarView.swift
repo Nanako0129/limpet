@@ -180,6 +180,10 @@ struct MenuBarView: View {
     }
 
     private func statusColor(for profile: SyncProfile) -> Color {
+        // limpet-plan.md L5 finding 4: a disabled profile (including a
+        // freshly-created blank one, which defaults to .idle) must never
+        // show the green "syncing fine" dot.
+        guard profile.isEnabled else { return .gray }
         switch syncManager.state(for: profile.id) {
         case .idle:
             return .green
