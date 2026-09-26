@@ -261,11 +261,13 @@ picker is what that refers to. Unobserved until exercised in the running GUI
 `MenuBarView.statusColor(for:)` returns `.gray` for any profile with
 `isEnabled == false` before switching on its sync state, so a disabled
 profile (including a freshly-created blank one, which defaults to `.idle`)
-never shows the green dot. `StatusHeaderView`'s "Last sync" line formats
-`min(lastSync, Date())`, so a `lastSyncTime` slightly ahead of now (clock
-skew) never renders as "in 0 seconds". Neither has a self-test (SwiftUI
-views); both are a single expression, unobserved until exercised in the
-running GUI.
+never shows the green dot. `StatusHeaderView`'s "Last sync" formatter uses
+`dateTimeStyle = .named`: with the default `.numeric`, `RelativeDateTimeFormatter`
+renders every gap under one second as "in 0s" / `0秒後` (measured on macOS
+2026-09-26 for 0, -0.5 and -0.99 s; `lastSyncTime` is never in the future),
+while `.named` says "now" / `現在` and is identical from one second on.
+Neither change has a self-test (SwiftUI views); both are unobserved until
+exercised in the running GUI.
 
 **No unprompted keychain dialogs.** Before any `security` call,
 `KeychainSecretStore` asks a lock-status provider (production:

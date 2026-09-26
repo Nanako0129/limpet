@@ -39,10 +39,7 @@ struct StatusHeaderView: View {
                         .font(.headline)
 
                     if let lastSync = syncManager.lastSyncTime {
-                        // limpet-plan.md L5 finding 4: a lastSync timestamp
-                        // slightly ahead of now (clock skew) must never render
-                        // as "in 0 seconds" — clamp to now before formatting.
-                        Text("Last sync: \(relativeDateFormatter.localizedString(for: min(lastSync, Date()), relativeTo: Date()))")
+                        Text("Last sync: \(lastSync, formatter: relativeDateFormatter)")
                             .font(.caption)
                             .foregroundColor(.secondary)
                     } else {
@@ -81,6 +78,10 @@ struct StatusHeaderView: View {
     private var relativeDateFormatter: RelativeDateTimeFormatter {
         let formatter = RelativeDateTimeFormatter()
         formatter.unitsStyle = .abbreviated
+        // .numeric renders any gap under 1 s as "in 0s" / `0秒後` (measured,
+        // macOS, 2026-09-26); .named says "now" / `現在` there and is
+        // otherwise identical ("1s ago", "1m ago").
+        formatter.dateTimeStyle = .named
         return formatter
     }
 
