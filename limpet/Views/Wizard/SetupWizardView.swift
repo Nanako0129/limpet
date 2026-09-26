@@ -607,6 +607,10 @@ struct SetupWizardView: View {
 
         // Create remote if on credentials step
         if currentStep == .credentials && selectedRemote.isEmpty {
+            // Re-entry guard (limpet-plan.md L5.1 finding 1): a second trigger
+            // (e.g. Return key + a click) while addRemote is still running
+            // off-main must not start a second creation of the same remote.
+            guard !isLoading else { return }
             createRemote {
                 withAnimation {
                     currentStep = nextStep
@@ -650,6 +654,11 @@ struct SetupWizardView: View {
                     isLoading = false
                     selectedRemote = remoteName
                     completion()
+                }
+            } catch RcloneConfigService.ConfigError.remoteAlreadyExists(let name) {
+                DispatchQueue.main.async {
+                    isLoading = false
+                    errorMessage = "A remote named '\(name)' already exists. Go Back and choose it from the list of existing remotes."
                 }
             } catch {
                 DispatchQueue.main.async {

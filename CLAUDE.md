@@ -245,6 +245,16 @@ available, in the failure notification: 76 (the delete-limit trip, see
 Flags** above) -> "Refused: invalid profile settings (see log)"; every other
 code keeps the prior generic "Exit code N".
 
+**Wizard remote creation (limpet-plan.md L5.1 finding 1).**
+`SetupWizardView.advanceToNextStep` returns early while `createRemote`'s
+`isLoading` is still true, so a second trigger (e.g. Return key plus a click)
+cannot start a second `addRemote` for the same in-progress remote. When
+`addRemote` throws `RcloneConfigService.ConfigError.remoteAlreadyExists`, the
+wizard shows "A remote named '<name>' already exists. Go Back and choose it
+from the list of existing remotes." — the Welcome step's "Existing Remote"
+picker is what that refers to. Unobserved until exercised in the running GUI
+(SwiftUI view; no self-test).
+
 **No unprompted keychain dialogs.** Before any `security` call,
 `KeychainSecretStore` asks a lock-status provider (production:
 `SecKeychainGetStatus`). While the login
