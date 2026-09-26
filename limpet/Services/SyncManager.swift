@@ -971,15 +971,13 @@ final class SyncManager: ObservableObject {
 
     /// Pure text for a `syncFailed` exit code (limpet-plan.md L5.1 finding 2):
     /// 76 is the script's dedicated delete-limit-trip code
-    /// (`SyncSetupService.maxDeleteArgument` / AC-L4-11), 64 is its
-    /// argument-validation refusal code (see CLAUDE.md's `additionalRcloneFlags`
-    /// section); every other code keeps the prior generic text unchanged.
+    /// (`SyncSetupService.maxDeleteArgument` / AC-L4-11); every other code
+    /// keeps the prior generic text. (No 64 case: a refusal exits before the
+    /// script writes "Sync failed with exit code", so it never reaches here.)
     static func exitCodeErrorText(_ exitCode: Int) -> String {
         switch exitCode {
         case 76:
             return "Delete limit reached"
-        case 64:
-            return "Refused: invalid profile settings (see log)"
         default:
             return "Exit code \(exitCode)"
         }

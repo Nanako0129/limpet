@@ -3829,6 +3829,7 @@ enum ConfigSelfTest {
         let successCases: [(String, FileChange.Operation)] = [
             ("Copied (new)", .copied),
             ("Copied (replaced existing)", .updated),
+            ("Copied (server-side copy)", .copied),
             ("Updated modification time in destination", .updated),
             ("Deleted", .deleted),
             ("Moved (server-side) to: a-renamed.txt", .renamed),
@@ -3878,7 +3879,7 @@ enum ConfigSelfTest {
 
         let cases: [(Int, String)] = [
             (76, "Delete limit reached"),
-            (64, "Refused: invalid profile settings (see log)"),
+            (64, "Exit code 64"),
             (1, "Exit code 1"),
             (7, "Exit code 7"),
         ]

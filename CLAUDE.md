@@ -224,8 +224,10 @@ L5.1 finding 3).** `RcloneLogEntry.fileChange` (`RcloneLogEntry.swift`) is the
 only seam a `--use-json-log` line becomes a `FileChange` shown in the menu's
 Recent Changes list. It requires `level == "info"` and matches only rclone's
 own success message text (verified live against rclone 1.75.1, 2026-09-26,
-`rclone sync --use-json-log -v` between local temp dirs): `Copied (new)` ->
-`.copied`; `Copied (replaced existing)` and `Updated modification time in
+`rclone sync --use-json-log -v` between local temp dirs): any other
+`Copied (…)` — `Copied (new)`, `Copied (server-side copy)` (a 300 MiB
+local→local new file) — -> `.copied`, matched with `contains` so a prefixed
+variant is not dropped; `Copied (replaced existing)` and `Updated modification time in
 destination` -> `.updated`; `Deleted` -> `.deleted`; `Moved (server-side)
 to: ...` and `Renamed from "..."` (both lines are emitted per rename under
 `--track-renames`) -> `.renamed`. An `error`-level line mentioning "delete" or
@@ -240,10 +242,10 @@ were still on the remote.
 is the single pure mapping from a `syncFailed` exit code to the text shown in
 `profileStates[id] = .error(...)` and, when no more specific error message is
 available, in the failure notification: 76 (the delete-limit trip, see
-**Delete limit** above) -> "Delete limit reached"; 64 (the script's
-`additionalRcloneFlags`/profile-settings refusal, see **Additional rclone
-Flags** above) -> "Refused: invalid profile settings (see log)"; every other
-code keeps the prior generic "Exit code N".
+**Delete limit** above) -> "Delete limit reached"; every other code keeps
+the prior generic "Exit code N". A refusal (exit 64) is not mapped: the
+script exits before writing "Sync failed with exit code", so the GUI never
+sees that code — showing a refusal in the menu is open work.
 
 **Wizard remote creation (limpet-plan.md L5.1 finding 1).**
 `SetupWizardView.advanceToNextStep` returns early while `createRemote`'s

@@ -176,11 +176,14 @@ extension RcloneLogEntry {
     private func parseOperation(from message: String, level: String) -> FileChange.Operation? {
         guard level == "info" else { return nil }
 
-        if message.hasPrefix("Copied (new)") {
-            return .copied
-        }
-        if message.hasPrefix("Copied (replaced existing)") {
+        // Any "Copied (…)" success: "(new)" and "(server-side copy)" were
+        // measured on rclone 1.75.1; contains, not hasPrefix, so a prefixed
+        // variant (e.g. a multi-thread transfer's) is not dropped.
+        if message.contains("Copied (replaced existing)") {
             return .updated
+        }
+        if message.contains("Copied (") {
+            return .copied
         }
         if message.hasPrefix("Updated modification time in destination") {
             return .updated
