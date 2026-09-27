@@ -152,6 +152,7 @@ enum ConfigSelfTest {
             testCLIWriteMarkerClassification,
             testAppWritesLeaveMarkerDirEmpty,
             testCLIMarkerSuppressesReconcile,
+            testSyncAlreadyRunningSetsSyncing,
         ]
 
         for check in checks {
@@ -4178,6 +4179,25 @@ enum ConfigSelfTest {
 
             return report(id, slug, true)
         }
+    }
+
+    // MARK: - AC-L61-4 — .syncAlreadyRunning reduces to .syncing
+
+    /// limpet-plan.md L6.1 change C, root cause 3. Mutation: reverting the
+    /// `.syncAlreadyRunning` case added to `SyncManager.reduceProfileState`
+    /// (and the matching `processLogEvent` branch) must fail this.
+    private static func testSyncAlreadyRunningSetsSyncing() -> Bool {
+        let id = "AC-L61-4", slug = "sync-already-running-sets-syncing"
+        let result = SyncManager.reduceProfileState(.idle, for: .syncAlreadyRunning)
+        guard result == .syncing else {
+            return report(id, slug, false, "(.syncAlreadyRunning reduced .idle to \(result), expected .syncing)")
+        }
+        // Idempotent from an already-syncing state too.
+        let result2 = SyncManager.reduceProfileState(.syncing, for: .syncAlreadyRunning)
+        guard result2 == .syncing else {
+            return report(id, slug, false, "(.syncAlreadyRunning reduced .syncing to \(result2), expected .syncing)")
+        }
+        return report(id, slug, true)
     }
 
 }

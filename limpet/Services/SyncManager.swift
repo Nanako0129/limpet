@@ -836,14 +836,29 @@ final class SyncManager: ObservableObject {
         }
     }
 
+    /// (limpet-plan.md L6.1 change C, root cause 3.) Runs the SAME lock-file
+    /// check `detectAndResumeRunningSyncs` does at launch, so a profile whose
+    /// watching (re)starts later — e.g. after a `.reinstall` reconcile tears
+    /// down and rebuilds its `LogWatcher` — sees a sync already in flight
+    /// instead of defaulting to `.idle` and staying wrong until that sync
+    /// happens to log a line. `monitoringExternalSyncs` is checked first so a
+    /// sync launch already detected (and already being polled) never gets a
+    /// second poller.
     private func startWatching(profile: SyncProfile) {
         let watcher = LogWatcher(logPath: profile.logPath)
         watcher.delegate = self
         watcher.startWatching()
         logWatchers[profile.id] = watcher
 
-        // If a sync is already running (detected at startup), use faster polling
-        if profileStates[profile.id] == .syncing {
+        if let pid = detectRunningSyncPID(for: profile) {
+            profileStates[profile.id] = .syncing
+            watcher.setActivelySyncing(true)
+            if !monitoringExternalSyncs.contains(profile.id) {
+                monitoringExternalSyncs.insert(profile.id)
+                startPollingForSyncCompletion(profile: profile, pid: pid)
+            }
+        } else if profileStates[profile.id] == .syncing {
+            // Set by `detectAndResumeRunningSyncs` moments ago, at launch.
             watcher.setActivelySyncing(true)
         } else {
             profileStates[profile.id] = .idle
@@ -1015,7 +1030,7 @@ final class SyncManager: ObservableObject {
     /// it can be exercised headlessly.
     static func reduceProfileState(_ current: SyncState, for eventType: ParsedLogEvent.EventType) -> SyncState {
         switch eventType {
-        case .syncStarted:
+        case .syncStarted, .syncAlreadyRunning:
             return .syncing
         case .syncCompleted:
             return .idle
@@ -1128,7 +1143,11 @@ final class SyncManager: ObservableObject {
             }
 
         case .syncAlreadyRunning:
-            break
+            // limpet-plan.md L6.1 change C, root cause 3: a lock-held skip line
+            // means a sync IS running (elsewhere, or from before this app/watcher
+            // pairing started watching) — show it, through the same pure reducer
+            // `.syncStarted`/`.syncCompleted` use.
+            profileStates[profileId] = Self.reduceProfileState(profileStates[profileId] ?? .idle, for: event.type)
 
         case .sourceMissing(let path):
             // Menu only (L5.0) — no notification. Clears through the existing
