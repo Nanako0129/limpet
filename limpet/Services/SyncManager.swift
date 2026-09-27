@@ -883,6 +883,12 @@ final class SyncManager: ObservableObject {
     private func stopWatching(profileId: UUID) {
         logWatchers[profileId]?.stopWatching()
         logWatchers.removeValue(forKey: profileId)
+        // Same cleanup as pauseProfile: a poller left behind here would keep
+        // the id in monitoringExternalSyncs and block the poller for the sync
+        // the next startWatching finds (CodeRabbit, PR #9).
+        syncCompletionPollers[profileId]?.cancel()
+        syncCompletionPollers.removeValue(forKey: profileId)
+        monitoringExternalSyncs.remove(profileId)
 
         profileStates.removeValue(forKey: profileId)
     }

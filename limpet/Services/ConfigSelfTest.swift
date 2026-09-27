@@ -4526,6 +4526,27 @@ enum ConfigSelfTest {
             return report(id, slug, false, "(the plist was left behind after a failed load)")
         }
 
+        // (c) CodeRabbit PR #9: a loaded agent that fails to unload must not be
+        // "replaced" by a load on top of it — install throws and never loads.
+        callOrder = []
+        do {
+            try SyncSetupService.shared.install(
+                profile: profile, loadAgent: true,
+                executablePath: "/Applications/limpet.app/Contents/MacOS/limpet",
+                otherProfiles: [], isInstalled: { _ in false },
+                loadCommand: { _ in callOrder.append("load"); return (output: "", exitCode: 0) },
+                isLoadedCheck: { _ in true },
+                unloadCommand: { _ in callOrder.append("unload"); return (output: "busy", exitCode: 5) })
+            return report(id, slug, false, "(install did not throw on a failing unload)")
+        } catch SyncSetupService.SetupError.launchAgentUnloadFailed {
+            // expected
+        } catch {
+            return report(id, slug, false, "(threw the wrong error on a failing unload: \(error))")
+        }
+        guard callOrder == ["unload"] else {
+            return report(id, slug, false, "(call order after a failing unload was \(callOrder), expected [unload] only)")
+        }
+
         return report(id, slug, true)
     }
 

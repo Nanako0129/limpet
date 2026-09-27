@@ -500,9 +500,9 @@ non-zero with a greppable `error: no profile matches "<target>"`.
 whether or not the menu-bar app is running:** they write the authoritative
 `.profile.json` and drive `SyncSetupService` install/uninstall directly (the
 launchd delta chosen by the shared `SyncManager.reconcileAction`). When the app
-IS running, its `ConfigFileWatcher` also sees the write and reconciles — the two
-converge on identical files and one loaded agent, so running both is redundant,
-not conflicting. Profile files stay credential-free (secrets live in
+IS running, its `ConfigFileWatcher` sees the write, recognises it as a CLI write
+through `CLIWriteMarker`, and refreshes its in-memory state without a second
+launchd reconcile (see "Cross-process self-write suppression" above). Profile files stay credential-free (secrets live in
 `~/.config/rclone/rclone.conf` or, for keychain-backed remotes, the login
 keychain), so no profile file the CLI writes carries a credential.
 

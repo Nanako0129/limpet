@@ -200,7 +200,12 @@ final class SyncSetupService {
         // agent is currently loaded, so `load` always starts fresh.
         if loadAgent {
             if isLoadedCheck(profile) {
-                _ = unloadCommand(profile.plistPath)
+                // Loading on top of an agent that failed to unload would report
+                // success without the old watcher stopping (CodeRabbit, PR #9).
+                let unload = unloadCommand(profile.plistPath)
+                guard unload.exitCode == 0 else {
+                    throw SetupError.launchAgentUnloadFailed(exitCode: unload.exitCode, output: unload.output)
+                }
             }
             let result = loadCommand(profile.plistPath)
             guard result.exitCode == 0 else {
@@ -889,6 +894,7 @@ final class SyncSetupService {
         case shimInstallFailed
         case refusedProfile(String)
         case launchAgentLoadFailed(exitCode: Int32, output: String)
+        case launchAgentUnloadFailed(exitCode: Int32, output: String)
 
         var errorDescription: String? {
             switch self {
@@ -915,6 +921,10 @@ final class SyncSetupService {
                 return "Refusing to install: \(reason)"
             case .launchAgentLoadFailed(let exitCode, let output):
                 return "launchctl load failed (exit \(exitCode)): "
+                    + (output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                        ? "no output" : output.trimmingCharacters(in: .whitespacesAndNewlines))
+            case .launchAgentUnloadFailed(let exitCode, let output):
+                return "launchctl unload of the running agent failed (exit \(exitCode)), so it was not replaced: "
                     + (output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                         ? "no output" : output.trimmingCharacters(in: .whitespacesAndNewlines))
             }
