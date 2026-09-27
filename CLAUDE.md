@@ -219,6 +219,61 @@ completion sets `.idle`. `SyncManager.reduceProfileState` is the pure
 transition function for these three cases, extracted so it can be driven
 without a full `SyncManager`.
 
+**A (re)started watcher checks the lock, not stale state (limpet-plan.md
+L6.1 change C).** `SyncManager.startWatching(profile:)` runs whenever a
+profile's `LogWatcher` (re)starts — at launch, and again whenever
+`startWatchingAllProfiles` rebuilds one after `.reinstall` tore it down.
+Before this it defaulted the new state to `.idle` unless
+`profileStates[profile.id]` already read `.syncing` — a value only
+`detectAndResumeRunningSyncs` sets, and only once, at app launch — so a
+sync already in flight when watching (re)starts later showed Idle until
+the run happened to log a line (measured live 2026-09-27). `startWatching`
+now runs the SAME lock-file check (`detectRunningSyncPID`) launch does: if a
+sync currently holds the profile's lock, it sets `.syncing` and starts the
+existing completion poller, guarded by `monitoringExternalSyncs` so an
+already-detected, already-polled sync never gets a second poller.
+Separately, the sync script's lock-held skip line (`.syncAlreadyRunning`,
+previously a silent `break` in `processLogEvent`) now routes through
+`SyncManager.reduceProfileState` like every other state transition, so a
+lock the script itself observed also shows as `.syncing` in the menu.
+
+**The watcher forwards SIGTERM/SIGINT to the sync child's process group
+(limpet-plan.md L6.1 change B).** `SyncWatchDaemon.run` originally handled
+only `SIGUSR1` ("sync now"); `launchctl unload` sends `SIGTERM`, and with no
+handler that took the default action (terminate the watcher). The sync
+child is spawned with Foundation `Process`, which makes it its OWN
+process-group leader — measured live: watcher pgid 24762, script/rclone/tee
+pgid 61291, a different group — so killing only the watcher left the
+script, rclone and tee running under launchd (reparented to pid 1), still
+holding the profile's lock, while the very next watcher (started right
+after by `KeepAlive`/the CLI's reinstall sequence) logged `Sync already
+running … skipping` every ~10s until the orphan finished on its own. `run`
+now attaches a `SIGTERM`/`SIGINT` `DispatchSource` (`SIG_IGN` first, exactly
+like the existing `SIGUSR1` pattern) whose handler sends `SIGTERM` to the
+CHILD'S PROCESS GROUP (`SyncWatchDaemon.terminateChildProcessGroup(pid:)`,
+`killpg(childPid, SIGTERM)`) and calls `exit(0)` immediately — no waiting, so
+`launchctl unload`/`load` timing is unchanged. rclone's default
+`--delete-after` means an interrupted run has already finished every
+transfer before it would ever start deleting, so this can't leave a partial
+delete; the next watcher's catch-up sync resumes whatever didn't finish.
+The running child's PID crosses from the background queue that spawns it
+(`runChildProcess`) to the main-queue signal handler through a small
+`NSLock`-guarded box (`RunningChildPID`), the one piece of state both sides
+touch.
+
+**`SyncSetupService.install` surfaces a `launchctl load` failure (limpet-plan.md
+L6.1 change B).** `install` previously discarded `launchctl load`'s exit
+status (`_ = runCommand(...)`), so a load failure (a malformed plist, a
+stale label collision) silently left a profile with no running watcher.
+`install` now takes an injectable `loadCommand` closure (default:
+`runLaunchctlLoad`, `runCommand("/bin/launchctl", ["load", plistPath])`
+factored out for this seam and for self-test injection) and throws
+`SetupError.launchAgentLoadFailed(exitCode:output:)` on a non-zero exit —
+callers already surface a thrown install error (CLI stderr via
+`installProfile`, the app's `profileErrors` via
+`applyProfileChange`/`applyExternalProfileEdit`), so no caller needed a
+change.
+
 **Recent Changes only reports rclone's own success lines (limpet-plan.md
 L5.1 finding 3).** `RcloneLogEntry.fileChange` (`RcloneLogEntry.swift`) is the
 only seam a `--use-json-log` line becomes a `FileChange` shown in the menu's
@@ -286,9 +341,37 @@ That is one end-to-end observation of this path; that `SecKeychainGetStatus`
 can never prompt was not measured on its own.
 
 **Self-write suppression.** `ConfigSelfWriteRegistry` tracks the content hash
-of every file limpet itself writes; `ConfigFileWatcher.shouldReconcile`
+of every file limpet itself writes; `ConfigFileWatcher.classifyWrite`
+(`shouldReconcile` is a thin `!= .skip` wrapper kept for one existing test)
 drops an FSEvent whose file content hash matches a just-noted self-write, so
 the app never reacts to its own writes.
+
+**Cross-process self-write suppression (limpet-plan.md L6.1 change A).**
+`ConfigSelfWriteRegistry` is per-process, so it cannot recognize a write made
+by the SEPARATE `limpet` CLI process — without more, the running app's
+`ConfigFileWatcher` would see every CLI-driven profile write as an external
+edit and reconcile launchd a second time, on top of the reconcile the CLI
+command (`profile set`/`create`/`enable`/`disable`) already did itself
+(measured live 2026-09-27: every CLI edit reinstalled/reloaded the agent
+twice). `CLIWriteMarker` (`ConfigFileWatcher.swift`) closes that gap: the
+CLI's `writeProfile` closure (`LimpetCLI.swift`, the ONLY caller — `ProfileStore`
+itself stays marker-free) hashes the exact bytes it is about to write
+(`ProfileStore.encodedProfileFileData`) and drops a marker file named by that
+hash under `CLIWriteMarker.directory` (`<LimpetPaths.home>/.local/state/limpet/cli-writes`)
+BEFORE writing the profile file, so a racing FSEvent can never arrive first.
+`ConfigFileWatcher.classifyWrite` returns a three-way `WriteOrigin`: the
+in-process registry is checked FIRST (a hit is `.skip`, and the marker is
+never even read); on a miss, a matching marker is consumed (read and deleted)
+and the origin is `.cliWrite`; otherwise `.external`. Markers older than 10
+minutes are swept on every check, so a crashed CLI can't suppress a later,
+genuinely external edit forever. On `.cliWrite`,
+`SyncManager.applyExternalProfileEdit`/`applyExternalProfileCreate` still run
+`persist` (so `profileStore.profiles`, and through its `$profiles` sink the
+`LogWatcher` wiring, stays current) but replace `install`/`uninstall` with
+no-ops — the CLI process already drove `SyncSetupService` itself.
+`CLIWriteMarker.directory` is `private(set)`, changed only through
+`withDirectory(_:_:)` (redirect for a closure, restore after) — the self-test's
+only way to point it at an isolated temp dir instead of the real path.
 
 **Launch-at-login isolation.** `settings.json`'s `launchAtLogin` key is
 read-write via `SMAppService.register`/`unregister`, applied through
