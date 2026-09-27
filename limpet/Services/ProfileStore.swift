@@ -119,8 +119,8 @@ final class ProfileStore: ObservableObject {
     /// `profiles`) so the file-authoritative `load()` can never resurrect a
     /// deleted profile. The prune only touches the `*.profile.json` suffix —
     /// never the derived `{shortId}.json`, the exclude filter, or `schema/`.
-    /// A pruned file generates an FSEvent, but `ConfigFileWatcher.shouldReconcile`
-    /// returns false for a missing file and `classify` only reacts to existing
+    /// A pruned file generates an FSEvent, but `ConfigFileWatcher.classifyWrite`
+    /// returns `.skip` for a missing file and `classify` only reacts to existing
     /// `.profile.json` changes, so pruning is safe with the watcher.
     private func writeProfileFiles() {
         guard (try? FileManager.default.createDirectory(

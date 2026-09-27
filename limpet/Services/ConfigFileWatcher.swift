@@ -340,15 +340,6 @@ final class ConfigFileWatcher {
         }
         return .external
     }
-
-    /// Legacy bool view of `classifyWrite`, kept only because it reads more
-    /// directly in a plain self-write-suppression test (AC-5): `true` unless
-    /// the write should be skipped entirely. Touches `CLIWriteMarker` exactly
-    /// like `classifyWrite` — a caller in a self-test MUST wrap it in
-    /// `CLIWriteMarker.withDirectory` to avoid ever reading the real path.
-    static func shouldReconcile(forFileAt path: String) -> Bool {
-        classifyWrite(forFileAt: path) != .skip
-    }
 }
 
 // MARK: - FSEvents Callback

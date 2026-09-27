@@ -429,7 +429,7 @@ final class SyncManager: ObservableObject {
     /// isn't `{shortId}.profile.json`, the differently-named source is removed
     /// AFTER `profileStore.add` writes the canonical file (which notes its own
     /// content hash in `ConfigSelfWriteRegistry`) — the resulting missing-source
-    /// FSEvent is a no-op (`ConfigFileWatcher.shouldReconcile` returns false for
+    /// FSEvent is a no-op (`ConfigFileWatcher.classifyWrite` returns `.skip` for
     /// a missing file), so this can never loop.
     private func applyExternalProfileCreate(decoded: SyncProfile, sourcePath: String, suppressReconcile: Bool = false) {
         let outcome = Self.applyExternalCreateIfNeeded(

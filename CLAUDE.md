@@ -350,10 +350,11 @@ That is one end-to-end observation of this path; that `SecKeychainGetStatus`
 can never prompt was not measured on its own.
 
 **Self-write suppression.** `ConfigSelfWriteRegistry` tracks the content hash
-of every file limpet itself writes; `ConfigFileWatcher.classifyWrite`
-(`shouldReconcile` is a thin `!= .skip` wrapper kept for one existing test)
-drops an FSEvent whose file content hash matches a just-noted self-write, so
-the app never reacts to its own writes.
+of every file limpet itself writes; `ConfigFileWatcher.classifyWrite` (the
+production dispatch and the self-test's AC-5 both call it directly — the
+`shouldReconcile` bool wrapper this used to go through was dead code and was
+removed, code-review finding 10) drops an FSEvent whose file content hash
+matches a just-noted self-write, so the app never reacts to its own writes.
 
 **Cross-process self-write suppression (limpet-plan.md L6.1 change A).**
 `ConfigSelfWriteRegistry` is per-process, so it cannot recognize a write made

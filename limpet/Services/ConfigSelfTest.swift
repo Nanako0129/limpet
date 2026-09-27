@@ -349,8 +349,8 @@ enum ConfigSelfTest {
     private static func testSelfWriteSuppression() -> Bool {
         let dir = "\(selfTestRoot)/ac5-selfwrite"
         try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
-        // `shouldReconcile`/`classifyWrite` also consult `CLIWriteMarker`; redirect
-        // it to an isolated, empty temp dir so this test never touches the real
+        // `classifyWrite` also consults `CLIWriteMarker`; redirect it to an
+        // isolated, empty temp dir so this test never touches the real
         // `~/.local/state/limpet/cli-writes` (no marker here is ever expected to
         // match, but the directory listing itself must stay off the real path).
         let markerDir = "\(dir)/cli-writes"
@@ -363,7 +363,7 @@ enum ConfigSelfTest {
             }
             ConfigSelfWriteRegistry.shared.noteSelfWrite(contentHash: ConfigSelfWriteRegistry.hash(selfWrittenContent))
 
-            guard ConfigFileWatcher.shouldReconcile(forFileAt: selfWrittenPath) == false else {
+            guard ConfigFileWatcher.classifyWrite(forFileAt: selfWrittenPath) == .skip else {
                 return report("AC-5", "self-write-suppression", false, "(a noted self-write was NOT suppressed)")
             }
 
@@ -373,7 +373,7 @@ enum ConfigSelfTest {
             guard (try? externalContent.write(to: URL(fileURLWithPath: externalPath))) != nil else {
                 return report("AC-5", "self-write-suppression", false, "(failed to write external fixture)")
             }
-            guard ConfigFileWatcher.shouldReconcile(forFileAt: externalPath) == true else {
+            guard ConfigFileWatcher.classifyWrite(forFileAt: externalPath) == .external else {
                 return report("AC-5", "self-write-suppression", false, "(an external write was incorrectly suppressed)")
             }
 
