@@ -95,6 +95,13 @@ struct CLIEnvironment {
     /// Read every profile from the file-authoritative profiles directory.
     var readProfiles: () -> [SyncProfile]
     var fileExists: (String) -> Bool
+    /// Whether a directory entry exists at the path WITHOUT following a final
+    /// symlink (lstat), so a dangling symlink counts as existing. `trash
+    /// restore` uses it so a symlink at the destination is never looked through.
+    var itemExists: (String) -> Bool
+    /// realpath(3) of an existing path (every symlink resolved), or `nil` when
+    /// it cannot be resolved (missing, dangling symlink, no permission).
+    var realPath: (String) -> String?
     /// Run `launchctl` with `args`. Returns `(exitCode, stdout)`.
     var runLaunchctl: (_ args: [String]) -> (Int32, String)
     /// Whether the JSON schema files are installed under the config directory.
@@ -1194,6 +1201,46 @@ enum LimpetCLI {
         return nil
     }
 
+    /// `validateTrashRelativePath` is syntax only: a SYMLINK already inside
+    /// `localSyncPath` (`sub -> /outside`) lets `sub/file` pass it, and the
+    /// temp `copyto` and final rename both address paths through that link
+    /// (CodeRabbit, PR #10). Measured 2026-09-28, rclone 1.75.1: today only
+    /// the `links` option of the `:local,links:` destination stops the copy
+    /// ("need \".rclonelink\" suffix to refer to symlink", exit 1, nothing
+    /// written); a plain local destination DOES write through the link. That
+    /// is incidental, not a guarantee, so containment is checked here, before
+    /// any rclone call. The destination's
+    /// PARENT is resolved against the real filesystem and must lie inside the
+    /// resolved `localSyncPath`. Components that do not exist yet cannot be
+    /// links, so the nearest EXISTING ancestor is what gets resolved; an
+    /// existing entry that cannot be resolved (a dangling symlink) is refused.
+    /// The destination entry itself is not resolved here — a symlink there is
+    /// never followed (see `runTrashRestore`). Returns an error, or `nil`.
+    static func trashRestoreContainmentError(
+        localSyncPath: String, relativePath: String, env: CLIEnvironment
+    ) -> String? {
+        func resolve(_ path: String) -> String? {
+            var existing = path
+            var missing: [String] = []
+            while !existing.isEmpty, existing != "/", !env.itemExists(existing) {
+                missing.insert((existing as NSString).lastPathComponent, at: 0)
+                existing = (existing as NSString).deletingLastPathComponent
+            }
+            guard let real = env.realPath(existing) else { return nil }
+            return missing.reduce(real) { ($0 as NSString).appendingPathComponent($1) }
+        }
+        let target = (localSyncPath as NSString).appendingPathComponent(relativePath)
+        guard let root = resolve(localSyncPath),
+              let parent = resolve((target as NSString).deletingLastPathComponent) else {
+            return "cannot resolve the real path of \(target)'s directory"
+        }
+        let rootPrefix = root.hasSuffix("/") ? root : root + "/"
+        guard parent == root || parent.hasPrefix(rootPrefix) else {
+            return "\(relativePath) resolves outside \(localSyncPath) (through a symlink); refusing to restore there"
+        }
+        return nil
+    }
+
     /// `--date` must be exactly `YYYY-MM-DD` — refused before any rclone call.
     static func validateTrashDate(_ date: String?) -> String? {
         guard let date else { return nil }
@@ -1329,6 +1376,11 @@ enum LimpetCLI {
             env.stderr("error: \(err)\n")
             return 65
         }
+        if let err = trashRestoreContainmentError(
+            localSyncPath: profile.localSyncPath, relativePath: relativePath, env: env) {
+            env.stderr("error: \(err)\n")
+            return 65
+        }
         // Finding 4: path formula alone, same reasoning as runTrashList.
         guard let root = SyncSetupService.trashRootPath(for: profile) else {
             env.stderr("error: \(profile.name) (\(profile.shortId)) can have no trash root: "
@@ -1336,7 +1388,10 @@ enum LimpetCLI {
             return 1
         }
         let localTarget = (profile.localSyncPath as NSString).appendingPathComponent(relativePath)
-        guard force || !env.fileExists(localTarget) else {
+        // lstat, not stat: a symlink at the destination (dangling or not) is
+        // an existing entry. rclone only ever writes the temp name, and the
+        // final rename replaces the link itself, so the link is never followed.
+        guard force || !env.itemExists(localTarget) else {
             env.stderr("error: \(localTarget) already exists; pass --force to overwrite\n")
             return 1
         }
@@ -1417,6 +1472,8 @@ extension CLIEnvironment {
             },
             readProfiles: { ProfileStore.profilesOnDisk(in: SyncProfile.configDirectory) },
             fileExists: { FileManager.default.fileExists(atPath: $0) },
+            itemExists: CLIEnvironment.lstatExists,
+            realPath: CLIEnvironment.resolvedRealPath,
             runLaunchctl: { args in CLIEnvironment.runProcess(launchPath: "/bin/launchctl", args: args) },
             schemaFilesPresent: {
                 ConfigSchemaInstaller.schemaResourceFilenames.allSatisfy {
@@ -1484,6 +1541,19 @@ extension CLIEnvironment {
             stdout: { FileHandle.standardOutput.write(Data($0.utf8)) },
             stderr: { FileHandle.standardError.write(Data($0.utf8)) }
         )
+    }
+
+    /// `itemExists` for production: lstat, so a dangling symlink exists.
+    static func lstatExists(_ path: String) -> Bool {
+        var info = stat()
+        return lstat(path, &info) == 0
+    }
+
+    /// `realPath` for production: realpath(3); `nil` on any failure.
+    static func resolvedRealPath(_ path: String) -> String? {
+        guard let resolved = realpath(path, nil) else { return nil }
+        defer { free(resolved) }
+        return String(cString: resolved)
     }
 
     /// Run rclone at its located path with a hard process-level watchdog —

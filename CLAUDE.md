@@ -310,8 +310,17 @@ trash restore <name|shortId> <relative-path> [--date D] [--force]` restores
 the newest version (or the newest at one `--date`): before any rclone call it
 refuses (exit 65) an empty/absolute `relative-path` or one with an
 empty/`.`/`..` component, and a `--date` not matching
-`^[0-9]{4}-[0-9]{2}-[0-9]{2}$`; it refuses (without calling rclone) to
-overwrite an existing local file unless `--force` is given. Matching
+`^[0-9]{4}-[0-9]{2}-[0-9]{2}$`. Because that check is syntax only, it also
+refuses (exit 65, before any rclone call) a path whose destination DIRECTORY
+resolves outside `localSyncPath` through a symlink
+(`LimpetCLI.trashRestoreContainmentError`: realpath(3) of the nearest
+existing ancestor of the destination's parent, compared with the resolved
+`localSyncPath`; an existing ancestor that cannot be resolved, i.e. a dangling
+symlink, is refused too). It refuses (without calling rclone) to overwrite an
+existing local entry unless `--force` is given; existence is checked with
+lstat (`CLIEnvironment.itemExists`), so a symlink at the destination,
+dangling or not, counts as existing and is never followed: with `--force`
+the link itself is replaced. Matching
 (`LimpetCLI.newestTrashMatch`/`trashSuffixMatch`) tries EVERY `.` boundary of
 the original name (plus its end) rather than re-deriving rclone's own
 extension split, and also tries `<name>.rclonelink` for a symlink on a remote
@@ -615,7 +624,7 @@ isn't limpet's own.
 | `limpet install <name\|shortId>` | Install an already-enabled profile's launchd agent (idempotent; runs `SyncSetupService.install`). Complements `profile enable`, which early-returns without installing when the profile is ALREADY enabled — so `install` re-creates an agent that went missing. Refuses a disabled or incomplete profile. Never flips `isEnabled`. |
 | `limpet reinstall <name\|shortId>` | Regenerate script+plist and reinstall the agent (uninstall → install), i.e. the settings-save reinstall path. Works for any sync mode. Refuses a disabled profile. |
 | `limpet remote add <name> --type s3\|b2 --access-key-id <id> [--provider <p>] [--endpoint <https url>] [--region <r>]` | Create a keychain-backed remote through `RcloneConfigService.addKeychainRemote`, the same function the wizard uses. The secret is read from stdin — a no-echo prompt on a terminal, otherwise one line from the pipe — never from an argument. Writes the non-secret section plus `limpet_keychain = true` to rclone.conf (appended; nothing else rewritten) and stores the secret with `/usr/bin/security -i` (`add-generic-password -s limpet -a <name> -T /usr/bin/security`, secret hex-encoded on stdin). Names are `[A-Za-z0-9_]+` and may not collide case-insensitively with any rclone.conf section; endpoints must be https; `--provider Mega --region <r>` derives `s3.<r>.megas4.com`; a known `--provider` in any case (`mega`) is written in the wizard's spelling (`Mega`). |
-| `limpet trash restore <name\|shortId> <relative-path> [--date YYYY-MM-DD] [--force]` | Restore the newest (or one dated) trashed version of a file into `localSyncPath` (see **Trash** above). Refuses before any rclone call on a bad path/date; refuses to overwrite an existing local file without `--force`. |
+| `limpet trash restore <name\|shortId> <relative-path> [--date YYYY-MM-DD] [--force]` | Restore the newest (or one dated) trashed version of a file into `localSyncPath` (see **Trash** above). Refuses before any rclone call on a bad path/date or a destination directory that resolves outside `localSyncPath` through a symlink; refuses to overwrite an existing local entry (a symlink included, never followed) without `--force`. |
 
 **Operate:**
 

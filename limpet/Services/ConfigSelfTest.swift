@@ -170,6 +170,7 @@ enum ConfigSelfTest {
             testTrashCommandsUsePathFormulaIgnoringActiveRule,
             testTrashRestoreRclonelinkSymlinkAndAtomicRename,
             testTrashPurgeCertFlagsFailureAndDryRunVariants,
+            testTrashRestoreSymlinkContainment,
         ]
 
         for check in checks {
@@ -834,6 +835,12 @@ enum ConfigSelfTest {
         runRclone: @escaping (_ args: [String], _ remote: String?, _ timeout: TimeInterval) -> (Int32, String, String) = { _, _, _ in (0, "", "") },
         readProfiles: @escaping () -> [SyncProfile] = { [] },
         fileExists: @escaping (String) -> Bool = { _ in false },
+        // nil -> same answer as `fileExists`, so existing fakes that stub
+        // `fileExists` for `trash restore`'s overwrite check keep working.
+        itemExists: ((String) -> Bool)? = nil,
+        // Identity: every fake path "exists" as itself, so the containment
+        // check is inert unless a test passes the real resolver.
+        realPath: @escaping (String) -> String? = { $0 },
         runLaunchctl: @escaping (_ args: [String]) -> (Int32, String) = { _ in (0, "") },
         schemaFilesPresent: @escaping () -> Bool = { true },
         remoteSection: @escaping (String) -> [String: String]? = { _ in nil },
@@ -854,6 +861,8 @@ enum ConfigSelfTest {
             runRclone: runRclone,
             readProfiles: readProfiles,
             fileExists: fileExists,
+            itemExists: itemExists ?? fileExists,
+            realPath: realPath,
             runLaunchctl: runLaunchctl,
             schemaFilesPresent: schemaFilesPresent,
             remoteSection: remoteSection,
@@ -5326,6 +5335,140 @@ enum ConfigSelfTest {
         return report(id, slug, true)
     }
 
+    /// Real rclone against a self-test-owned `type = local` config, run with
+    /// its CWD at `dataDir` so `selftest:<path>` resolves under it (shared by
+    /// AC-L62-9 and AC-L62-11; never a network remote).
+    private static func localRcloneRunner(rclonePath: String, confPath: String, dataDir: String)
+        -> (_ args: [String], _ remote: String?, _ timeout: TimeInterval) -> (Int32, String, String) {
+        return { args, _, _ in
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: rclonePath)
+            process.arguments = ["--config", confPath] + args
+            process.currentDirectoryURL = URL(fileURLWithPath: dataDir)
+            let outPipe = Pipe(), errPipe = Pipe()
+            process.standardOutput = outPipe
+            process.standardError = errPipe
+            guard (try? process.run()) != nil else { return (-1, "", "") }
+            process.waitUntilExit()
+            let out = String(data: outPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            let err = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            return (process.terminationStatus, out, err)
+        }
+    }
+
+    // MARK: - AC-L62-11 — trash restore never writes through a symlink
+    // (CodeRabbit, PR #10): a symlinked subdirectory pointing outside
+    // `localSyncPath` is refused before any rclone call; a symlink AT the
+    // destination is never followed (refused without --force, the link itself
+    // replaced with it); a normal nested path and a symlinked `localSyncPath`
+    // still restore. Real rclone, real symlinks, all under `selfTestRoot`.
+
+    private static func testTrashRestoreSymlinkContainment() -> Bool {
+        let id = "AC-L62-11", slug = "trash-restore-symlink-containment"
+        guard let rclonePath = RcloneLocator.resolve() else {
+            return report(id, slug, true, "(skipped: no local rclone binary found)")
+        }
+        let fm = FileManager.default
+        let root = "\(selfTestRoot)/ac-l62-11"
+        try? fm.removeItem(atPath: root)
+        let localDir = "\(root)/local", outsideDir = "\(root)/outside", dataDir = "\(root)/data"
+        let trashDateDir = "\(dataDir)/parent/.limpet-trash/leaf/2026-09-01"
+        let confPath = "\(root)/rclone.conf"
+        do {
+            for dir in ["\(localDir)/nested", outsideDir, "\(trashDateDir)/sub", "\(trashDateDir)/nested/deep"] {
+                try fm.createDirectory(atPath: dir, withIntermediateDirectories: true)
+            }
+            try "trashed-sub".write(toFile: "\(trashDateDir)/sub/file-100000.txt", atomically: true, encoding: .utf8)
+            try "trashed-nested".write(toFile: "\(trashDateDir)/nested/deep/n-100000.txt", atomically: true, encoding: .utf8)
+            try "trashed-link".write(toFile: "\(trashDateDir)/link-100000.txt", atomically: true, encoding: .utf8)
+            try "trashed-dangling".write(toFile: "\(trashDateDir)/dangling-100000.txt", atomically: true, encoding: .utf8)
+            try "outside-original".write(toFile: "\(outsideDir)/target.txt", atomically: true, encoding: .utf8)
+            try fm.createSymbolicLink(atPath: "\(localDir)/sub", withDestinationPath: outsideDir)
+            try fm.createSymbolicLink(atPath: "\(localDir)/dsub", withDestinationPath: "\(outsideDir)/no-such-dir")
+            try fm.createSymbolicLink(atPath: "\(localDir)/link.txt", withDestinationPath: "\(outsideDir)/target.txt")
+            try fm.createSymbolicLink(atPath: "\(localDir)/dangling.txt", withDestinationPath: "\(outsideDir)/nowhere.txt")
+            try fm.createSymbolicLink(atPath: "\(root)/local-alias", withDestinationPath: localDir)
+            try "[selftest]\ntype = local\n".write(toFile: confPath, atomically: true, encoding: .utf8)
+        } catch {
+            return report(id, slug, false, "(fixture setup failed: \(error))")
+        }
+
+        var profile = sampleProfile()
+        profile.rcloneRemote = "selftest:"
+        profile.remotePath = "parent/leaf"
+        profile.localSyncPath = localDir
+        var aliased = profile
+        aliased.localSyncPath = "\(root)/local-alias"
+
+        let realRclone = localRcloneRunner(rclonePath: rclonePath, confPath: confPath, dataDir: dataDir)
+        var rcloneCalls = 0
+        func env(_ p: SyncProfile) -> CLIEnvironment {
+            fakeCLIEnvironment(
+                runRclone: { args, remote, timeout in rcloneCalls += 1; return realRclone(args, remote, timeout) },
+                readProfiles: { [p] },
+                fileExists: { fm.fileExists(atPath: $0) },
+                itemExists: CLIEnvironment.lstatExists,
+                realPath: CLIEnvironment.resolvedRealPath,
+                removeFile: { (try? fm.removeItem(atPath: $0)) != nil },
+                moveFile: { from, to in
+                    _ = try? fm.removeItem(atPath: to)
+                    return (try? fm.moveItem(atPath: from, toPath: to)) != nil
+                })
+        }
+        func outsideUntouched() -> Bool {
+            (try? fm.contentsOfDirectory(atPath: outsideDir)) == ["target.txt"]
+                && (try? String(contentsOfFile: "\(outsideDir)/target.txt", encoding: .utf8)) == "outside-original"
+        }
+        func isLink(_ path: String) -> Bool { (try? fm.destinationOfSymbolicLink(atPath: path)) != nil }
+
+        // A symlinked subdirectory (existing or dangling) pointing outside:
+        // exit 65, with or without --force, before any rclone call.
+        for argv in [["sub/file.txt"], ["sub/file.txt", "--force"], ["sub/new/file.txt"], ["dsub/x.txt"]] {
+            let code = LimpetCLI.execute(["trash", "restore", profile.shortId] + argv, env: env(profile))
+            guard code == 65, rcloneCalls == 0, outsideUntouched() else {
+                return report(id, slug, false,
+                    "(\(argv) through a symlinked dir: exit \(code), rclone calls \(rcloneCalls), outside untouched \(outsideUntouched()))")
+            }
+        }
+
+        // A symlink AT the destination, without --force: refused like any
+        // existing entry (a dangling one too), no rclone call, link intact.
+        for name in ["link.txt", "dangling.txt"] {
+            let code = LimpetCLI.execute(["trash", "restore", profile.shortId, name], env: env(profile))
+            guard code == 1, rcloneCalls == 0, isLink("\(localDir)/\(name)"), outsideUntouched() else {
+                return report(id, slug, false, "(\(name) symlink destination without --force: exit \(code), rclone calls \(rcloneCalls))")
+            }
+        }
+
+        // With --force: the LINK itself is replaced by a regular file; its
+        // target is never written.
+        for name in ["link.txt", "dangling.txt"] {
+            let code = LimpetCLI.execute(["trash", "restore", profile.shortId, name, "--force"], env: env(profile))
+            let stem = (name as NSString).deletingPathExtension
+            guard code == 0, !isLink("\(localDir)/\(name)"),
+                  (try? String(contentsOfFile: "\(localDir)/\(name)", encoding: .utf8)) == "trashed-\(stem)",
+                  outsideUntouched() else {
+                return report(id, slug, false, "(\(name) symlink destination with --force: exit \(code), outside untouched \(outsideUntouched()))")
+            }
+        }
+
+        // A normal nested path (with a not-yet-existing directory) restores.
+        let nestedCode = LimpetCLI.execute(["trash", "restore", profile.shortId, "nested/deep/n.txt"], env: env(profile))
+        guard nestedCode == 0,
+              (try? String(contentsOfFile: "\(localDir)/nested/deep/n.txt", encoding: .utf8)) == "trashed-nested" else {
+            return report(id, slug, false, "(normal nested restore failed: exit \(nestedCode))")
+        }
+
+        // A localSyncPath that is ITSELF a symlink is legitimate: the root is
+        // resolved too, so its own files are inside.
+        let aliasCode = LimpetCLI.execute(["trash", "restore", aliased.shortId, "nested/deep/n.txt", "--force"], env: env(aliased))
+        guard aliasCode == 0 else {
+            return report(id, slug, false, "(restore under a symlinked localSyncPath refused: exit \(aliasCode))")
+        }
+
+        return report(id, slug, true)
+    }
+
     // MARK: - AC-L62-9 — restore a `.rclonelink` object as a real symlink;
     // atomic temp-then-rename leaves nothing partial on failure (code-review
     // findings 2/3 on 87bbf67), via the REAL `LimpetCLI.execute` entry point
@@ -5371,20 +5514,7 @@ enum ConfigSelfTest {
         profile.remotePath = "parent/leaf"
         profile.localSyncPath = localDir
 
-        func realRclone(_ args: [String], _ remote: String?, _ timeout: TimeInterval) -> (Int32, String, String) {
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: rclonePath)
-            process.arguments = ["--config", confPath] + args
-            process.currentDirectoryURL = URL(fileURLWithPath: dataDir)
-            let outPipe = Pipe(), errPipe = Pipe()
-            process.standardOutput = outPipe
-            process.standardError = errPipe
-            guard (try? process.run()) != nil else { return (-1, "", "") }
-            process.waitUntilExit()
-            let out = String(data: outPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-            let err = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-            return (process.terminationStatus, out, err)
-        }
+        let realRclone = localRcloneRunner(rclonePath: rclonePath, confPath: confPath, dataDir: dataDir)
         func moveFile(_ from: String, _ to: String) -> Bool {
             _ = try? FileManager.default.removeItem(atPath: to)
             return (try? FileManager.default.moveItem(atPath: from, toPath: to)) != nil
