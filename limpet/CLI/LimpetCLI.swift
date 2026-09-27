@@ -1221,6 +1221,7 @@ extension CLIEnvironment {
     }
 
     fileprivate static func runProcess(launchPath: String, args: [String], timeout: TimeInterval = 10) -> (Int32, String) {
+        if SelfTestGuard.refuses(launchPath, args) { return (1, "") }
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: launchPath)
         proc.arguments = args

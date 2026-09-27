@@ -21,7 +21,7 @@ enum AppSettingsFileStore {
     private static let schemaRef = "./schema/settings.schema.json"
 
     static var defaultDirectory: String {
-        "\(NSHomeDirectory())/.config/limpet"
+        "\(LimpetPaths.home)/.config/limpet"
     }
 
     static var settingsFilePath: String {

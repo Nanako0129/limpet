@@ -30,13 +30,50 @@ enum ConfigSelfTest {
         return tmpDir.hasSuffix("/") ? "\(tmpDir)limpet-selftest" : "\(tmpDir)/limpet-selftest"
     }
 
+    /// Names, sizes and modification times of every limpet-owned entry in the
+    /// real home, compared before and after a run by AC-GUARD.
+    private static func realHomeFingerprint(_ home: String) -> Set<String> {
+        let fm = FileManager.default
+        var out = Set<String>()
+        func add(_ path: String) {
+            guard let a = try? fm.attributesOfItem(atPath: path) else { return }
+            let size = (a[.size] as? NSNumber)?.int64Value ?? -1
+            let mtime = (a[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
+            out.insert("\(path) \(size) \(mtime)")
+        }
+        let agents = "\(home)/Library/LaunchAgents"
+        for name in (try? fm.contentsOfDirectory(atPath: agents)) ?? [] where name.hasPrefix("com.nanako.limpet") {
+            add("\(agents)/\(name)")
+        }
+        let bin = "\(home)/.local/bin"
+        for name in (try? fm.contentsOfDirectory(atPath: bin)) ?? [] where name.hasPrefix("limpet") {
+            add("\(bin)/\(name)")
+        }
+        for dir in ["\(home)/.config/limpet", "\(home)/.local/state/limpet"] {
+            add(dir)
+            if let e = fm.enumerator(atPath: dir) {
+                for case let rel as String in e { add("\(dir)/\(rel)") }
+            }
+        }
+        add("\(home)/.config/rclone/rclone.conf")
+        return out
+    }
+
     /// Run every self-test. Returns 0 if all passed, 1 otherwise.
     static func run() -> Int32 {
         // No self-test may reach a real keychain (see makeSecurityStub).
         KeychainSecretStore.realKeychainForbidden = true
+        // No self-test may write the real home or change launchd state: every
+        // per-user path resolves under a temp home, and launchctl load/unload/
+        // kill/bootstrap/bootout are refused and recorded (SelfTestGuard).
+        let realHome = NSHomeDirectory()
+        let before = realHomeFingerprint(realHome)
+        SelfTestGuard.active = true
         // Start clean so a previous run's leftovers can't mask a real failure.
         try? FileManager.default.removeItem(atPath: selfTestRoot)
         try? FileManager.default.createDirectory(atPath: selfTestRoot, withIntermediateDirectories: true)
+        LimpetPaths.home = "\(selfTestRoot)/home"
+        try? FileManager.default.createDirectory(atPath: LimpetPaths.home, withIntermediateDirectories: true)
 
         var allPassed = true
         let checks: [() -> Bool] = [
@@ -118,6 +155,14 @@ enum ConfigSelfTest {
             if !check() { allPassed = false }
         }
 
+        // AC-GUARD: the run left the real home and launchd alone.
+        let after = realHomeFingerprint(realHome)
+        let changed = before.symmetricDifference(after).sorted()
+        if !report("AC-GUARD", "real-home-and-launchd-untouched",
+                   changed.isEmpty && SelfTestGuard.violations.isEmpty,
+                   "(changed: \(changed.prefix(5)); refused launchctl: \(SelfTestGuard.violations.prefix(5)))") {
+            allPassed = false
+        }
         return allPassed ? 0 : 1
     }
 

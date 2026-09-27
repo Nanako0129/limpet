@@ -17,7 +17,7 @@ enum CLIShimInstaller {
     static let ownershipMarker = "#!/bin/sh\n# Managed by limpet — safe to delete; regenerated on next launch."
 
     static var shimPath: String {
-        "\(NSHomeDirectory())/.local/bin/limpet"
+        "\(LimpetPaths.home)/.local/bin/limpet"
     }
 
     /// Whether `path` runs through macOS's App Translocation

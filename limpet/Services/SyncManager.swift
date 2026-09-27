@@ -197,6 +197,7 @@ final class SyncManager: ObservableObject {
     /// Run `/bin/launchctl` with `args`, discarding output — every caller here
     /// only needs the exit code. Mirrors `SyncSetupService.runCommand`.
     private func runLaunchctl(_ args: [String]) -> Int32 {
+        if SelfTestGuard.refuses("/bin/launchctl", args) { return 1 }
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/launchctl")
         process.arguments = args

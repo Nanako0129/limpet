@@ -1,5 +1,32 @@
 import Foundation
 
+/// Root of every per-user path limpet writes (LaunchAgents plists, the shim
+/// and sync script, ~/.config/limpet, ~/.local/log, rclone.conf). The self-test
+/// points it at a temp directory before running anything, so no test can write
+/// into the real home: on 2026-09-27 a self-test called the real `install()`
+/// and left eight plists in ~/Library/LaunchAgents and rewrote the live shim
+/// (limpet-plan.md L6.1). `NSHomeDirectory()` ignores `$HOME` (measured), so
+/// redirecting the environment is not an option.
+enum LimpetPaths {
+    nonisolated(unsafe) static var home = NSHomeDirectory()
+}
+
+/// Set by `ConfigSelfTest.run()`: while active, a `launchctl` subcommand that
+/// changes launchd state is refused and recorded instead of run, and the
+/// self-test fails if anything was recorded. `list` and `print` only read.
+enum SelfTestGuard {
+    nonisolated(unsafe) static var active = false
+    nonisolated(unsafe) static var violations: [String] = []
+
+    /// true = do not spawn `executable`.
+    static func refuses(_ executable: String, _ arguments: [String]) -> Bool {
+        guard active, (executable as NSString).lastPathComponent == "launchctl" else { return false }
+        if let sub = arguments.first, sub == "list" || sub == "print" { return false }
+        violations.append("launchctl " + arguments.joined(separator: " "))
+        return true
+    }
+}
+
 /// A sync profile representing a single rclone remote/target configuration
 struct SyncProfile: Identifiable, Codable, Equatable {
     let id: UUID
@@ -31,12 +58,12 @@ struct SyncProfile: Identifiable, Codable, Equatable {
 
     /// Shared script path (single script for all profiles)
     static var sharedScriptPath: String {
-        "\(NSHomeDirectory())/.local/bin/limpet-sync.sh"
+        "\(LimpetPaths.home)/.local/bin/limpet-sync.sh"
     }
 
     /// Profile config directory
     static var configDirectory: String {
-        "\(NSHomeDirectory())/.config/limpet/profiles"
+        "\(LimpetPaths.home)/.config/limpet/profiles"
     }
 
     /// Profile-specific config file (JSON)
@@ -55,12 +82,12 @@ struct SyncProfile: Identifiable, Codable, Equatable {
 
     /// Profile-specific launchd plist
     var plistPath: String {
-        "\(NSHomeDirectory())/Library/LaunchAgents/com.nanako.limpet.watch.\(shortId).plist"
+        "\(LimpetPaths.home)/Library/LaunchAgents/com.nanako.limpet.watch.\(shortId).plist"
     }
 
     /// Profile-specific log file
     var logPath: String {
-        "\(NSHomeDirectory())/.local/log/limpet-sync-\(shortId).log"
+        "\(LimpetPaths.home)/.local/log/limpet-sync-\(shortId).log"
     }
 
     /// Profile-specific exclude filter file

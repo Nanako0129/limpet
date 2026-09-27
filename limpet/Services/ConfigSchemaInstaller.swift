@@ -14,7 +14,7 @@ enum ConfigSchemaInstaller {
     static let schemaResourceFilenames = ["profile.schema.json", "settings.schema.json"]
 
     static var defaultBase: String {
-        "\(NSHomeDirectory())/.config/limpet"
+        "\(LimpetPaths.home)/.config/limpet"
     }
 
     static func schemaDirectory(base: String = defaultBase) -> String {

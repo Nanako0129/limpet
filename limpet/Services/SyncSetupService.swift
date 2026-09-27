@@ -352,8 +352,8 @@ final class SyncSetupService {
 
     /// Check if the legacy single-profile scheduled sync is installed
     func isLegacyInstalled() -> Bool {
-        let plistPath = "\(NSHomeDirectory())/Library/LaunchAgents/com.nanako.limpet.watch.plist"
-        let scriptPath = "\(NSHomeDirectory())/.local/bin/limpet-sync.sh"
+        let plistPath = "\(LimpetPaths.home)/Library/LaunchAgents/com.nanako.limpet.watch.plist"
+        let scriptPath = "\(LimpetPaths.home)/.local/bin/limpet-sync.sh"
 
         // Check if it's the old-style script (without config file support)
         if FileManager.default.fileExists(atPath: scriptPath),
@@ -368,7 +368,7 @@ final class SyncSetupService {
 
     /// Uninstall legacy single-profile configuration
     func uninstallLegacy() throws {
-        let plistPath = "\(NSHomeDirectory())/Library/LaunchAgents/com.nanako.limpet.watch.plist"
+        let plistPath = "\(LimpetPaths.home)/Library/LaunchAgents/com.nanako.limpet.watch.plist"
 
         _ = runCommand("/bin/launchctl", arguments: ["unload", plistPath])
 
@@ -814,6 +814,7 @@ final class SyncSetupService {
     private func runCommand(_ command: String, arguments: [String]) -> (
         output: String, exitCode: Int32
     ) {
+        if SelfTestGuard.refuses(command, arguments) { return ("refused during self-test", 1) }
         let process = Process()
         let pipe = Pipe()
 

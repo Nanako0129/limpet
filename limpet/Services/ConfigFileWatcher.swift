@@ -98,7 +98,7 @@ final class ConfigFileWatcher {
     ///   - debounceInterval: short (~1s) — config edits are small, hand-typed files, not a
     ///     sync-triggering directory where 15s debounce avoids reacting to every intermediate write.
     init(
-        watchedDirectory: String = "\(NSHomeDirectory())/.config/limpet",
+        watchedDirectory: String = "\(LimpetPaths.home)/.config/limpet",
         debounceInterval: TimeInterval = 1.0,
         onProfileChange: @escaping (String) -> Void,
         onSettingsChange: @escaping () -> Void
