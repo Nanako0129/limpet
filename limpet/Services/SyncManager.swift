@@ -1077,7 +1077,7 @@ final class SyncManager: ObservableObject {
     /// Whether a parsed file-change belongs in Recent Changes/notifications
     /// (limpet-plan.md L6.2 item 4b; code-review finding 1/8 on 87bbf67 fixed
     /// the two bugs below). `false` only when `hasTrashRoot` AND the change is
-    /// flagged `mayBeTrashArtifact` — set by `RcloneLogEntry.mayBeTrashArtifact`
+    /// flagged `mayBeTrashArtifact` — set by `SyncLogPatterns.mayBeTrashArtifact`
     /// for exactly the two log lines that are ambiguous between a genuine
     /// change and the trash mechanism's own backup-move step (a bare
     /// `Deleted`, and `Moved (server-side) to: ...`), never for the trash

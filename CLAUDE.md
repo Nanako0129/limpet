@@ -252,7 +252,7 @@ same-remote copy never gets a " to:" suffix). `Moved (server-side) to: …` IS
 restored to `.renamed` — a profile's `additionalRcloneFlags` can set
 `--track-renames`, so this line can be a genuine rename, and limpet does not
 forbid that flag. Both this line and the bare `Deleted` line are flagged
-`FileChange.mayBeTrashArtifact` by `RcloneLogEntry.mayBeTrashArtifact(message:)`,
+`FileChange.mayBeTrashArtifact` by `SyncLogPatterns.mayBeTrashArtifact(_:)`,
 because BOTH are ambiguous — measured for reference on a Move-capable
 backend, a backup-dir move ALSO logs `Moved (server-side) to: …` for both an
 overwrite's and a delete's backup step, textually identical to a real
