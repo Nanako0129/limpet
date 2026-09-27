@@ -636,38 +636,66 @@ final class SyncSetupService {
             fi
             trap 'rm -f "$LOCK_FILE"' EXIT
 
-            # Trash purge (limpet-plan.md L6.2 item 3): once per LOCAL day, before
-            # the sync, skipped under --dry-run. BACKUP_DATE/BACKUP_TIME are taken
-            # ONCE here and reused below for --backup-dir/--suffix, so a run
-            # straddling midnight can't disagree with itself about "today".
+            # Trash purge (limpet-plan.md L6.2 item 3, code-review findings 5/7
+            # on 87bbf67): once per LOCAL day, before the sync, skipped under a
+            # dry run. BACKUP_DATE/BACKUP_TIME are taken ONCE here and reused
+            # below for --backup-dir/--suffix, so a run straddling midnight
+            # can't disagree with itself about "today".
             if [[ -n "$TRASH_ROOT" ]]; then
                 BACKUP_DATE=$(date +%F)
                 BACKUP_TIME=$(date +%H%M%S)
+                # Recognise every rclone spelling of "this run is a dry run",
+                # not only the bare flag: -n (short form), --dry-run=true, and
+                # --dry-run=<anything but exactly "false"> (rclone's own bool
+                # flag parsing treats a non-"false" value as true).
                 IS_DRY_RUN=false
                 for flag_token in "${ADDITIONAL_FLAGS_ARRAY[@]}"; do
-                    if [[ "$flag_token" == "--dry-run" ]]; then
+                    if [[ "$flag_token" == "--dry-run" || "$flag_token" == "-n" ]]; then
                         IS_DRY_RUN=true
+                    elif [[ "$flag_token" == --dry-run=* ]]; then
+                        dry_run_value="${flag_token#--dry-run=}"
+                        if [[ "$dry_run_value" != "false" ]]; then
+                            IS_DRY_RUN=true
+                        fi
                     fi
                 done
                 if [[ "$IS_DRY_RUN" == false ]]; then
                     PURGE_STAMP="${CONFIG_FILE%.json}.trash-purged"
                     LAST_PURGE=$(cat "$PURGE_STAMP" 2>/dev/null || true)
                     if [[ "$LAST_PURGE" != "$BACKUP_DATE" ]]; then
+                        # $NO_CHECK_CERT only — NEVER the profile's own
+                        # additionalRcloneFlags (a user's filters/extra flags
+                        # must never shape what a purge lists or deletes).
+                        PURGE_ARGS=()
+                        if [[ -n "$NO_CHECK_CERT" ]]; then
+                            PURGE_ARGS+=("$NO_CHECK_CERT")
+                        fi
                         CUTOFF=$(date -v-"${TRASH_DAYS}"d +%F)
-                        while IFS= read -r entry; do
-                            # Only a top-level dir matching YYYY-MM-DD/ exactly is
-                            # ever purged — never anything `rclone lsf` might also
-                            # list (a stray file, an odd-named dir, a nested path).
-                            if [[ "$entry" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}/$ ]]; then
-                                entry_date="${entry%/}"
-                                if [[ "$entry_date" < "$CUTOFF" ]]; then
-                                    if ! "$RCLONE_BIN" purge "$TRASH_ROOT/$entry" > /dev/null 2>&1; then
-                                        echo "$(date '+%Y-%m-%d %H:%M:%S') - Trash purge failed for $TRASH_ROOT/$entry" >> "$LOG_FILE"
+                        LSF_OUTPUT=$("$RCLONE_BIN" lsf --dirs-only "${PURGE_ARGS[@]}" "$TRASH_ROOT" 2>/dev/null)
+                        LSF_STATUS=$?
+                        if [[ $LSF_STATUS -ne 0 ]]; then
+                            # Do NOT write the stamp: a later run today (the
+                            # periodic safety sync, a manual "sync now", the
+                            # next login) retries the purge instead of waiting
+                            # until tomorrow.
+                            echo "$(date '+%Y-%m-%d %H:%M:%S') - Trash purge: could not list $TRASH_ROOT (rclone lsf exit $LSF_STATUS); will retry" >> "$LOG_FILE"
+                        else
+                            while IFS= read -r entry; do
+                                [[ -z "$entry" ]] && continue
+                                # Only a top-level dir matching YYYY-MM-DD/ exactly is
+                                # ever purged — never anything `rclone lsf` might also
+                                # list (a stray file, an odd-named dir, a nested path).
+                                if [[ "$entry" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}/$ ]]; then
+                                    entry_date="${entry%/}"
+                                    if [[ "$entry_date" < "$CUTOFF" ]]; then
+                                        if ! "$RCLONE_BIN" purge "${PURGE_ARGS[@]}" "$TRASH_ROOT/$entry" > /dev/null 2>&1; then
+                                            echo "$(date '+%Y-%m-%d %H:%M:%S') - Trash purge failed for $TRASH_ROOT/$entry" >> "$LOG_FILE"
+                                        fi
                                     fi
                                 fi
-                            fi
-                        done < <("$RCLONE_BIN" lsf --dirs-only "$TRASH_ROOT" 2>/dev/null)
-                        echo "$BACKUP_DATE" > "$PURGE_STAMP"
+                            done <<< "$LSF_OUTPUT"
+                            echo "$BACKUP_DATE" > "$PURGE_STAMP"
+                        fi
                     fi
                 fi
             fi
