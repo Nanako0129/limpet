@@ -4373,14 +4373,25 @@ enum ConfigSelfTest {
         }
 
         // A spawn that fails (`pid: nil`) after a pending termination has
-        // nothing to kill — must not claim it does.
+        // nothing to kill, but MUST still decide to exit — verifier gap 2:
+        // without this, `requestTermination` already returned `.wait` (so the
+        // handler did not exit) and a failed spawn used to report `.ok` (so
+        // this call did not exit either), leaving the watcher alive until a
+        // second signal or launchd's own SIGKILL.
         let failedSpawnState = RunningChildState()
         failedSpawnState.beginSpawning()
         guard failedSpawnState.requestTermination() == .wait else {
             return report(id, slug, false, "(setup: expected .wait)")
         }
-        guard failedSpawnState.spawned(pid: nil) == .ok else {
-            return report(id, slug, false, "(a failed spawn after a pending termination claimed a PID to kill)")
+        guard failedSpawnState.spawned(pid: nil) == .exitNow else {
+            return report(id, slug, false, "(a failed spawn after a pending termination did not decide to exit)")
+        }
+
+        // Contrast: a failed spawn with NO pending termination must not exit.
+        let failedSpawnNoTermination = RunningChildState()
+        failedSpawnNoTermination.beginSpawning()
+        guard failedSpawnNoTermination.spawned(pid: nil) == .ok else {
+            return report(id, slug, false, "(a failed spawn with no pending termination wrongly decided to exit)")
         }
 
         return report(id, slug, true)

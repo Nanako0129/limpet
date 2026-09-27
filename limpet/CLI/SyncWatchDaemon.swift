@@ -47,22 +47,30 @@ final class RunningChildState {
         lock.unlock()
     }
 
-    /// What `spawned(pid:)` decided: `.ok` (nothing pending) or
-    /// `.killAndExitNow(pid)` — a termination arrived while `.spawning`, and
-    /// this is the first point a PID was known to kill.
-    enum SpawnOutcome: Equatable { case ok, killAndExitNow(pid_t) }
+    /// What `spawned(pid:)` decided:
+    /// - `.ok`: nothing pending — carry on as normal.
+    /// - `.killAndExitNow(pid)`: a termination arrived while `.spawning` AND a
+    ///   PID now exists — this is the first point one was known, so kill its
+    ///   group and exit.
+    /// - `.exitNow`: a termination arrived while `.spawning`, but the spawn
+    ///   itself then FAILED (`pid == nil`) — there is nothing to kill, but the
+    ///   process must still exit. Without this case, a SIGTERM landing in that
+    ///   exact window was silently swallowed: `requestTermination` had already
+    ///   returned `.wait` (so the handler did not exit), and a failed spawn
+    ///   used to report `.ok` (so this call did not exit either) — the watcher
+    ///   then lived on until a second signal or launchd's own SIGKILL.
+    enum SpawnOutcome: Equatable { case ok, killAndExitNow(pid_t), exitNow }
 
     /// Call immediately after `Process.run()` either succeeds (`pid` given) or
     /// throws (`pid == nil`).
     func spawned(pid: pid_t?) -> SpawnOutcome {
         lock.lock()
-        let mustFinishTermination = terminating && pid != nil
+        let wasTerminating = terminating
         state = pid.map(State.running) ?? .idle
         lock.unlock()
-        if mustFinishTermination, let pid {
-            return .killAndExitNow(pid)
-        }
-        return .ok
+        guard wasTerminating else { return .ok }
+        if let pid { return .killAndExitNow(pid) }
+        return .exitNow
     }
 
     /// Call after the child has exited normally (`waitUntilExit()` returned).
@@ -312,7 +320,14 @@ enum SyncWatchDaemon {
         do {
             try process.run()
         } catch {
-            _ = runningChild.spawned(pid: nil)
+            // finding 7 (verifier gap 2): a termination requested while
+            // `.spawning` returns `.exitNow` here when the spawn itself then
+            // failed — nothing to kill, but the process must still exit; see
+            // `SpawnOutcome.exitNow`'s doc for why leaving this unhandled
+            // silently swallowed the signal.
+            if runningChild.spawned(pid: nil) == .exitNow {
+                exit(0)
+            }
             return -1
         }
         // finding 7: SIGTERM/SIGINT arriving between `beginSpawning()` above and
@@ -325,6 +340,8 @@ enum SyncWatchDaemon {
         case .killAndExitNow(let pid):
             terminateChildProcessGroup(pid: pid)
             exit(0)
+        case .exitNow:
+            exit(0)  // unreachable here (a real PID is always non-nil), kept exhaustive
         }
         process.waitUntilExit()
         runningChild.cleared()
