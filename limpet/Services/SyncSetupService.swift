@@ -480,6 +480,8 @@ final class SyncSetupService {
             SYNC_DIRECTION=$(parse_json "syncDirection" "localToRemote")
             REMOTE_PATH=$(parse_json "remotePath" "")
             TRANSFERS=$(parse_json "transfers" "16")
+            TRASH_ROOT=$(parse_json "trashRoot" "")
+            TRASH_DAYS=$(parse_json "trashDays" "14")
 
             if [[ -z "$REMOTE" || -z "$LOCAL_PATH" ]]; then
                 echo "Error: Invalid config - missing remote or localPath"
@@ -509,6 +511,14 @@ final class SyncSetupService {
             MAX_DELETE=$(parse_json "maxDelete" "0")
             if [[ ! "$MAX_DELETE" =~ ^(0|[1-9][0-9]*)$ ]]; then
                 echo "$(date '+%Y-%m-%d %H:%M:%S') - Refusing to sync: maxDelete must be a whole number" >> "$LOG_FILE"
+                exit 64
+            fi
+
+            # trashDays reaches `date -v-Nd` below; accept exactly 0-365, the
+            # range SyncProfile.validationError allows (limpet-plan.md L6.2).
+            # A bare `^[0-9]+$` let an unbounded digit string through to `date`.
+            if [[ ! "$TRASH_DAYS" =~ ^([0-9]|[1-9][0-9]|[12][0-9][0-9]|3[0-5][0-9]|36[0-5])$ ]]; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S') - Refusing to sync: trashDays must be a whole number from 0 to 365" >> "$LOG_FILE"
                 exit 64
             fi
 
@@ -627,6 +637,81 @@ final class SyncSetupService {
             fi
             trap 'rm -f "$LOCK_FILE"' EXIT
 
+            # Trash purge (limpet-plan.md L6.2 item 3, code-review findings 5/7
+            # on 87bbf67): once per LOCAL day, before the sync, skipped under a
+            # dry run. BACKUP_DATE/BACKUP_TIME are taken ONCE here and reused
+            # below for --backup-dir/--suffix, so a run straddling midnight
+            # can't disagree with itself about "today".
+            if [[ -n "$TRASH_ROOT" ]]; then
+                BACKUP_DATE=$(date +%F)
+                BACKUP_TIME=$(date +%H%M%S)
+                # Recognise every rclone spelling of "this run is a dry run",
+                # not only the bare flag: -n (short form), a bundled short-flag
+                # cluster containing n (e.g. -vn, -nv — measured 2026-09-28:
+                # `rclone -vn sync ...` logs "Skipped copy as --dry-run is
+                # set"), --dry-run=true, and --dry-run=<anything but exactly
+                # "false"> (rclone's own bool flag parsing treats a
+                # non-"false" value as true).
+                IS_DRY_RUN=false
+                for flag_token in "${ADDITIONAL_FLAGS_ARRAY[@]}"; do
+                    if [[ "$flag_token" == "--dry-run" ]]; then
+                        IS_DRY_RUN=true
+                    elif [[ "$flag_token" =~ ^-[a-zA-Z]*n[a-zA-Z]*$ ]]; then
+                        IS_DRY_RUN=true
+                    elif [[ "$flag_token" == --dry-run=* ]]; then
+                        dry_run_value="${flag_token#--dry-run=}"
+                        if [[ "$dry_run_value" != "false" ]]; then
+                            IS_DRY_RUN=true
+                        fi
+                    fi
+                done
+                if [[ "$IS_DRY_RUN" == false ]]; then
+                    PURGE_STAMP="${CONFIG_FILE%.json}.trash-purged"
+                    LAST_PURGE=$(cat "$PURGE_STAMP" 2>/dev/null || true)
+                    if [[ "$LAST_PURGE" != "$BACKUP_DATE" ]]; then
+                        # $NO_CHECK_CERT only — NEVER the profile's own
+                        # additionalRcloneFlags (a user's filters/extra flags
+                        # must never shape what a purge lists or deletes).
+                        PURGE_ARGS=()
+                        if [[ -n "$NO_CHECK_CERT" ]]; then
+                            PURGE_ARGS+=("$NO_CHECK_CERT")
+                        fi
+                        CUTOFF=$(date -v-"${TRASH_DAYS}"d +%F)
+                        if [[ -z "$CUTOFF" ]]; then
+                            # No cutoff to compare against: skip, and leave the stamp
+                            # alone so a later run retries.
+                            echo "$(date '+%Y-%m-%d %H:%M:%S') - Trash purge skipped: could not compute the cutoff date" >> "$LOG_FILE"
+                        else
+                            LSF_OUTPUT=$("$RCLONE_BIN" lsf --dirs-only "${PURGE_ARGS[@]}" "$TRASH_ROOT" 2>/dev/null)
+                            LSF_STATUS=$?
+                            if [[ $LSF_STATUS -ne 0 ]]; then
+                                # Do NOT write the stamp: a later run today (the
+                                # periodic safety sync, a manual "sync now", the
+                                # next login) retries the purge instead of waiting
+                                # until tomorrow.
+                                echo "$(date '+%Y-%m-%d %H:%M:%S') - Trash purge: could not list $TRASH_ROOT (rclone lsf exit $LSF_STATUS); will retry" >> "$LOG_FILE"
+                            else
+                                while IFS= read -r entry; do
+                                    [[ -z "$entry" ]] && continue
+                                    # Only a top-level dir matching YYYY-MM-DD/ exactly is
+                                    # ever purged — never anything `rclone lsf` might also
+                                    # list (a stray file, an odd-named dir, a nested path).
+                                    if [[ "$entry" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}/$ ]]; then
+                                        entry_date="${entry%/}"
+                                        if [[ "$entry_date" < "$CUTOFF" ]]; then
+                                            if ! "$RCLONE_BIN" purge "${PURGE_ARGS[@]}" "$TRASH_ROOT/$entry" > /dev/null 2>&1; then
+                                                echo "$(date '+%Y-%m-%d %H:%M:%S') - Trash purge failed for $TRASH_ROOT/$entry" >> "$LOG_FILE"
+                                            fi
+                                        fi
+                                    fi
+                                done <<< "$LSF_OUTPUT"
+                                echo "$BACKUP_DATE" > "$PURGE_STAMP"
+                            fi
+                        fi
+                    fi
+                fi
+            fi
+
             # A missing local source must NEVER be silently created (upstream
             # unconditionally recreated the source directory here, so a moved
             # or unmounted source became an empty one and the next sync
@@ -656,6 +741,14 @@ final class SyncSetupService {
                 cmd+=("$NO_CHECK_CERT")
             fi
 
+            # Trash (limpet-plan.md L6.2 item 2): every version, not one per
+            # day — --suffix-keep-extension inserts "-HHMMSS" before the
+            # extension rclone derives, so a same-day second overwrite lands
+            # beside the first rather than replacing it.
+            if [[ -n "$TRASH_ROOT" ]]; then
+                cmd+=(--backup-dir "$TRASH_ROOT/$BACKUP_DATE" --suffix "-$BACKUP_TIME" --suffix-keep-extension)
+            fi
+
             if [[ "$MAX_DELETE" != "0" ]]; then
                 cmd+=(--max-delete "$MAX_DELETE")
             fi
@@ -668,7 +761,13 @@ final class SyncSetupService {
 
             # The max-delete lines of THIS run only (never an older run's lines in
             # the profile log), and only those lines, not the whole output.
-            MAX_DELETE_MESSAGE='Got fatal error on delete: --max-delete threshold reached'
+            # limpet-plan.md L6.2 item 4: with a trash root, overwrites count
+            # toward --max-delete too and trip a DIFFERENT message ("Cancelling
+            # sync due to fatal error: --max-delete threshold reached", no "Got
+            # fatal error on delete" line at all — measured 2026-09-28 with
+            # --disable Move, the S4-path fallback); match the substring both
+            # share instead of the delete-only message.
+            MAX_DELETE_MESSAGE='--max-delete threshold reached'
             RUN_MATCHES=$(mktemp "${TMPDIR:-/tmp}/limpet-run.XXXXXX") || {
                 echo "$(date '+%Y-%m-%d %H:%M:%S') - Refusing to sync: could not create a temporary file" >> "$LOG_FILE"
                 exit 1
@@ -690,6 +789,11 @@ final class SyncSetupService {
             # local, 5 files removed from the source, --max-delete 2: exit 7, exactly
             # 2 files deleted, each refused delete logged as "Got fatal error on
             # delete: --max-delete threshold reached" (text and JSON log alike).
+            # Measured again 2026-09-28 with a trash root + --disable Move (the S4
+            # path): 3 OVERWRITES over --max-delete 2 also exit 7, logging
+            # "Cancelling sync due to fatal error: --max-delete threshold reached"
+            # instead — no "Got fatal error on delete" line at all — so the message
+            # match above is the shared substring, not the delete-only phrasing.
             # Exit 7 is every fatal error, so the code AND the message must match.
             if [[ $EXIT_CODE -eq 7 && -s "$RUN_MATCHES" ]]; then
                 echo "$(date '+%Y-%m-%d %H:%M:%S') - Delete limit reached: rclone stopped at --max-delete $MAX_DELETE; limpet will not sync this profile again until the limit is cleared (limpet profile clear-delete-limit, or the menu)" >> "$LOG_FILE"
@@ -708,17 +812,71 @@ final class SyncSetupService {
             """
     }
 
-    /// `--max-delete` for `profile`, or 0 for none (limpet-plan.md L4 F6): only
-    /// where a wrong delete cannot be undone. MEGA S4 and Cloudflare R2 keep no
-    /// deleted versions, so always; any other s3 provider (AWS, MinIO, Other)
-    /// unless the user states versioning is on. B2 hides instead of deleting,
-    /// and other remote types keep today's behaviour. `remoteSection` is the
-    /// remote's rclone.conf section (`nil` = not found = no limit).
-    static func maxDeleteArgument(for profile: SyncProfile, remoteSection: [String: String]?) -> Int {
-        guard remoteSection?["type"] == "s3" else { return 0 }
-        // Case-insensitive: a hand-edited or CLI-given `provider = mega` is still MEGA S4.
+    /// Whether `profile`'s remote keeps no deleted versions — the shared test
+    /// `maxDeleteArgument` and `trashRoot(for:remoteSection:)` both use
+    /// (limpet-plan.md L6.2 item 1 factors this out of the old inline
+    /// `maxDeleteArgument` body). MEGA S4 and Cloudflare R2 always (case-
+    /// insensitive: a hand-edited or CLI-given `provider = mega` is still MEGA
+    /// S4); any other s3 provider (AWS, MinIO, Other) unless the user states
+    /// versioning is on; B2 and other remote types never (B2 hides instead of
+    /// deleting). `remoteSection` is the remote's rclone.conf section (`nil` =
+    /// not found = not applicable).
+    static func remoteKeepsNoDeletedVersions(for profile: SyncProfile, remoteSection: [String: String]?) -> Bool {
+        guard remoteSection?["type"] == "s3" else { return false }
         let neverVersioned = ["mega", "cloudflare"].contains((remoteSection?["provider"] ?? "").lowercased())
-        return neverVersioned || !profile.remoteVersioning ? profile.maxDelete : 0
+        return neverVersioned || !profile.remoteVersioning
+    }
+
+    /// The trash root's PATH FORMULA alone — `<remote>:<parent>/.limpet-trash/<leaf>`
+    /// — requiring only that `remotePath` has a parent (a bucket-root
+    /// `remotePath` has nowhere to put a `.limpet-trash` SIBLING without it
+    /// becoming part of what gets synced/deleted). Ignores `trashDays`,
+    /// `syncDirection` and `remoteVersioning` on purpose (code-review finding
+    /// 4 on 87bbf67): `limpet trash list`/`trash restore` call this directly
+    /// so they keep working to inspect/restore OLD trash after the profile's
+    /// direction or versioning changed, or after trash was switched off
+    /// (`trashDays` set to 0) — the sync and purge instead call `trashRoot`
+    /// below, which layers the "is trash currently ACTIVE" checks on top of
+    /// this formula. A trash whose profile no longer actively uses it is
+    /// therefore never purged automatically; deleting it is on the user.
+    static func trashRootPath(for profile: SyncProfile) -> String? {
+        let components = profile.remotePath.split(separator: "/").filter { !$0.isEmpty }
+        guard components.count > 1, let leaf = components.last else { return nil }
+        let parent = components.dropLast().joined(separator: "/")
+        let remoteName = profile.rcloneRemote.hasSuffix(":") ? String(profile.rcloneRemote.dropLast()) : profile.rcloneRemote
+        return "\(remoteName):\(parent)/.limpet-trash/\(leaf)"
+    }
+
+    /// Where deleted/overwritten files for `profile` are kept, or `nil` if
+    /// trash does not apply (limpet-plan.md L6.2 item 1). Resolved ONLY here
+    /// (and by `maxDeleteArgument` below, which calls this for its own 5000
+    /// bump) — never anywhere else — so every reader (the script, the CLI,
+    /// `SyncManager`'s drop-bare-Deleted check) sees the exact same decision by
+    /// going through the derived config or this function, not by re-deriving
+    /// it. Applies only when the trash is currently ACTIVE: the profile
+    /// uploads (a download's remote is the SOURCE, so nothing to keep a
+    /// remote trash of), `trashDays > 0`, `remoteKeepsNoDeletedVersions`, and
+    /// `trashRootPath` resolves (i.e. `remotePath` has a parent). `limpet
+    /// trash list`/`trash restore` do NOT call this — see `trashRootPath`.
+    static func trashRoot(for profile: SyncProfile, remoteSection: [String: String]?) -> String? {
+        guard profile.syncDirection == .localToRemote,
+              profile.trashDays > 0,
+              remoteKeepsNoDeletedVersions(for: profile, remoteSection: remoteSection) else { return nil }
+        return trashRootPath(for: profile)
+    }
+
+    /// `--max-delete` for `profile`, or 0 for none (limpet-plan.md L4 F6): only
+    /// where a wrong delete cannot be undone (see `remoteKeepsNoDeletedVersions`
+    /// above). limpet-plan.md L6.2 item 4: a profile with an active trash root
+    /// is stopping on a mass-change ALARM, not a last line of defense (the
+    /// trash makes deletes recoverable), so its default of 100 (still the
+    /// stored value — never overwritten on disk) is raised to 5000 here.
+    static func maxDeleteArgument(for profile: SyncProfile, remoteSection: [String: String]?) -> Int {
+        guard remoteKeepsNoDeletedVersions(for: profile, remoteSection: remoteSection) else { return 0 }
+        if profile.maxDelete == 100, trashRoot(for: profile, remoteSection: remoteSection) != nil {
+            return 5000
+        }
+        return profile.maxDelete
     }
 
     /// Generate profile-specific JSON config.
@@ -744,6 +902,8 @@ final class SyncSetupService {
             "remotePath": profile.remotePath,
             "transfers": profile.transfers,
             "maxDelete": Self.maxDeleteArgument(for: profile, remoteSection: remoteSection),
+            "trashRoot": Self.trashRoot(for: profile, remoteSection: remoteSection) ?? "",
+            "trashDays": profile.trashDays,
         ]
 
         if let data = try? JSONSerialization.data(

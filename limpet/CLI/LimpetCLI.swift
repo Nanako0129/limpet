@@ -41,7 +41,27 @@ enum CLICommand: Equatable {
     case profileSetEnabled(target: String, enabled: Bool)
     case profileClearDeleteLimit(String)
     case remoteAdd(RemoteAddRequest)
+    case trashList(target: String, date: String?)
+    case trashRestore(target: String, relativePath: String, date: String?, force: Bool)
     case help
+}
+
+/// The newest trashed version of a restore target found in a `rclone lsf -R`
+/// listing (limpet-plan.md L6.2 item 5).
+struct TrashMatch: Equatable {
+    /// The `YYYY-MM-DD` folder it was found under.
+    let date: String
+    /// Its path relative to the LISTED root (includes the date folder when
+    /// the listing covered the whole trash root, i.e. no fixed `--date`).
+    let entry: String
+    /// The 6-digit `HHMMSS` suffix rclone inserted.
+    let suffix: String
+    /// Whether this matched the `<name>.rclonelink` form — a symlink stored
+    /// as a plain content object because the remote has no native symlink
+    /// support (code-review finding 2 on 87bbf67). Restore needs this to
+    /// recreate a real local symlink instead of a regular file carrying the
+    /// link target as text.
+    let isSymlink: Bool
 }
 
 /// A `parse` failure — carries the usage message printed to stderr.
@@ -75,6 +95,13 @@ struct CLIEnvironment {
     /// Read every profile from the file-authoritative profiles directory.
     var readProfiles: () -> [SyncProfile]
     var fileExists: (String) -> Bool
+    /// Whether a directory entry exists at the path WITHOUT following a final
+    /// symlink (lstat), so a dangling symlink counts as existing. `trash
+    /// restore` uses it so a symlink at the destination is never looked through.
+    var itemExists: (String) -> Bool
+    /// realpath(3) of an existing path (every symlink resolved), or `nil` when
+    /// it cannot be resolved (missing, dangling symlink, no permission).
+    var realPath: (String) -> String?
     /// Run `launchctl` with `args`. Returns `(exitCode, stdout)`.
     var runLaunchctl: (_ args: [String]) -> (Int32, String)
     /// Whether the JSON schema files are installed under the config directory.
@@ -94,6 +121,12 @@ struct CLIEnvironment {
     var deleteProfileFile: (SyncProfile) -> Void
     /// Remove a file (the delete-limit marker). Returns whether it succeeded.
     var removeFile: (String) -> Bool
+    /// Move/rename a local file or symlink from `from` to `to`. With
+    /// `replace`, an existing item at `to` is replaced atomically; without it
+    /// the move fails if ANY item appears at `to`, even one created after an
+    /// earlier existence check (CodeRabbit, PR #10). On failure `to` is left
+    /// untouched. Used by `trash restore`'s temp-name-then-rename.
+    var moveFile: (_ from: String, _ to: String, _ replace: Bool) -> Bool
     /// Read all of stdin (for `profile create -`). `nil` on read failure.
     var readStdin: () -> String?
     /// Read a file's contents as UTF-8 text. `nil` if missing/unreadable.
@@ -146,16 +179,24 @@ enum LimpetCLI {
       remote add <name> --type s3|b2 --access-key-id <id> [--provider <p>] [--endpoint <https url>] [--region <r>]
                                    Add a remote whose secret lives in the login keychain;
                                    the secret is read from stdin (no-echo prompt on a terminal)
+      trash restore <name|id> <relative-path> [--date YYYY-MM-DD] [--force]
+                                   Restore the newest (or one dated) trashed version of a file
 
     Operate:
       sync <name|id>                          Ask the profile's watcher to sync now (returns immediately)
       watch <name|id>                         Run as the profile's realtime watcher (launchd only; never exits)
+      trash list <name|id> [--date YYYY-MM-DD] List a profile's trashed (deleted/overwritten) files
 
     profile set keys: name, rcloneRemote, remotePath, localSyncPath,
       drivePathToMonitor, additionalRcloneFlags,
       syncDirection (localToRemote|remoteToLocal), syncIntervalMinutes,
-      transfers, isMuted, maxDelete, remoteVersioning.
+      transfers, isMuted, maxDelete, remoteVersioning, trashDays.
       Use enable/disable for isEnabled.
+
+    trash list/restore work on any profile whose remotePath has a parent
+    (the trash root is a path formula, independent of trashDays/syncDirection/
+    remoteVersioning), so they keep reaching OLD trash after trash was turned
+    off or the profile changed — see CLAUDE.md's Delete-limit/Trash sections.
 
     Profiles author JSON against schema/profile.schema.json under the config
     directory; the same file an agent can drop in or edit directly.
@@ -241,6 +282,9 @@ enum LimpetCLI {
 
         case "remote":
             return parseRemote(rest)
+
+        case "trash":
+            return parseTrash(rest)
 
         case "help", "-h", "--help":
             return .success(.help)
@@ -364,6 +408,41 @@ enum LimpetCLI {
         return .success(.remoteAdd(RemoteAddRequest(name: name, type: type, values: values)))
     }
 
+    /// Parse `trash list <name|id> [--date D]` / `trash restore <name|id>
+    /// <relative-path> [--date D] [--force]`. Value validation (path shape,
+    /// date shape) happens in `run`, before any rclone call — never here.
+    private static func parseTrash(_ rest: [String]) -> Result<CLICommand, CLIUsageError> {
+        guard let sub = rest.first else {
+            return .failure(CLIUsageError(message: "usage: limpet trash <list|restore> ..."))
+        }
+        var args = Array(rest.dropFirst())
+        var date: String?
+        if let idx = args.firstIndex(of: "--date"), idx + 1 < args.count {
+            date = args[idx + 1]
+            args.removeSubrange(idx...(idx + 1))
+        }
+        let force = args.contains("--force")
+        args.removeAll { $0 == "--force" }
+
+        switch sub {
+        case "list":
+            guard let target = args.first else {
+                return .failure(CLIUsageError(message: "usage: limpet trash list <name|shortId> [--date YYYY-MM-DD]"))
+            }
+            return .success(.trashList(target: target, date: date))
+
+        case "restore":
+            guard args.count == 2 else {
+                return .failure(CLIUsageError(
+                    message: "usage: limpet trash restore <name|shortId> <relative-path> [--date YYYY-MM-DD] [--force]"))
+            }
+            return .success(.trashRestore(target: args[0], relativePath: args[1], date: date, force: force))
+
+        default:
+            return .failure(CLIUsageError(message: "unknown 'trash' subcommand: \(sub)"))
+        }
+    }
+
     /// Parse + dispatch, printing usage via `env.stderr` on a parse failure.
     /// The single entry point both `dispatch` (real env) and the self-test
     /// (fake env) exercise for the unknown/absent-subcommand case.
@@ -413,6 +492,10 @@ enum LimpetCLI {
             return runClearDeleteLimit(target, env: env)
         case .remoteAdd(let request):
             return runRemoteAdd(request, env: env)
+        case .trashList(let target, let date):
+            return runTrashList(target, date: date, env: env)
+        case .trashRestore(let target, let relativePath, let date, let force):
+            return runTrashRestore(target, relativePath: relativePath, date: date, force: force, env: env)
         case .help:
             env.stdout(Self.usage + "\n")
             return 0
@@ -1023,6 +1106,12 @@ enum LimpetCLI {
         case "maxDelete":
             guard let n = int(value), n >= 1 else { return "maxDelete must be an integer ≥ 1" }
             profile.maxDelete = n
+        case "trashDays":
+            // 0...365, matching SyncProfile.validationError's rule (0 = off).
+            guard let n = int(value), (0...365).contains(n) else {
+                return "trashDays must be an integer from 0 to 365"
+            }
+            profile.trashDays = n
         case "remoteVersioning":
             guard let b = bool(value) else { return "remoteVersioning must be true or false" }
             profile.remoteVersioning = b
@@ -1096,6 +1185,276 @@ enum LimpetCLI {
         }
         return 0
     }
+
+    // MARK: - trash
+
+    /// F6/limpet-plan.md L6.2 item 5: refused BEFORE any rclone call — empty,
+    /// absolute, or carrying an empty/`.`/`..` component (any of which could
+    /// escape `localSyncPath` on restore, or address something outside the
+    /// trash tree).
+    static func validateTrashRelativePath(_ path: String) -> String? {
+        guard !path.isEmpty, !path.hasPrefix("/") else {
+            return "path must be a non-empty, non-absolute relative path"
+        }
+        let components = path.split(separator: "/", omittingEmptySubsequences: false)
+        guard components.allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." }) else {
+            return "path must not contain an empty, \".\" or \"..\" component"
+        }
+        return nil
+    }
+
+    /// `validateTrashRelativePath` is syntax only: a SYMLINK already inside
+    /// `localSyncPath` (`sub -> /outside`) lets `sub/file` pass it, and the
+    /// temp `copyto` and final rename both address paths through that link
+    /// (CodeRabbit, PR #10). Measured 2026-09-28, rclone 1.75.1: today only
+    /// the `links` option of the `:local,links:` destination stops the copy
+    /// ("need \".rclonelink\" suffix to refer to symlink", exit 1, nothing
+    /// written); a plain local destination DOES write through the link. That
+    /// is incidental, not a guarantee, so containment is checked here, before
+    /// any rclone call. The destination's
+    /// PARENT is resolved against the real filesystem and must lie inside the
+    /// resolved `localSyncPath`. Components that do not exist yet cannot be
+    /// links, so the nearest EXISTING ancestor is what gets resolved; an
+    /// existing entry that cannot be resolved (a dangling symlink) is refused.
+    /// The destination entry itself is not resolved here — a symlink there is
+    /// never followed (see `runTrashRestore`). Returns an error, or `nil`.
+    static func trashRestoreContainmentError(
+        localSyncPath: String, relativePath: String, env: CLIEnvironment
+    ) -> String? {
+        func resolve(_ path: String) -> String? {
+            var existing = path
+            var missing: [String] = []
+            while !existing.isEmpty, existing != "/", !env.itemExists(existing) {
+                missing.insert((existing as NSString).lastPathComponent, at: 0)
+                existing = (existing as NSString).deletingLastPathComponent
+            }
+            guard let real = env.realPath(existing) else { return nil }
+            return missing.reduce(real) { ($0 as NSString).appendingPathComponent($1) }
+        }
+        let target = (localSyncPath as NSString).appendingPathComponent(relativePath)
+        guard let root = resolve(localSyncPath),
+              let parent = resolve((target as NSString).deletingLastPathComponent) else {
+            return "cannot resolve the real path of \(target)'s directory"
+        }
+        let rootPrefix = root.hasSuffix("/") ? root : root + "/"
+        guard parent == root || parent.hasPrefix(rootPrefix) else {
+            return "\(relativePath) resolves outside \(localSyncPath) (through a symlink); refusing to restore there"
+        }
+        return nil
+    }
+
+    /// `--date` must be exactly `YYYY-MM-DD` — refused before any rclone call.
+    static func validateTrashDate(_ date: String?) -> String? {
+        guard let date else { return nil }
+        guard date.range(of: "^[0-9]{4}-[0-9]{2}-[0-9]{2}$", options: .regularExpression) != nil else {
+            return "--date must match YYYY-MM-DD"
+        }
+        return nil
+    }
+
+    /// Whether `candidate` is `original` with rclone's `--suffix -HHMMSS
+    /// --suffix-keep-extension` (a literal `-` + exactly 6 digits) inserted at
+    /// one `.` boundary of `original`, or at its very end. Tries EVERY dot
+    /// boundary rather than re-deriving rclone's own extension-split rule
+    /// (limpet-plan.md L6.2 item 5, measured 2026-09-28: `a.tar.gz` splits at
+    /// the FIRST dot -> `a-100003.tar.gz`, but `x.min.js` splits at the LAST
+    /// dot -> `x.min-100003.js`) — only one boundary can produce a match
+    /// against a real rclone-generated name. Returns the 6-digit suffix.
+    static func trashSuffixMatch(candidate: String, original: String) -> String? {
+        var boundaries: [String.Index] = [original.endIndex]
+        boundaries.append(contentsOf: original.indices.filter { original[$0] == "." })
+        for pos in boundaries {
+            let prefix = String(original[original.startIndex..<pos])
+            let ext = String(original[pos...])
+            let marker = "\(prefix)-"
+            guard candidate.hasPrefix(marker), candidate.hasSuffix(ext),
+                  candidate.count >= marker.count + ext.count else { continue }
+            let start = candidate.index(candidate.startIndex, offsetBy: marker.count)
+            let end = candidate.index(candidate.endIndex, offsetBy: -ext.count)
+            guard start <= end else { continue }
+            let digits = String(candidate[start..<end])
+            guard digits.count == 6, digits.allSatisfy(\.isNumber) else { continue }
+            return digits
+        }
+        return nil
+    }
+
+    /// The newest trashed version of `dirComponent`/`baseName` (or its
+    /// `.rclonelink` form, for a symlink on a remote without native symlink
+    /// support) in a `rclone lsf -R` `listing`. When `dateFixed` is `nil` each
+    /// line is `<date>/<relative path>` (a whole-root listing); otherwise
+    /// every line is relative to that one date's folder already. Ties broken
+    /// by date (lexicographic `YYYY-MM-DD` sorts chronologically), then by the
+    /// highest 6-digit suffix. Pure — the self-test drives it over fixture
+    /// text without touching rclone.
+    static func newestTrashMatch(
+        listing: String, dateFixed: String?, dirComponent: String, baseName: String
+    ) -> TrashMatch? {
+        var best: TrashMatch?
+        // Plain name first, so a same-suffix collision (unlikely: a 6-digit
+        // stamp is exact) prefers the non-symlink form; either candidate that
+        // actually matches is scored against `best` the same way.
+        let candidates: [(name: String, isSymlink: Bool)] = [(baseName, false), ("\(baseName).rclonelink", true)]
+        for rawLine in listing.split(separator: "\n", omittingEmptySubsequences: true) {
+            let line = String(rawLine)
+            let date: String
+            let relativeToDate: String
+            if let dateFixed {
+                date = dateFixed
+                relativeToDate = line
+            } else {
+                guard let slash = line.firstIndex(of: "/") else { continue }
+                let candidateDate = String(line[line.startIndex..<slash])
+                guard candidateDate.range(of: "^[0-9]{4}-[0-9]{2}-[0-9]{2}$", options: .regularExpression) != nil else {
+                    continue
+                }
+                date = candidateDate
+                relativeToDate = String(line[line.index(after: slash)...])
+            }
+            guard (relativeToDate as NSString).deletingLastPathComponent == dirComponent else { continue }
+            let entryName = (relativeToDate as NSString).lastPathComponent
+            for candidate in candidates {
+                guard let suffix = trashSuffixMatch(candidate: entryName, original: candidate.name) else { continue }
+                let match = TrashMatch(date: date, entry: line, suffix: suffix, isSymlink: candidate.isSymlink)
+                if best == nil || isNewerTrashMatch(match, than: best!) { best = match }
+                break
+            }
+        }
+        return best
+    }
+
+    private static func isNewerTrashMatch(_ a: TrashMatch, than b: TrashMatch) -> Bool {
+        if a.date != b.date { return a.date > b.date }
+        return (Int(a.suffix) ?? -1) > (Int(b.suffix) ?? -1)
+    }
+
+    /// `lsf -R` over a whole trash root can be a large listing; generous but
+    /// not unbounded (code-review finding 3 on 87bbf67: the old 20s cap was
+    /// arbitrary for a possibly-large `.limpet-trash`).
+    private static let trashListTimeout: TimeInterval = 600
+    /// A restored file can be arbitrarily large (it is exactly a file the
+    /// profile once synced); effectively no limit rather than the old
+    /// arbitrary 60s (code-review finding 3 on 87bbf67).
+    private static let trashRestoreTimeout: TimeInterval = 86400
+
+    private static func runTrashList(_ target: String, date: String?, env: CLIEnvironment) -> Int32 {
+        guard let profile = resolveProfile(target, in: env.readProfiles()) else {
+            env.stderr("error: no profile matches \"\(target)\"\n")
+            return 1
+        }
+        if let err = validateTrashDate(date) {
+            env.stderr("error: \(err)\n")
+            return 65
+        }
+        // Finding 4: list/restore use the path FORMULA alone (ignoring
+        // trashDays/direction/versioning), so they keep working to inspect
+        // old trash after the profile changed or trash was switched off.
+        guard let root = SyncSetupService.trashRootPath(for: profile) else {
+            env.stdout("\(profile.name) (\(profile.shortId)) can have no trash root: remotePath \"\(profile.remotePath)\" has no parent\n")
+            return 0
+        }
+        let listPath = date.map { "\(root)/\($0)" } ?? root
+        let (exit, out, err) = env.runRclone(["lsf", "-R", listPath], profile.rcloneRemote, trashListTimeout)
+        guard exit == 0 else {
+            env.stderr(err.isEmpty ? "error: rclone lsf failed (exit \(exit))\n" : err)
+            return 1
+        }
+        env.stdout(out)
+        return 0
+    }
+
+    private static func runTrashRestore(
+        _ target: String, relativePath: String, date: String?, force: Bool, env: CLIEnvironment
+    ) -> Int32 {
+        guard let profile = resolveProfile(target, in: env.readProfiles()) else {
+            env.stderr("error: no profile matches \"\(target)\"\n")
+            return 1
+        }
+        if let err = validateTrashRelativePath(relativePath) {
+            env.stderr("error: \(err)\n")
+            return 65
+        }
+        if let err = validateTrashDate(date) {
+            env.stderr("error: \(err)\n")
+            return 65
+        }
+        if let err = trashRestoreContainmentError(
+            localSyncPath: profile.localSyncPath, relativePath: relativePath, env: env) {
+            env.stderr("error: \(err)\n")
+            return 65
+        }
+        // Finding 4: path formula alone, same reasoning as runTrashList.
+        guard let root = SyncSetupService.trashRootPath(for: profile) else {
+            env.stderr("error: \(profile.name) (\(profile.shortId)) can have no trash root: "
+                + "remotePath \"\(profile.remotePath)\" has no parent\n")
+            return 1
+        }
+        let localTarget = (profile.localSyncPath as NSString).appendingPathComponent(relativePath)
+        // lstat, not stat: a symlink at the destination (dangling or not) is
+        // an existing entry. rclone only ever writes the temp name, and the
+        // final rename replaces the link itself, so the link is never followed.
+        guard force || !env.itemExists(localTarget) else {
+            env.stderr("error: \(localTarget) already exists; pass --force to overwrite\n")
+            return 1
+        }
+        let listPath = date.map { "\(root)/\($0)" } ?? root
+        let (listExit, listing, listErr) = env.runRclone(["lsf", "-R", listPath], profile.rcloneRemote, trashListTimeout)
+        guard listExit == 0 else {
+            env.stderr(listErr.isEmpty ? "error: rclone lsf failed (exit \(listExit))\n" : listErr)
+            return 1
+        }
+        let dirComponent = (relativePath as NSString).deletingLastPathComponent
+        let baseName = (relativePath as NSString).lastPathComponent
+        guard let match = Self.newestTrashMatch(
+            listing: listing, dateFixed: date, dirComponent: dirComponent, baseName: baseName) else {
+            env.stderr("error: no trashed version of \(relativePath) found\n")
+            return 1
+        }
+        let sourcePath = "\(listPath)/\(match.entry)"
+
+        // Restore to a TEMP name in the same directory, then rename into
+        // place on success — a failed copyto must never leave a partial file
+        // at `localTarget` (code-review finding 3 on 87bbf67).
+        let tempTarget = "\(localTarget).limpet-restore-tmp"
+        // Never delete whatever sits at the temp path: it may be the user's own
+        // file. limpet removes its temp on every failure path, so an existing
+        // one is not ours to discard (CodeRabbit, PR #10); --force does not
+        // bypass this.
+        guard !env.itemExists(tempTarget) else {
+            env.stderr("error: \(tempTarget) already exists; refusing to overwrite it — move or delete it, then retry\n")
+            return 1
+        }
+
+        // A `.rclonelink` MATCH is a symlink stored as a plain content object
+        // (the remote has no native symlink support) — `rclone copyto` alone
+        // writes that content literally, as a regular file. Measured
+        // 2026-09-28: destination `":local,links:<path>.rclonelink"` (an
+        // rclone "connection string" override, LOCAL side only — the source
+        // is read as a plain object, never itself touched by `--links`) makes
+        // the local backend strip the suffix and create a REAL symlink at
+        // `<path>`, pointing at the object's text content:
+        //   rclone --config /dev/null copyto <src>/l-100003.txt.rclonelink \
+        //     ":local,links:<dst>/l.txt.rclonelink"
+        //   -> creates a real symlink <dst>/l.txt -> a.tar.gz
+        // A plain (non-symlink) restore uses the same destination form
+        // without the suffix; that also measured as an ordinary file copy
+        // (the `links` local-backend option only changes `.rclonelink`
+        // handling), so one destination shape covers both cases uniformly.
+        let destinationArg = match.isSymlink ? ":local,links:\(tempTarget).rclonelink" : ":local,links:\(tempTarget)"
+        let (copyExit, _, copyErr) = env.runRclone(["copyto", sourcePath, destinationArg], profile.rcloneRemote, trashRestoreTimeout)
+        guard copyExit == 0 else {
+            _ = env.removeFile(tempTarget)
+            env.stderr(copyErr.isEmpty ? "error: restore failed (exit \(copyExit))\n" : copyErr)
+            return 1
+        }
+        guard env.moveFile(tempTarget, localTarget, force) else {
+            _ = env.removeFile(tempTarget)
+            env.stderr("error: restored to \(tempTarget) but could not move it into place at \(localTarget)\n")
+            return 1
+        }
+        env.stdout("restored \(relativePath) from \(sourcePath) to \(localTarget)\n")
+        return 0
+    }
 }
 
 // MARK: - Production environment
@@ -1122,6 +1481,8 @@ extension CLIEnvironment {
             },
             readProfiles: { ProfileStore.profilesOnDisk(in: SyncProfile.configDirectory) },
             fileExists: { FileManager.default.fileExists(atPath: $0) },
+            itemExists: CLIEnvironment.lstatExists,
+            realPath: CLIEnvironment.resolvedRealPath,
             runLaunchctl: { args in CLIEnvironment.runProcess(launchPath: "/bin/launchctl", args: args) },
             schemaFilesPresent: {
                 ConfigSchemaInstaller.schemaResourceFilenames.allSatisfy {
@@ -1159,6 +1520,9 @@ extension CLIEnvironment {
                 try? FileManager.default.removeItem(atPath: path)
             },
             removeFile: { (try? FileManager.default.removeItem(atPath: $0)) != nil },
+            moveFile: { from, to, replace in
+                replace ? CLIEnvironment.moveReplacing(from, to) : CLIEnvironment.moveNoReplace(from, to)
+            },
             readStdin: {
                 let data = FileHandle.standardInput.readDataToEndOfFile()
                 return String(data: data, encoding: .utf8)
@@ -1182,6 +1546,45 @@ extension CLIEnvironment {
             stdout: { FileHandle.standardOutput.write(Data($0.utf8)) },
             stderr: { FileHandle.standardError.write(Data($0.utf8)) }
         )
+    }
+
+    /// `moveFile` for production. The old remove-then-move lost BOTH files
+    /// when the move failed (CodeRabbit, PR #10). An existing destination
+    /// entry (lstat, so a dangling symlink too) is replaced with rename(2),
+    /// which swaps the directory entry atomically: on failure nothing
+    /// changed, and neither side's symlink is followed. `moveItem` only when
+    /// no entry exists (it refuses to overwrite one that appeared meanwhile).
+    /// `FileManager.replaceItemAt` was measured unsuitable 2026-09-28 (macOS
+    /// 27): it throws whenever the destination OR the source is a symlink
+    /// (dangling or not), so a forced restore over a symlink, or of a
+    /// symlink, could never succeed; and it REPLACED a non-empty directory
+    /// with a file (the directory and its contents gone). rename(2)
+    /// measured: file over symlink replaces the link (target untouched),
+    /// file over dangling symlink, symlink over file, missing source ->
+    /// ENOENT with the destination intact, file over a non-empty directory
+    /// -> EISDIR with it intact.
+    static func moveReplacing(_ from: String, _ to: String) -> Bool {
+        if lstatExists(to) { return rename(from, to) == 0 }
+        return (try? FileManager.default.moveItem(atPath: from, toPath: to)) != nil
+    }
+
+    /// Atomic move that never replaces: renamex_np(RENAME_EXCL) fails with
+    /// EEXIST if any item (a dangling symlink included) exists at `to`.
+    static func moveNoReplace(_ from: String, _ to: String) -> Bool {
+        renamex_np(from, to, UInt32(RENAME_EXCL)) == 0
+    }
+
+    /// `itemExists` for production: lstat, so a dangling symlink exists.
+    static func lstatExists(_ path: String) -> Bool {
+        var info = stat()
+        return lstat(path, &info) == 0
+    }
+
+    /// `realPath` for production: realpath(3); `nil` on any failure.
+    static func resolvedRealPath(_ path: String) -> String? {
+        guard let resolved = realpath(path, nil) else { return nil }
+        defer { free(resolved) }
+        return String(cString: resolved)
     }
 
     /// Run rclone at its located path with a hard process-level watchdog —

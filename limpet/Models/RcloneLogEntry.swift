@@ -144,7 +144,8 @@ extension RcloneLogEntry {
                 return FileChange(
                     timestamp: date ?? Date(),
                     path: objectPath,
-                    operation: operation
+                    operation: operation,
+                    mayBeTrashArtifact: SyncLogPatterns.mayBeTrashArtifact(cleanMsg)
                 )
             }
         }
@@ -172,13 +173,26 @@ extension RcloneLogEntry {
     /// "Copied (new)" -> .copied; "Copied (replaced existing)" and
     /// "Updated modification time in destination" -> .updated; "Deleted"
     /// -> .deleted; "Moved (server-side) to: ..." and "Renamed from \"...\""
-    /// (both emitted per rename under `--track-renames`) -> .renamed.
+    /// (both emitted per rename under `--track-renames`, which a profile's
+    /// `additionalRcloneFlags` CAN set — limpet does not forbid it) -> .renamed.
+    ///
+    /// limpet-plan.md L6.2 item 4b (measured 2026-09-28 with a trash root,
+    /// `--disable Move`, the S4-path fallback): "Copied (server-side copy)
+    /// to: ..." is ALWAYS the trash mechanism moving a version aside before
+    /// the real change (a normal same-remote copy never gets a " to:" suffix
+    /// — that only appears when the destination name differs from the
+    /// source's, which a plain copy never does) — never a change to report,
+    /// unconditionally, trash root or not.
     private func parseOperation(from message: String, level: String) -> FileChange.Operation? {
         guard level == "info" else { return nil }
 
-        // Any "Copied (…)" success: "(new)" and "(server-side copy)" were
-        // measured on rclone 1.75.1; contains, not hasPrefix, so a prefixed
-        // variant (e.g. a multi-thread transfer's) is not dropped.
+        if SyncLogPatterns.isTrashBackupCopy(message) {
+            return nil
+        }
+        // Any other "Copied (…)" success: "(new)" and "(server-side copy)"
+        // (without " to:", a genuine same-remote copy, not a backup-dir move)
+        // were measured on rclone 1.75.1; contains, not hasPrefix, so a
+        // prefixed variant (e.g. a multi-thread transfer's) is not dropped.
         if message.contains("Copied (replaced existing)") {
             return .updated
         }
@@ -188,7 +202,7 @@ extension RcloneLogEntry {
         if message.hasPrefix("Updated modification time in destination") {
             return .updated
         }
-        if message == "Deleted" {
+        if message == "Deleted" || SyncLogPatterns.isMovedIntoBackupDir(message) {
             return .deleted
         }
         if message.hasPrefix("Moved (server-side) to:") || message.hasPrefix("Renamed from") {

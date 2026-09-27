@@ -48,6 +48,12 @@ struct SyncProfile: Identifiable, Codable, Equatable {
     /// versioning on). Lifts `--max-delete` for AWS/MinIO/Other s3 remotes;
     /// never for MEGA S4 or Cloudflare R2, which have none.
     var remoteVersioning: Bool
+    /// Days a deleted/overwritten file is kept under `.limpet-trash` on a
+    /// remote that keeps no deleted versions (limpet-plan.md L6.2); 0 = off.
+    /// Only takes effect when `syncDirection == .localToRemote`, the remote
+    /// keeps no deleted versions, and `remotePath` has a parent — resolved
+    /// once, in `SyncSetupService.generateProfileConfig`/`trashRoot(for:remoteSection:)`.
+    var trashDays: Int
 
     /// Short ID for file naming (first 8 chars of UUID)
     var shortId: String {
@@ -145,6 +151,7 @@ struct SyncProfile: Identifiable, Codable, Equatable {
     var validationError: String? {
         if let error = Self.remoteSpecError(rcloneRemote) { return error }
         if maxDelete < 1 { return "maxDelete must be at least 1" }
+        if !(0...365).contains(trashDays) { return "trashDays must be between 0 and 365" }
         // Carried from L4.0: 1–64. A leading zero never survives JSON decoding
         // (measured: JSONDecoder rejects `08` and `010`), and `profile set`
         // refuses one itself, because bash reads `08` as octal.
@@ -228,7 +235,8 @@ struct SyncProfile: Identifiable, Codable, Equatable {
         syncDirection: SyncDirection = .localToRemote,
         transfers: Int = 16,
         maxDelete: Int = 100,
-        remoteVersioning: Bool = false
+        remoteVersioning: Bool = false,
+        trashDays: Int = 14
     ) {
         self.id = id
         self.name = name
@@ -244,6 +252,7 @@ struct SyncProfile: Identifiable, Codable, Equatable {
         self.transfers = transfers
         self.maxDelete = maxDelete
         self.remoteVersioning = remoteVersioning
+        self.trashDays = trashDays
     }
 
     /// Create a new profile with default values
@@ -259,7 +268,7 @@ extension SyncProfile {
         case id, name, rcloneRemote, remotePath, localSyncPath
         case drivePathToMonitor, syncIntervalMinutes, additionalRcloneFlags
         case isEnabled, isMuted, syncDirection, transfers
-        case maxDelete, remoteVersioning
+        case maxDelete, remoteVersioning, trashDays
     }
 
     init(from decoder: Decoder) throws {
@@ -285,6 +294,9 @@ extension SyncProfile {
         transfers = try container.decodeIfPresent(Int.self, forKey: .transfers) ?? 16
         maxDelete = try container.decodeIfPresent(Int.self, forKey: .maxDelete) ?? 100
         remoteVersioning = try container.decodeIfPresent(Bool.self, forKey: .remoteVersioning) ?? false
+        // Backwards compatibility: default 14 (limpet-plan.md L6.2), matching
+        // the memberwise-init default so an app-written file round-trips.
+        trashDays = try container.decodeIfPresent(Int.self, forKey: .trashDays) ?? 14
 
         // F4: a refused value never becomes a SyncProfile, so it can never be
         // written back out, installed, or run by a watcher.

@@ -60,6 +60,16 @@ final class SyncManager: ObservableObject {
     /// Profiles where we're monitoring an externally-started sync
     private var monitoringExternalSyncs: Set<UUID> = []
 
+    /// Cache for `shouldReportFileChange`'s `hasTrashRoot` (code-review
+    /// finding 6 on 87bbf67): populated only by `startWatching`, which runs
+    /// at launch and whenever a profile's watching (re)starts — i.e. after
+    /// any reinstall-worthy field change (`rcloneRemote`, `remotePath`,
+    /// `syncDirection`, `remoteVersioning`, `trashDays` among them, per
+    /// `ConfigReconciler.reconcileAction`). Never recomputed per file-change
+    /// event; removed by `stopWatching` so a deleted profile leaves nothing
+    /// behind.
+    private var trashRootCache: [UUID: Bool] = [:]
+
     /// Timers polling for sync completion
     private var syncCompletionPollers: [UUID: DispatchSourceTimer] = [:]
 
@@ -862,6 +872,7 @@ final class SyncManager: ObservableObject {
         watcher.delegate = self
         watcher.startWatching()
         logWatchers[profile.id] = watcher
+        trashRootCache[profile.id] = Self.resolveHasTrashRoot(for: profile)
 
         if let pid = detectRunningSyncPID(for: profile) {
             profileStates[profile.id] = .syncing
@@ -883,6 +894,7 @@ final class SyncManager: ObservableObject {
     private func stopWatching(profileId: UUID) {
         logWatchers[profileId]?.stopWatching()
         logWatchers.removeValue(forKey: profileId)
+        trashRootCache.removeValue(forKey: profileId)
         // Same cleanup as pauseProfile: a poller left behind here would keep
         // the id in monitoringExternalSyncs and block the poller for the sync
         // the next startWatching finds (CodeRabbit, PR #9).
@@ -1062,6 +1074,38 @@ final class SyncManager: ObservableObject {
         }
     }
 
+    /// Whether a parsed file-change belongs in Recent Changes/notifications
+    /// (limpet-plan.md L6.2 item 4b; code-review finding 1/8 on 87bbf67 fixed
+    /// the two bugs below). `false` only when `hasTrashRoot` AND the change is
+    /// flagged `mayBeTrashArtifact` — set by `SyncLogPatterns.mayBeTrashArtifact`
+    /// for exactly the two log lines that are ambiguous between a genuine
+    /// change and the trash mechanism's own backup-move step (a bare
+    /// `Deleted`, and `Moved (server-side) to: ...`), never for the trash
+    /// mechanism's OWN unambiguous delete report (`Moved into backup dir`) or
+    /// for a genuine `Renamed from "..."` line. Finding 1 (P1): the previous
+    /// version keyed this off `operation == .deleted` alone, which ALSO
+    /// matched `Moved into backup dir` (mapped to the same `.deleted` case),
+    /// so a trash profile's real deletes were dropped along with the
+    /// ambiguous ones and never shown at all. Finding 8: a rename is
+    /// similarly ambiguous when it could be either a real `--track-renames`
+    /// rename (a profile's `additionalRcloneFlags` can set that) or a
+    /// Move-capable backend's backup-dir move — since rclone's own JSON log
+    /// line is textually identical for both, a trash-enabled profile cannot
+    /// tell them apart and suppresses both, same as the bare `Deleted`
+    /// ambiguity; a non-trash profile is unaffected either way. Pure so it is
+    /// testable without a full `SyncManager`.
+    nonisolated static func shouldReportFileChange(_ change: FileChange, hasTrashRoot: Bool) -> Bool {
+        !(hasTrashRoot && change.mayBeTrashArtifact)
+    }
+
+    /// One rclone.conf section read — the actual computation `trashRootCache`
+    /// exists to avoid repeating per file-change event (code-review finding 6
+    /// on 87bbf67). Called only from `startWatching`.
+    nonisolated private static func resolveHasTrashRoot(for profile: SyncProfile) -> Bool {
+        let remoteSection = RcloneConfigService.shared.section(named: String(profile.rcloneRemote.prefix { $0 != ":" }))
+        return SyncSetupService.trashRoot(for: profile, remoteSection: remoteSection) != nil
+    }
+
     private func processLogEvent(_ event: ParsedLogEvent, profileId: UUID) {
         let profile = profileStore.profile(for: profileId)
         let profileName = profile?.name ?? "Unknown"
@@ -1187,6 +1231,18 @@ final class SyncManager: ObservableObject {
             profileStates[profileId] = Self.reduceProfileState(profileStates[profileId] ?? .idle, for: event.type)
 
         case .fileChange(var change):
+            // Code-review finding 6 on 87bbf67: only even LOOK at
+            // `hasTrashRoot` when the change is flagged ambiguous — for every
+            // other change (the vast majority of log lines) `shouldReportFileChange`
+            // returns true regardless, so there is nothing to gain by reading
+            // `trashRootCache` at all. When it IS ambiguous, `trashRootCache`
+            // is a lookup, not a computation: populated by `startWatching`
+            // only when a profile's watching (re)starts (launch, or a
+            // reinstall-worthy field change), never per file-change event.
+            if change.mayBeTrashArtifact,
+               !Self.shouldReportFileChange(change, hasTrashRoot: trashRootCache[profileId] ?? false) {
+                break
+            }
             change.profileName = profileName
             if currentSyncChanges[profileId] == nil {
                 currentSyncChanges[profileId] = []
