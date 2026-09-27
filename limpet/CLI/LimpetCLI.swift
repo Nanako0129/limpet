@@ -122,8 +122,9 @@ struct CLIEnvironment {
     /// Remove a file (the delete-limit marker). Returns whether it succeeded.
     var removeFile: (String) -> Bool
     /// Move/rename a local file or symlink from `from` to `to`, REPLACING an
-    /// existing item at `to`. Returns whether it succeeded. Used by `trash
-    /// restore`'s temp-name-then-rename (code-review finding 3 on 87bbf67).
+    /// existing item at `to` atomically: on failure `to` is left untouched.
+    /// Returns whether it succeeded. Used by `trash restore`'s
+    /// temp-name-then-rename (code-review finding 3 on 87bbf67).
     var moveFile: (_ from: String, _ to: String) -> Bool
     /// Read all of stdin (for `profile create -`). `nil` on read failure.
     var readStdin: () -> String?
@@ -1511,13 +1512,7 @@ extension CLIEnvironment {
                 try? FileManager.default.removeItem(atPath: path)
             },
             removeFile: { (try? FileManager.default.removeItem(atPath: $0)) != nil },
-            moveFile: { from, to in
-                // Never follows a symlink: `removeItem`/`moveItem` act on the
-                // directory entry itself, so a restored symlink at `from`
-                // lands as a symlink at `to`, not the target it points at.
-                _ = try? FileManager.default.removeItem(atPath: to)
-                return (try? FileManager.default.moveItem(atPath: from, toPath: to)) != nil
-            },
+            moveFile: CLIEnvironment.moveReplacing,
             readStdin: {
                 let data = FileHandle.standardInput.readDataToEndOfFile()
                 return String(data: data, encoding: .utf8)
@@ -1541,6 +1536,26 @@ extension CLIEnvironment {
             stdout: { FileHandle.standardOutput.write(Data($0.utf8)) },
             stderr: { FileHandle.standardError.write(Data($0.utf8)) }
         )
+    }
+
+    /// `moveFile` for production. The old remove-then-move lost BOTH files
+    /// when the move failed (CodeRabbit, PR #10). An existing destination
+    /// entry (lstat, so a dangling symlink too) is replaced with rename(2),
+    /// which swaps the directory entry atomically: on failure nothing
+    /// changed, and neither side's symlink is followed. `moveItem` only when
+    /// no entry exists (it refuses to overwrite one that appeared meanwhile).
+    /// `FileManager.replaceItemAt` was measured unsuitable 2026-09-28 (macOS
+    /// 27): it throws whenever the destination OR the source is a symlink
+    /// (dangling or not), so a forced restore over a symlink, or of a
+    /// symlink, could never succeed; and it REPLACED a non-empty directory
+    /// with a file (the directory and its contents gone). rename(2)
+    /// measured: file over symlink replaces the link (target untouched),
+    /// file over dangling symlink, symlink over file, missing source ->
+    /// ENOENT with the destination intact, file over a non-empty directory
+    /// -> EISDIR with it intact.
+    static func moveReplacing(_ from: String, _ to: String) -> Bool {
+        if lstatExists(to) { return rename(from, to) == 0 }
+        return (try? FileManager.default.moveItem(atPath: from, toPath: to)) != nil
     }
 
     /// `itemExists` for production: lstat, so a dangling symlink exists.

@@ -171,6 +171,7 @@ enum ConfigSelfTest {
             testTrashRestoreRclonelinkSymlinkAndAtomicRename,
             testTrashPurgeCertFlagsFailureAndDryRunVariants,
             testTrashRestoreSymlinkContainment,
+            testForcedRestoreReplaceIsAtomic,
         ]
 
         for check in checks {
@@ -5410,10 +5411,7 @@ enum ConfigSelfTest {
                 itemExists: CLIEnvironment.lstatExists,
                 realPath: CLIEnvironment.resolvedRealPath,
                 removeFile: { (try? fm.removeItem(atPath: $0)) != nil },
-                moveFile: { from, to in
-                    _ = try? fm.removeItem(atPath: to)
-                    return (try? fm.moveItem(atPath: from, toPath: to)) != nil
-                })
+                moveFile: CLIEnvironment.moveReplacing)
         }
         func outsideUntouched() -> Bool {
             (try? fm.contentsOfDirectory(atPath: outsideDir)) == ["target.txt"]
@@ -5469,6 +5467,68 @@ enum ConfigSelfTest {
         return report(id, slug, true)
     }
 
+    // MARK: - AC-L62-12 — a forced restore whose final move fails leaves the
+    // existing file untouched (CodeRabbit, PR #10: remove-then-move lost both).
+
+    private static func testForcedRestoreReplaceIsAtomic() -> Bool {
+        let id = "AC-L62-12", slug = "forced-restore-replace-atomic"
+        let fm = FileManager.default
+        let root = "\(selfTestRoot)/ac-l62-12"
+        try? fm.removeItem(atPath: root)
+        let localDir = "\(root)/local"
+        do {
+            try fm.createDirectory(atPath: "\(localDir)/dir/child", withIntermediateDirectories: true)
+            try "original".write(toFile: "\(localDir)/a.txt", atomically: true, encoding: .utf8)
+        } catch {
+            return report(id, slug, false, "(fixture setup failed)")
+        }
+        var profile = sampleProfile()
+        profile.rcloneRemote = "s4:"
+        profile.remotePath = "nanako-mirror/Datarget"
+        profile.localSyncPath = localDir
+        func content(_ path: String) -> String? { try? String(contentsOfFile: path, encoding: .utf8) }
+
+        // `copyto` is faked: `writeTemp` decides whether it actually leaves the
+        // temp file. Reporting success WITHOUT writing it makes the final move
+        // fail after the copy "succeeded" — the exact failure the old
+        // remove-then-move turned into losing the existing file.
+        var writeTemp = false
+        let env = fakeCLIEnvironment(
+            runRclone: { args, _, _ in
+                if args.first == "lsf" { return (0, "2026-09-01/a-100000.txt\n", "") }
+                if args.first == "copyto", writeTemp, let dest = args.last {
+                    try? "restored".write(toFile: String(dest.dropFirst(":local,links:".count)), atomically: true, encoding: .utf8)
+                }
+                return (0, "", "")
+            },
+            readProfiles: { [profile] },
+            itemExists: CLIEnvironment.lstatExists,
+            realPath: CLIEnvironment.resolvedRealPath,
+            removeFile: { (try? fm.removeItem(atPath: $0)) != nil },
+            moveFile: CLIEnvironment.moveReplacing)
+
+        let failCode = LimpetCLI.execute(["trash", "restore", profile.shortId, "a.txt", "--force"], env: env)
+        guard failCode == 1, content("\(localDir)/a.txt") == "original" else {
+            return report(id, slug, false, "(a failed final move lost or altered the existing file: exit \(failCode))")
+        }
+        writeTemp = true
+        let okCode = LimpetCLI.execute(["trash", "restore", profile.shortId, "a.txt", "--force"], env: env)
+        guard okCode == 0, content("\(localDir)/a.txt") == "restored",
+              !fm.fileExists(atPath: "\(localDir)/a.txt.limpet-restore-tmp") else {
+            return report(id, slug, false, "(forced restore did not replace the existing file: exit \(okCode))")
+        }
+
+        // A non-empty directory in the way: refused, directory intact (the
+        // old removeItem deleted it recursively, then "succeeded").
+        try? "x".write(toFile: "\(root)/tmp-file", atomically: true, encoding: .utf8)
+        guard !CLIEnvironment.moveReplacing("\(root)/tmp-file", "\(localDir)/dir"),
+              fm.fileExists(atPath: "\(localDir)/dir/child") else {
+            return report(id, slug, false, "(a file replaced a non-empty directory)")
+        }
+
+        return report(id, slug, true)
+    }
+
     // MARK: - AC-L62-9 — restore a `.rclonelink` object as a real symlink;
     // atomic temp-then-rename leaves nothing partial on failure (code-review
     // findings 2/3 on 87bbf67), via the REAL `LimpetCLI.execute` entry point
@@ -5515,10 +5575,7 @@ enum ConfigSelfTest {
         profile.localSyncPath = localDir
 
         let realRclone = localRcloneRunner(rclonePath: rclonePath, confPath: confPath, dataDir: dataDir)
-        func moveFile(_ from: String, _ to: String) -> Bool {
-            _ = try? FileManager.default.removeItem(atPath: to)
-            return (try? FileManager.default.moveItem(atPath: from, toPath: to)) != nil
-        }
+        let moveFile = CLIEnvironment.moveReplacing
         let env = fakeCLIEnvironment(
             runRclone: realRclone,
             readProfiles: { [profile] },

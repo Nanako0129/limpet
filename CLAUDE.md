@@ -337,7 +337,12 @@ without the suffix, which measured as an ordinary file copy, so one
 destination shape covers both. The restore always copies to a temp name in
 `localSyncPath` (`<target>.limpet-restore-tmp`) and renames into place only
 on success (no effective timeout — a restored file can be arbitrarily large),
-so a failed copy never leaves a partial file at the real destination. Restore
+so a failed copy never leaves a partial file at the real destination. The
+rename (`CLIEnvironment.moveReplacing`) replaces an existing entry with
+rename(2), atomically, so a failed `--force` move leaves the existing file
+untouched; never remove-then-move (which lost both) and never
+`FileManager.replaceItemAt` (measured 2026-09-28: throws whenever either side
+is a symlink, and replaced a non-empty directory with a file). Restore
 uses the same keychain secret environment as a sync (`env.runRclone`, which
 injects it via `RcloneConfigService`).
 
