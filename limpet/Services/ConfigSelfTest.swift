@@ -850,7 +850,7 @@ enum ConfigSelfTest {
         uninstallProfile: @escaping (SyncProfile) -> String? = { _ in nil },
         deleteProfileFile: @escaping (SyncProfile) -> Void = { _ in },
         removeFile: @escaping (String) -> Bool = { _ in true },
-        moveFile: @escaping (String, String) -> Bool = { _, _ in true },
+        moveFile: @escaping (String, String, Bool) -> Bool = { _, _, _ in true },
         readStdin: @escaping () -> String? = { nil },
         readFile: @escaping (String) -> String? = { _ in nil },
         readSecret: @escaping (String) -> String? = { _ in nil },
@@ -5411,7 +5411,7 @@ enum ConfigSelfTest {
                 itemExists: CLIEnvironment.lstatExists,
                 realPath: CLIEnvironment.resolvedRealPath,
                 removeFile: { (try? fm.removeItem(atPath: $0)) != nil },
-                moveFile: CLIEnvironment.moveReplacing)
+                moveFile: { f, t, r in r ? CLIEnvironment.moveReplacing(f, t) : CLIEnvironment.moveNoReplace(f, t) })
         }
         func outsideUntouched() -> Bool {
             (try? fm.contentsOfDirectory(atPath: outsideDir)) == ["target.txt"]
@@ -5493,11 +5493,17 @@ enum ConfigSelfTest {
         // fail after the copy "succeeded" — the exact failure the old
         // remove-then-move turned into losing the existing file.
         var writeTemp = false
+        // CodeRabbit PR #10: another process creating the target after the
+        // existence check, i.e. while the copy runs.
+        var createDuringCopy: String?
         let env = fakeCLIEnvironment(
             runRclone: { args, _, _ in
-                if args.first == "lsf" { return (0, "2026-09-01/a-100000.txt\n", "") }
+                if args.first == "lsf" { return (0, "2026-09-01/a-100000.txt\n2026-09-01/b-100000.txt\n", "") }
                 if args.first == "copyto", writeTemp, let dest = args.last {
                     try? "restored".write(toFile: String(dest.dropFirst(":local,links:".count)), atomically: true, encoding: .utf8)
+                }
+                if args.first == "copyto", let late = createDuringCopy {
+                    try? "late".write(toFile: late, atomically: true, encoding: .utf8)
                 }
                 return (0, "", "")
             },
@@ -5505,7 +5511,7 @@ enum ConfigSelfTest {
             itemExists: CLIEnvironment.lstatExists,
             realPath: CLIEnvironment.resolvedRealPath,
             removeFile: { (try? fm.removeItem(atPath: $0)) != nil },
-            moveFile: CLIEnvironment.moveReplacing)
+            moveFile: { f, t, r in r ? CLIEnvironment.moveReplacing(f, t) : CLIEnvironment.moveNoReplace(f, t) })
 
         let failCode = LimpetCLI.execute(["trash", "restore", profile.shortId, "a.txt", "--force"], env: env)
         guard failCode == 1, content("\(localDir)/a.txt") == "original" else {
@@ -5516,6 +5522,16 @@ enum ConfigSelfTest {
         guard okCode == 0, content("\(localDir)/a.txt") == "restored",
               !fm.fileExists(atPath: "\(localDir)/a.txt.limpet-restore-tmp") else {
             return report(id, slug, false, "(forced restore did not replace the existing file: exit \(okCode))")
+        }
+
+        // Without --force the final move never replaces, even an item that
+        // appeared after the existence check (CodeRabbit, PR #10).
+        createDuringCopy = "\(localDir)/b.txt"
+        let raceCode = LimpetCLI.execute(["trash", "restore", profile.shortId, "b.txt"], env: env)
+        createDuringCopy = nil
+        guard raceCode == 1, content("\(localDir)/b.txt") == "late",
+              !fm.fileExists(atPath: "\(localDir)/b.txt.limpet-restore-tmp") else {
+            return report(id, slug, false, "(a non-force restore replaced a file created during the copy: exit \(raceCode), b.txt=\(content("\(localDir)/b.txt") ?? "nil"))")
         }
 
         // A non-empty directory in the way: refused, directory intact (the
@@ -5575,7 +5591,7 @@ enum ConfigSelfTest {
         profile.localSyncPath = localDir
 
         let realRclone = localRcloneRunner(rclonePath: rclonePath, confPath: confPath, dataDir: dataDir)
-        let moveFile = CLIEnvironment.moveReplacing
+        let moveFile: (String, String, Bool) -> Bool = { f, t, r in r ? CLIEnvironment.moveReplacing(f, t) : CLIEnvironment.moveNoReplace(f, t) }
         let env = fakeCLIEnvironment(
             runRclone: realRclone,
             readProfiles: { [profile] },
@@ -5626,7 +5642,7 @@ enum ConfigSelfTest {
             readProfiles: { [profile] },
             fileExists: { FileManager.default.fileExists(atPath: $0) },
             removeFile: { (try? FileManager.default.removeItem(atPath: $0)) != nil },
-            moveFile: { from, to in moveCalls += 1; return moveFile(from, to) })
+            moveFile: { from, to, replace in moveCalls += 1; return moveFile(from, to, replace) })
         let failCode = LimpetCLI.execute(["trash", "restore", profile.shortId, "a.tar.gz", "--force"], env: failEnv)
         guard failCode != 0, copytoCalls == 1, moveCalls == 0,
               !FileManager.default.fileExists(atPath: "\(localDir)/a.tar.gz.limpet-restore-tmp") else {

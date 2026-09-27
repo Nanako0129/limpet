@@ -121,11 +121,12 @@ struct CLIEnvironment {
     var deleteProfileFile: (SyncProfile) -> Void
     /// Remove a file (the delete-limit marker). Returns whether it succeeded.
     var removeFile: (String) -> Bool
-    /// Move/rename a local file or symlink from `from` to `to`, REPLACING an
-    /// existing item at `to` atomically: on failure `to` is left untouched.
-    /// Returns whether it succeeded. Used by `trash restore`'s
-    /// temp-name-then-rename (code-review finding 3 on 87bbf67).
-    var moveFile: (_ from: String, _ to: String) -> Bool
+    /// Move/rename a local file or symlink from `from` to `to`. With
+    /// `replace`, an existing item at `to` is replaced atomically; without it
+    /// the move fails if ANY item appears at `to`, even one created after an
+    /// earlier existence check (CodeRabbit, PR #10). On failure `to` is left
+    /// untouched. Used by `trash restore`'s temp-name-then-rename.
+    var moveFile: (_ from: String, _ to: String, _ replace: Bool) -> Bool
     /// Read all of stdin (for `profile create -`). `nil` on read failure.
     var readStdin: () -> String?
     /// Read a file's contents as UTF-8 text. `nil` if missing/unreadable.
@@ -1439,7 +1440,7 @@ enum LimpetCLI {
             env.stderr(copyErr.isEmpty ? "error: restore failed (exit \(copyExit))\n" : copyErr)
             return 1
         }
-        guard env.moveFile(tempTarget, localTarget) else {
+        guard env.moveFile(tempTarget, localTarget, force) else {
             _ = env.removeFile(tempTarget)
             env.stderr("error: restored to \(tempTarget) but could not move it into place at \(localTarget)\n")
             return 1
@@ -1512,7 +1513,9 @@ extension CLIEnvironment {
                 try? FileManager.default.removeItem(atPath: path)
             },
             removeFile: { (try? FileManager.default.removeItem(atPath: $0)) != nil },
-            moveFile: CLIEnvironment.moveReplacing,
+            moveFile: { from, to, replace in
+                replace ? CLIEnvironment.moveReplacing(from, to) : CLIEnvironment.moveNoReplace(from, to)
+            },
             readStdin: {
                 let data = FileHandle.standardInput.readDataToEndOfFile()
                 return String(data: data, encoding: .utf8)
@@ -1556,6 +1559,12 @@ extension CLIEnvironment {
     static func moveReplacing(_ from: String, _ to: String) -> Bool {
         if lstatExists(to) { return rename(from, to) == 0 }
         return (try? FileManager.default.moveItem(atPath: from, toPath: to)) != nil
+    }
+
+    /// Atomic move that never replaces: renamex_np(RENAME_EXCL) fails with
+    /// EEXIST if any item (a dangling symlink included) exists at `to`.
+    static func moveNoReplace(_ from: String, _ to: String) -> Bool {
+        renamex_np(from, to, UInt32(RENAME_EXCL)) == 0
     }
 
     /// `itemExists` for production: lstat, so a dangling symlink exists.
