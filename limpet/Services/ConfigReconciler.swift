@@ -279,7 +279,8 @@ extension SyncManager {
             current.syncDirection != updated.syncDirection ||
             current.transfers != updated.transfers ||
             current.maxDelete != updated.maxDelete ||
-            current.remoteVersioning != updated.remoteVersioning
+            current.remoteVersioning != updated.remoteVersioning ||
+            current.trashDays != updated.trashDays
 
         return needsReinstall ? .reinstall : .none
     }

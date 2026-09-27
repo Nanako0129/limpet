@@ -1062,6 +1062,28 @@ final class SyncManager: ObservableObject {
         }
     }
 
+    /// Whether a parsed file-change belongs in Recent Changes/notifications
+    /// (limpet-plan.md L6.2 item 4b): false only for a bare `.deleted` on a
+    /// profile with an active trash root. That line also fires for every
+    /// S4-path overwrite (the original being moved into today's backup folder
+    /// before the new content lands, `RcloneLogEntry.parseOperation`'s
+    /// "Deleted" case) — the trash mechanism's OWN "Moved into backup dir"
+    /// line already reports the real delete exactly once. Pure so it is
+    /// testable without a full `SyncManager`; production wiring resolves
+    /// `hasTrashRoot` via `SyncSetupService.trashRoot(for:remoteSection:)`,
+    /// only when `operation == .deleted` (rare relative to every log line),
+    /// never per render.
+    nonisolated static func shouldReportFileChange(_ operation: FileChange.Operation, hasTrashRoot: Bool) -> Bool {
+        !(operation == .deleted && hasTrashRoot)
+    }
+
+    /// Cheap production check for `shouldReportFileChange`'s `hasTrashRoot`:
+    /// one rclone.conf section read, only reached for a `.deleted` change.
+    private func profileHasTrashRoot(_ profile: SyncProfile) -> Bool {
+        let remoteSection = RcloneConfigService.shared.section(named: String(profile.rcloneRemote.prefix { $0 != ":" }))
+        return SyncSetupService.trashRoot(for: profile, remoteSection: remoteSection) != nil
+    }
+
     private func processLogEvent(_ event: ParsedLogEvent, profileId: UUID) {
         let profile = profileStore.profile(for: profileId)
         let profileName = profile?.name ?? "Unknown"
@@ -1187,6 +1209,9 @@ final class SyncManager: ObservableObject {
             profileStates[profileId] = Self.reduceProfileState(profileStates[profileId] ?? .idle, for: event.type)
 
         case .fileChange(var change):
+            if let profile, !Self.shouldReportFileChange(change.operation, hasTrashRoot: profileHasTrashRoot(profile)) {
+                break
+            }
             change.profileName = profileName
             if currentSyncChanges[profileId] == nil {
                 currentSyncChanges[profileId] = []

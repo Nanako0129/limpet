@@ -70,6 +70,12 @@
     "remoteVersioning": {
       "type": "boolean",
       "description": "Set to true only if the S3 bucket keeps deleted versions (versioning on); lifts maxDelete for AWS/MinIO/other S3 remotes. Ignored for MEGA S4 and Cloudflare R2. Default false."
+    },
+    "trashDays": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 365,
+      "description": "Days a deleted or overwritten file is kept under <remote parent>/.limpet-trash/<leaf>/<date>/ before being purged, for a localToRemote profile on a remote that keeps no deleted versions and whose remotePath has a parent folder (a bucket-root remotePath cannot have a trash sibling). 0 disables trash. Default 14."
     }
   },
   "required": [

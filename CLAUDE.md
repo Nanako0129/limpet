@@ -185,8 +185,14 @@ other s3 provider unless the profile sets `remoteVersioning: true` — the
 derived config carries `maxDelete` (profile field, default 100;
 `SyncSetupService.maxDeleteArgument`) and the script adds `--max-delete N`.
 rclone 1.75.1 then deletes at most N files and exits 7 (measured); the script
-turns that into exit 76 only when the run's own output also contains `Got
-fatal error on delete: --max-delete threshold reached`. On 76 the watcher
+turns that into exit 76 only when the run's own output also contains the
+substring `--max-delete threshold reached` — broadened in limpet-plan.md L6.2
+from the delete-only phrasing `Got fatal error on delete: --max-delete
+threshold reached`, because a trash-enabled profile's OVERWRITES also count
+toward `--max-delete` and trip a different message with no "Got fatal error
+on delete" line at all (`Cancelling sync due to fatal error: --max-delete
+threshold reached`, measured 2026-09-28 with `--disable Move`, the S4-path
+fallback — see **Trash** below). On 76 the watcher
 writes `profiles/{shortId}.delete-limit` and refuses every later run —
 including after a respawn, login or reinstall — while staying alive and idle.
 `limpet profile clear-delete-limit <name|shortId>` or the menu's red octagon
@@ -201,6 +207,73 @@ profile is INSTALLED; after changing a remote's provider (or the profile's
 `remoteVersioning`) in rclone.conf directly, run `limpet reinstall
 <name|shortId>`. `limpet doctor` warns when the installed value differs from
 what the current rclone.conf section gives.
+
+**Trash — recoverable deletes and overwrites (limpet-plan.md L6.2).** For a
+`localToRemote` profile whose remote keeps no deleted versions (the same test
+`maxDeleteArgument` uses, factored into
+`SyncSetupService.remoteKeepsNoDeletedVersions`), a positive `trashDays`
+profile field (plain default 14; 0 disables it; 0–365) turns on a recycle bin:
+`SyncSetupService.trashRoot(for:remoteSection:)` — the ONLY place the root is
+resolved, called from `generateProfileConfig` and written into the derived
+config as `trashRoot`/`trashDays` — derives
+`<remote>:<parent>/.limpet-trash/<leaf>` from `remotePath`, so a profile whose
+`remotePath` has no parent (syncing straight into a bucket root) gets no trash
+root at all (there is nowhere to put a `.limpet-trash` SIBLING without it
+becoming part of what gets synced/deleted). The generated script adds
+`--backup-dir "<root>/$(date +%F)" --suffix "-$(date +%H%M%S)"
+--suffix-keep-extension` when a root is present (both dates captured once per
+run) — every version is kept, not one per day: measured 2026-09-28 with
+`--suffix-keep-extension`, `a.tar.gz` → `a-100003.tar.gz` (extension split at
+the FIRST dot), `x.min.js` → `x.min-100003.js` (split at the LAST dot),
+`Makefile` → `Makefile-100003`, and a symlink `l.txt` → symlink
+`l-100003.txt` — rclone's own extension-split rule differs by name, which is
+why restore tries every `.` boundary instead of re-deriving it (see `limpet
+trash restore` below). On the **S4 path** (no server-side Move, measured with
+`--disable Move`): an overwrite logs `Copied (server-side copy) to:
+<backup>` + `Deleted` (both for the ORIGINAL object, before the new content
+uploads); a real delete logs the same `Copied (server-side copy) to: <backup>`
++ `Deleted` PLUS `Moved into backup dir`. Both `RcloneLogEntry.parseOperation`
+and `SyncManager` account for this: a `Copied (server-side copy) to: …` or
+`Moved (server-side) to: …` line is never itself a reportable change (limpet
+never sets `--track-renames`, so any `Moved (server-side)` line is always a
+backup move); `Moved into backup dir` → `.deleted`; and for a profile WITH a
+trash root, `SyncManager.shouldReportFileChange` drops the bare `Deleted` line
+that also fires on every S4-path overwrite, so a real delete shows exactly
+once (via `Moved into backup dir`) and an overwrite never shows as a
+deletion — for a profile without trash, the bare `Deleted` line still maps to
+`.deleted` as before. `SyncManager` resolves `hasTrashRoot` on demand (one
+rclone.conf section read), only for a `.deleted` change — cheap, not
+per-render. Because overwrites count toward `--max-delete` too (see the
+broadened exit-76 detection above), a profile whose trash root is set gets
+`maxDelete` bumped to 5000 in the derived config when its STORED value is
+still the default 100 (`maxDeleteArgument`; the file on disk is never
+rewritten) — the limit is now a "stop and look" alarm for a mass change, not
+the only line of defense, since the trash makes deletes recoverable.
+
+Before the sync, the script purges trash folders older than `trashDays`, once
+per LOCAL day (a `<shortId>.trash-purged` stamp file beside the profile's
+derived config), skipped entirely under `--dry-run`: `rclone lsf --dirs-only
+<root>`, and only an entry matching `^[0-9]{4}-[0-9]{2}-[0-9]{2}/$` EXACTLY
+and older (by string comparison) than `date -v-<trashDays>d +%F` is purged
+with `rclone purge <root>/<entry>` — nothing else is ever purged, and a purge
+failure logs one line without failing the sync. Two profiles sharing a parent
+get disjoint roots (`.limpet-trash/Datarget`, `.limpet-trash/side-project`),
+and a profile's own sync never lists its trash (it sits outside `remotePath`).
+
+`limpet trash list <name|shortId> [--date YYYY-MM-DD]` lists a profile's
+trashed files (`rclone lsf -R`, restricted to one date's folder when `--date`
+is given). `limpet trash restore <name|shortId> <relative-path> [--date D]
+[--force]` restores the newest version (or the newest at one `--date`):
+before any rclone call it refuses (exit 65) an empty/absolute `relative-path`
+or one with an empty/`.`/`..` component, and a `--date` not matching
+`^[0-9]{4}-[0-9]{2}-[0-9]{2}$`; it refuses (without calling rclone) to
+overwrite an existing local file unless `--force` is given. Matching
+(`LimpetCLI.newestTrashMatch`/`trashSuffixMatch`) tries EVERY `.` boundary of
+the original name (plus its end) rather than re-deriving rclone's own
+extension split, and also tries `<name>.rclonelink` for a symlink on a remote
+without native symlink support; ties are broken by the newest date, then the
+highest 6-digit suffix. Restore uses the same keychain secret environment as
+a sync (`env.runRclone`, which injects it via `RcloneConfigService`).
 
 **Source-missing GUI state (limpet-plan.md L5.0).** When a profile's local
 source directory disappears, the watcher (`SyncWatchDaemon`) and the generated
@@ -485,12 +558,14 @@ isn't limpet's own.
 | `limpet install <name\|shortId>` | Install an already-enabled profile's launchd agent (idempotent; runs `SyncSetupService.install`). Complements `profile enable`, which early-returns without installing when the profile is ALREADY enabled — so `install` re-creates an agent that went missing. Refuses a disabled or incomplete profile. Never flips `isEnabled`. |
 | `limpet reinstall <name\|shortId>` | Regenerate script+plist and reinstall the agent (uninstall → install), i.e. the settings-save reinstall path. Works for any sync mode. Refuses a disabled profile. |
 | `limpet remote add <name> --type s3\|b2 --access-key-id <id> [--provider <p>] [--endpoint <https url>] [--region <r>]` | Create a keychain-backed remote through `RcloneConfigService.addKeychainRemote`, the same function the wizard uses. The secret is read from stdin — a no-echo prompt on a terminal, otherwise one line from the pipe — never from an argument. Writes the non-secret section plus `limpet_keychain = true` to rclone.conf (appended; nothing else rewritten) and stores the secret with `/usr/bin/security -i` (`add-generic-password -s limpet -a <name> -T /usr/bin/security`, secret hex-encoded on stdin). Names are `[A-Za-z0-9_]+` and may not collide case-insensitively with any rclone.conf section; endpoints must be https; `--provider Mega --region <r>` derives `s3.<r>.megas4.com`; a known `--provider` in any case (`mega`) is written in the wizard's spelling (`Mega`). |
+| `limpet trash restore <name\|shortId> <relative-path> [--date YYYY-MM-DD] [--force]` | Restore the newest (or one dated) trashed version of a file into `localSyncPath` (see **Trash** above). Refuses before any rclone call on a bad path/date; refuses to overwrite an existing local file without `--force`. |
 
 **Operate:**
 
 | Command | Purpose |
 |---------|---------|
 | `limpet sync <name\|shortId>` | Send the running watcher SIGUSR1 (`launchctl kill SIGUSR1 gui/$(id -u)/<launchdLabel>`) to ask it to sync now, and return immediately — it does NOT block until the sync finishes. On success prints `sync requested for "<name>" (<shortId>) — see: limpet logs <shortId>` and exits 0; if the agent isn't loaded prints `error: no watcher running for "<name>" (<shortId>)` to stderr and exits 1. Use `limpet logs <name\|shortId> --follow` to watch the run it triggered. |
+| `limpet trash list <name\|shortId> [--date YYYY-MM-DD]` | List a profile's trashed (deleted/overwritten) files (see **Trash** above). Prints "no trash root configured" and exits 0 for a profile with no active trash root. |
 
 `<name|shortId>` resolution tries an exact `shortId` match first, then a
 case-insensitive `name` match; an unmatched (or ambiguous) target exits

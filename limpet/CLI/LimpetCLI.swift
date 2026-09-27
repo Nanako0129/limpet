@@ -41,7 +41,21 @@ enum CLICommand: Equatable {
     case profileSetEnabled(target: String, enabled: Bool)
     case profileClearDeleteLimit(String)
     case remoteAdd(RemoteAddRequest)
+    case trashList(target: String, date: String?)
+    case trashRestore(target: String, relativePath: String, date: String?, force: Bool)
     case help
+}
+
+/// The newest trashed version of a restore target found in a `rclone lsf -R`
+/// listing (limpet-plan.md L6.2 item 5).
+struct TrashMatch: Equatable {
+    /// The `YYYY-MM-DD` folder it was found under.
+    let date: String
+    /// Its path relative to the LISTED root (includes the date folder when
+    /// the listing covered the whole trash root, i.e. no fixed `--date`).
+    let entry: String
+    /// The 6-digit `HHMMSS` suffix rclone inserted.
+    let suffix: String
 }
 
 /// A `parse` failure — carries the usage message printed to stderr.
@@ -146,16 +160,23 @@ enum LimpetCLI {
       remote add <name> --type s3|b2 --access-key-id <id> [--provider <p>] [--endpoint <https url>] [--region <r>]
                                    Add a remote whose secret lives in the login keychain;
                                    the secret is read from stdin (no-echo prompt on a terminal)
+      trash restore <name|id> <relative-path> [--date YYYY-MM-DD] [--force]
+                                   Restore the newest (or one dated) trashed version of a file
 
     Operate:
       sync <name|id>                          Ask the profile's watcher to sync now (returns immediately)
       watch <name|id>                         Run as the profile's realtime watcher (launchd only; never exits)
+      trash list <name|id> [--date YYYY-MM-DD] List a profile's trashed (deleted/overwritten) files
 
     profile set keys: name, rcloneRemote, remotePath, localSyncPath,
       drivePathToMonitor, additionalRcloneFlags,
       syncDirection (localToRemote|remoteToLocal), syncIntervalMinutes,
       transfers, isMuted, maxDelete, remoteVersioning.
       Use enable/disable for isEnabled.
+
+    trash list/restore apply only to a profile with an active trash root
+    (localToRemote, trashDays > 0, a remote that keeps no deleted versions,
+    remotePath with a parent) — see CLAUDE.md's Delete-limit/Trash sections.
 
     Profiles author JSON against schema/profile.schema.json under the config
     directory; the same file an agent can drop in or edit directly.
@@ -241,6 +262,9 @@ enum LimpetCLI {
 
         case "remote":
             return parseRemote(rest)
+
+        case "trash":
+            return parseTrash(rest)
 
         case "help", "-h", "--help":
             return .success(.help)
@@ -364,6 +388,41 @@ enum LimpetCLI {
         return .success(.remoteAdd(RemoteAddRequest(name: name, type: type, values: values)))
     }
 
+    /// Parse `trash list <name|id> [--date D]` / `trash restore <name|id>
+    /// <relative-path> [--date D] [--force]`. Value validation (path shape,
+    /// date shape) happens in `run`, before any rclone call — never here.
+    private static func parseTrash(_ rest: [String]) -> Result<CLICommand, CLIUsageError> {
+        guard let sub = rest.first else {
+            return .failure(CLIUsageError(message: "usage: limpet trash <list|restore> ..."))
+        }
+        var args = Array(rest.dropFirst())
+        var date: String?
+        if let idx = args.firstIndex(of: "--date"), idx + 1 < args.count {
+            date = args[idx + 1]
+            args.removeSubrange(idx...(idx + 1))
+        }
+        let force = args.contains("--force")
+        args.removeAll { $0 == "--force" }
+
+        switch sub {
+        case "list":
+            guard let target = args.first else {
+                return .failure(CLIUsageError(message: "usage: limpet trash list <name|shortId> [--date YYYY-MM-DD]"))
+            }
+            return .success(.trashList(target: target, date: date))
+
+        case "restore":
+            guard args.count == 2 else {
+                return .failure(CLIUsageError(
+                    message: "usage: limpet trash restore <name|shortId> <relative-path> [--date YYYY-MM-DD] [--force]"))
+            }
+            return .success(.trashRestore(target: args[0], relativePath: args[1], date: date, force: force))
+
+        default:
+            return .failure(CLIUsageError(message: "unknown 'trash' subcommand: \(sub)"))
+        }
+    }
+
     /// Parse + dispatch, printing usage via `env.stderr` on a parse failure.
     /// The single entry point both `dispatch` (real env) and the self-test
     /// (fake env) exercise for the unknown/absent-subcommand case.
@@ -413,6 +472,10 @@ enum LimpetCLI {
             return runClearDeleteLimit(target, env: env)
         case .remoteAdd(let request):
             return runRemoteAdd(request, env: env)
+        case .trashList(let target, let date):
+            return runTrashList(target, date: date, env: env)
+        case .trashRestore(let target, let relativePath, let date, let force):
+            return runTrashRestore(target, relativePath: relativePath, date: date, force: force, env: env)
         case .help:
             env.stdout(Self.usage + "\n")
             return 0
@@ -1094,6 +1157,177 @@ enum LimpetCLI {
         if request.type == "b2" {
             env.stdout("note: use a bucket-scoped application key without the deleteFiles capability\n")
         }
+        return 0
+    }
+
+    // MARK: - trash
+
+    /// F6/limpet-plan.md L6.2 item 5: refused BEFORE any rclone call — empty,
+    /// absolute, or carrying an empty/`.`/`..` component (any of which could
+    /// escape `localSyncPath` on restore, or address something outside the
+    /// trash tree).
+    static func validateTrashRelativePath(_ path: String) -> String? {
+        guard !path.isEmpty, !path.hasPrefix("/") else {
+            return "path must be a non-empty, non-absolute relative path"
+        }
+        let components = path.split(separator: "/", omittingEmptySubsequences: false)
+        guard components.allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." }) else {
+            return "path must not contain an empty, \".\" or \"..\" component"
+        }
+        return nil
+    }
+
+    /// `--date` must be exactly `YYYY-MM-DD` — refused before any rclone call.
+    static func validateTrashDate(_ date: String?) -> String? {
+        guard let date else { return nil }
+        guard date.range(of: "^[0-9]{4}-[0-9]{2}-[0-9]{2}$", options: .regularExpression) != nil else {
+            return "--date must match YYYY-MM-DD"
+        }
+        return nil
+    }
+
+    /// Whether `candidate` is `original` with rclone's `--suffix -HHMMSS
+    /// --suffix-keep-extension` (a literal `-` + exactly 6 digits) inserted at
+    /// one `.` boundary of `original`, or at its very end. Tries EVERY dot
+    /// boundary rather than re-deriving rclone's own extension-split rule
+    /// (limpet-plan.md L6.2 item 5, measured 2026-09-28: `a.tar.gz` splits at
+    /// the FIRST dot -> `a-100003.tar.gz`, but `x.min.js` splits at the LAST
+    /// dot -> `x.min-100003.js`) — only one boundary can produce a match
+    /// against a real rclone-generated name. Returns the 6-digit suffix.
+    static func trashSuffixMatch(candidate: String, original: String) -> String? {
+        var boundaries: [String.Index] = [original.endIndex]
+        boundaries.append(contentsOf: original.indices.filter { original[$0] == "." })
+        for pos in boundaries {
+            let prefix = String(original[original.startIndex..<pos])
+            let ext = String(original[pos...])
+            let marker = "\(prefix)-"
+            guard candidate.hasPrefix(marker), candidate.hasSuffix(ext),
+                  candidate.count >= marker.count + ext.count else { continue }
+            let start = candidate.index(candidate.startIndex, offsetBy: marker.count)
+            let end = candidate.index(candidate.endIndex, offsetBy: -ext.count)
+            guard start <= end else { continue }
+            let digits = String(candidate[start..<end])
+            guard digits.count == 6, digits.allSatisfy(\.isNumber) else { continue }
+            return digits
+        }
+        return nil
+    }
+
+    /// The newest trashed version of `dirComponent`/`baseName` (or its
+    /// `.rclonelink` form, for a symlink on a remote without native symlink
+    /// support) in a `rclone lsf -R` `listing`. When `dateFixed` is `nil` each
+    /// line is `<date>/<relative path>` (a whole-root listing); otherwise
+    /// every line is relative to that one date's folder already. Ties broken
+    /// by date (lexicographic `YYYY-MM-DD` sorts chronologically), then by the
+    /// highest 6-digit suffix. Pure — the self-test drives it over fixture
+    /// text without touching rclone.
+    static func newestTrashMatch(
+        listing: String, dateFixed: String?, dirComponent: String, baseName: String
+    ) -> TrashMatch? {
+        var best: TrashMatch?
+        let candidateNames = [baseName, "\(baseName).rclonelink"]
+        for rawLine in listing.split(separator: "\n", omittingEmptySubsequences: true) {
+            let line = String(rawLine)
+            let date: String
+            let relativeToDate: String
+            if let dateFixed {
+                date = dateFixed
+                relativeToDate = line
+            } else {
+                guard let slash = line.firstIndex(of: "/") else { continue }
+                let candidateDate = String(line[line.startIndex..<slash])
+                guard candidateDate.range(of: "^[0-9]{4}-[0-9]{2}-[0-9]{2}$", options: .regularExpression) != nil else {
+                    continue
+                }
+                date = candidateDate
+                relativeToDate = String(line[line.index(after: slash)...])
+            }
+            guard (relativeToDate as NSString).deletingLastPathComponent == dirComponent else { continue }
+            let entryName = (relativeToDate as NSString).lastPathComponent
+            for candidateName in candidateNames {
+                guard let suffix = trashSuffixMatch(candidate: entryName, original: candidateName) else { continue }
+                let match = TrashMatch(date: date, entry: line, suffix: suffix)
+                if best == nil || isNewerTrashMatch(match, than: best!) { best = match }
+                break
+            }
+        }
+        return best
+    }
+
+    private static func isNewerTrashMatch(_ a: TrashMatch, than b: TrashMatch) -> Bool {
+        if a.date != b.date { return a.date > b.date }
+        return (Int(a.suffix) ?? -1) > (Int(b.suffix) ?? -1)
+    }
+
+    private static func runTrashList(_ target: String, date: String?, env: CLIEnvironment) -> Int32 {
+        guard let profile = resolveProfile(target, in: env.readProfiles()) else {
+            env.stderr("error: no profile matches \"\(target)\"\n")
+            return 1
+        }
+        if let err = validateTrashDate(date) {
+            env.stderr("error: \(err)\n")
+            return 65
+        }
+        let remoteSection = env.remoteSection(String(profile.rcloneRemote.prefix { $0 != ":" }))
+        guard let root = SyncSetupService.trashRoot(for: profile, remoteSection: remoteSection) else {
+            env.stdout("no trash root configured for \(profile.name) (\(profile.shortId))\n")
+            return 0
+        }
+        let listPath = date.map { "\(root)/\($0)" } ?? root
+        let (exit, out, err) = env.runRclone(["lsf", "-R", listPath], profile.rcloneRemote, 20)
+        guard exit == 0 else {
+            env.stderr(err.isEmpty ? "error: rclone lsf failed (exit \(exit))\n" : err)
+            return 1
+        }
+        env.stdout(out)
+        return 0
+    }
+
+    private static func runTrashRestore(
+        _ target: String, relativePath: String, date: String?, force: Bool, env: CLIEnvironment
+    ) -> Int32 {
+        guard let profile = resolveProfile(target, in: env.readProfiles()) else {
+            env.stderr("error: no profile matches \"\(target)\"\n")
+            return 1
+        }
+        if let err = validateTrashRelativePath(relativePath) {
+            env.stderr("error: \(err)\n")
+            return 65
+        }
+        if let err = validateTrashDate(date) {
+            env.stderr("error: \(err)\n")
+            return 65
+        }
+        let remoteSection = env.remoteSection(String(profile.rcloneRemote.prefix { $0 != ":" }))
+        guard let root = SyncSetupService.trashRoot(for: profile, remoteSection: remoteSection) else {
+            env.stderr("error: no trash root configured for \(profile.name) (\(profile.shortId))\n")
+            return 1
+        }
+        let localTarget = (profile.localSyncPath as NSString).appendingPathComponent(relativePath)
+        guard force || !env.fileExists(localTarget) else {
+            env.stderr("error: \(localTarget) already exists; pass --force to overwrite\n")
+            return 1
+        }
+        let listPath = date.map { "\(root)/\($0)" } ?? root
+        let (listExit, listing, listErr) = env.runRclone(["lsf", "-R", listPath], profile.rcloneRemote, 20)
+        guard listExit == 0 else {
+            env.stderr(listErr.isEmpty ? "error: rclone lsf failed (exit \(listExit))\n" : listErr)
+            return 1
+        }
+        let dirComponent = (relativePath as NSString).deletingLastPathComponent
+        let baseName = (relativePath as NSString).lastPathComponent
+        guard let match = Self.newestTrashMatch(
+            listing: listing, dateFixed: date, dirComponent: dirComponent, baseName: baseName) else {
+            env.stderr("error: no trashed version of \(relativePath) found\n")
+            return 1
+        }
+        let sourcePath = "\(listPath)/\(match.entry)"
+        let (copyExit, _, copyErr) = env.runRclone(["copyto", sourcePath, localTarget, "--links"], profile.rcloneRemote, 60)
+        guard copyExit == 0 else {
+            env.stderr(copyErr.isEmpty ? "error: restore failed (exit \(copyExit))\n" : copyErr)
+            return 1
+        }
+        env.stdout("restored \(relativePath) from \(sourcePath) to \(localTarget)\n")
         return 0
     }
 }
