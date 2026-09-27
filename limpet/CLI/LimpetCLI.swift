@@ -1130,7 +1130,21 @@ extension CLIEnvironment {
             },
             remoteSection: { RcloneConfigService.shared.section(named: $0) },
             writeProfile: { profile in
-                ProfileStore.writeProfileFile(profile, in: SyncProfile.configDirectory) != nil
+                // limpet-plan.md L6.1 change A: note the marker BEFORE writing,
+                // hashing the SAME bytes `writeProfileFile` is about to write —
+                // only the CLI's write closure does this (ProfileStore itself
+                // stays marker-free for the app's own writes), so the running
+                // app's ConfigFileWatcher can tell "the CLI already reconciled
+                // this" from "a hand edit, reconcile normally". A refused
+                // profile hashes to `nil` and notes nothing, matching
+                // `writeProfileFile`'s own refusal a line below.
+                let hash = ProfileStore.encodedProfileFileData(profile).map(ConfigSelfWriteRegistry.hash)
+                if let hash { CLIWriteMarker.note(contentHash: hash) }
+                let wrote = ProfileStore.writeProfileFile(profile, in: SyncProfile.configDirectory) != nil
+                // A marker for a write that never happened would let a later
+                // identical hand edit skip its reconcile (CodeRabbit, PR #9).
+                if !wrote, let hash { _ = CLIWriteMarker.consume(hash: hash) }
+                return wrote
             },
             installProfile: { profile in
                 do { try SyncSetupService.shared.install(profile: profile); return nil }
@@ -1221,6 +1235,7 @@ extension CLIEnvironment {
     }
 
     fileprivate static func runProcess(launchPath: String, args: [String], timeout: TimeInterval = 10) -> (Int32, String) {
+        if SelfTestGuard.refuses(launchPath, args) { return (1, "") }
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: launchPath)
         proc.arguments = args

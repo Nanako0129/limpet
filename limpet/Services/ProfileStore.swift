@@ -119,8 +119,8 @@ final class ProfileStore: ObservableObject {
     /// `profiles`) so the file-authoritative `load()` can never resurrect a
     /// deleted profile. The prune only touches the `*.profile.json` suffix —
     /// never the derived `{shortId}.json`, the exclude filter, or `schema/`.
-    /// A pruned file generates an FSEvent, but `ConfigFileWatcher.shouldReconcile`
-    /// returns false for a missing file and `classify` only reacts to existing
+    /// A pruned file generates an FSEvent, but `ConfigFileWatcher.classifyWrite`
+    /// returns `.skip` for a missing file and `classify` only reacts to existing
     /// `.profile.json` changes, so pruning is safe with the watcher.
     private func writeProfileFiles() {
         guard (try? FileManager.default.createDirectory(
@@ -164,13 +164,7 @@ final class ProfileStore: ObservableObject {
         guard (try? fm.createDirectory(
             atPath: directory, withIntermediateDirectories: true)) != nil else { return nil }
 
-        guard var dict = try? encodeProfileDict(profile) else { return nil }
-        // Relative to `directory` (".../profiles"), the schema lives one level
-        // up, under "schema/" (see ConfigSchemaInstaller).
-        dict["$schema"] = "../schema/profile.schema.json"
-
-        guard let data = try? JSONSerialization.data(
-            withJSONObject: dict, options: [.prettyPrinted, .sortedKeys]) else { return nil }
+        guard let data = encodedProfileFileData(profile) else { return nil }
 
         let filename = "\(profile.shortId).profile.json"
         let path = "\(directory)/\(filename)"
@@ -206,6 +200,21 @@ final class ProfileStore: ObservableObject {
                 print("Could not move undecodable profile file \(file) to refused/; left in place")
             }
         }
+    }
+
+    /// The exact bytes `writeProfileFile` writes for `profile` (pretty,
+    /// sorted-key JSON with `$schema` merged in), or `nil` if the profile is
+    /// F4-refused or encoding fails. `nonisolated` and not private so the CLI's
+    /// write closure (`LimpetCLI.CLIEnvironment.production`) can hash the SAME
+    /// bytes it is about to write, to note a `CLIWriteMarker` BEFORE the write
+    /// (limpet-plan.md L6.1 change A) — computing the hash from anything else
+    /// would let it drift from what `ConfigFileWatcher` reads back off disk.
+    nonisolated static func encodedProfileFileData(_ profile: SyncProfile) -> Data? {
+        guard profile.validationError == nil, var dict = try? encodeProfileDict(profile) else { return nil }
+        // Relative to the profiles directory, the schema lives one level up,
+        // under "schema/" (see ConfigSchemaInstaller).
+        dict["$schema"] = "../schema/profile.schema.json"
+        return try? JSONSerialization.data(withJSONObject: dict, options: [.prettyPrinted, .sortedKeys])
     }
 
     /// Encode a profile to a plain dictionary (round-tripping through JSON) so

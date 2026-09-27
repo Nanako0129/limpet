@@ -16,7 +16,7 @@ final class RcloneConfigService: Sendable {  // every stored property is an immu
     /// rclone.conf, a stub rclone and a fake `security` — never the
     /// user's real ones.
     init(
-        configPath: String = "\(NSHomeDirectory())/.config/rclone/rclone.conf",
+        configPath: String = "\(LimpetPaths.home)/.config/rclone/rclone.conf",
         rclonePath: String? = nil,
         keychain: KeychainSecretStore = KeychainSecretStore()
     ) {

@@ -10,7 +10,129 @@ import Foundation
 /// or the sync script itself, and never touches the lock file — see
 /// `SyncManager.triggerManualSync` and the static grep self-test in
 /// `ConfigSelfTest`.
+/// Thread-safe state for the currently-running (or currently-spawning) sync
+/// child (limpet-plan.md L6.1 change B, code-review finding 7).
+/// `runSyncChild`/`runChildProcess` run on a background global queue; the
+/// SIGTERM/SIGINT handler runs on `.main` — this is the one piece of state
+/// both sides touch, so it needs its own lock rather than living as a plain
+/// var on either side.
+///
+/// A PID recorded only AFTER `Process.run()` returns leaves a window — SIGTERM
+/// arriving between spawn and the PID being stored finds nothing to kill, and
+/// exits anyway, orphaning the just-spawned group (finding 7). Closing that
+/// window needs a third state, `.spawning`, bracketing the window itself, plus
+/// a `terminating` flag: if termination is requested while `.spawning`, the
+/// HANDLER does not exit — `spawned(pid:)` does, immediately after storing the
+/// PID, since it is the first code to actually know the PID.
+///
+/// Every method here is a PURE decision under one lock acquisition — neither
+/// `killpg` nor `exit` is called from inside this type. That is deliberate:
+/// it lets a self-test drive the exact state machine (`beginSpawning` →
+/// `requestTermination` → `spawned`) and assert the decision it returns,
+/// without a test process ever calling real `exit()` on itself. The actual
+/// `killpg`/`exit` side effects live in `SyncWatchDaemon`'s callers, which
+/// only code review and the plan's live check cover — see `AC-L61-7`.
+final class RunningChildState {
+    private enum State { case idle, spawning, running(pid_t) }
+    private var state: State = .idle
+    private var terminating = false
+    private let lock = NSLock()
+
+    init() {}
+
+    /// Call immediately BEFORE spawning.
+    func beginSpawning() {
+        lock.lock()
+        state = .spawning
+        lock.unlock()
+    }
+
+    /// What `spawned(pid:)` decided:
+    /// - `.ok`: nothing pending — carry on as normal.
+    /// - `.killAndExitNow(pid)`: a termination arrived while `.spawning` AND a
+    ///   PID now exists — this is the first point one was known, so kill its
+    ///   group and exit.
+    /// - `.exitNow`: a termination arrived while `.spawning`, but the spawn
+    ///   itself then FAILED (`pid == nil`) — there is nothing to kill, but the
+    ///   process must still exit. Without this case, a SIGTERM landing in that
+    ///   exact window was silently swallowed: `requestTermination` had already
+    ///   returned `.wait` (so the handler did not exit), and a failed spawn
+    ///   used to report `.ok` (so this call did not exit either) — the watcher
+    ///   then lived on until a second signal or launchd's own SIGKILL.
+    enum SpawnOutcome: Equatable { case ok, killAndExitNow(pid_t), exitNow }
+
+    /// Call immediately after `Process.run()` either succeeds (`pid` given) or
+    /// throws (`pid == nil`).
+    func spawned(pid: pid_t?) -> SpawnOutcome {
+        lock.lock()
+        let wasTerminating = terminating
+        state = pid.map(State.running) ?? .idle
+        lock.unlock()
+        guard wasTerminating else { return .ok }
+        if let pid { return .killAndExitNow(pid) }
+        return .exitNow
+    }
+
+    /// Call after the child has exited normally (`waitUntilExit()` returned).
+    func cleared() {
+        lock.lock()
+        state = .idle
+        lock.unlock()
+    }
+
+    enum TerminationAction: Equatable {
+        /// Nothing running or about to run — exit now.
+        case exitNow
+        /// A child is running with this PID — kill its group, then exit.
+        case killAndExit(pid_t)
+        /// A child is mid-spawn; do NOT exit — `spawned(pid:)` will decide to
+        /// kill and exit once the PID is known.
+        case wait
+    }
+
+    /// The SIGTERM/SIGINT handler's decision, computed and recorded under one
+    /// lock acquisition so it can never race `spawned(pid:)`.
+    func requestTermination() -> TerminationAction {
+        lock.lock()
+        defer { lock.unlock() }
+        terminating = true
+        switch state {
+        case .idle: return .exitNow
+        case .spawning: return .wait
+        case .running(let pid): return .killAndExit(pid)
+        }
+    }
+}
+
 enum SyncWatchDaemon {
+    private static let runningChild = RunningChildState()
+
+    /// Send SIGTERM to the process group led by `pid` — the running sync
+    /// child is its OWN process-group leader (measured live, see `run`'s
+    /// comment), so this reaches the script, rclone and tee together. Not
+    /// private, and taking a bare `pid_t` rather than reading `runningChild`
+    /// itself, so a self-test can drive it against a process group IT
+    /// spawned, without a real `limpet watch` process.
+    static func terminateChildProcessGroup(pid: pid_t) {
+        killpg(pid, SIGTERM)
+    }
+
+    /// The SIGTERM/SIGINT handler body: forward to the running child's process
+    /// group, if any, and exit AT ONCE — see `run`'s comment on why this never
+    /// waits. Does NOT exit when a child is mid-spawn (`.wait`): `spawned(pid:)`
+    /// finishes that job instead, once it actually has a PID to kill.
+    private static func terminateRunningChildAndExit() {
+        switch runningChild.requestTermination() {
+        case .exitNow:
+            exit(0)
+        case .killAndExit(let pid):
+            terminateChildProcessGroup(pid: pid)
+            exit(0)
+        case .wait:
+            break
+        }
+    }
+
     /// Runs forever. Everything here dispatches onto the main queue (matching
     /// `DirectoryWatcher`'s own `DispatchQueue.main.async` callback), so the
     /// scheduler's state is only ever mutated from one thread; `dispatchMain()`
@@ -29,6 +151,36 @@ enum SyncWatchDaemon {
         let signalSource = DispatchSource.makeSignalSource(signal: SIGUSR1, queue: .main)
         signalSource.setEventHandler { scheduler.trigger() }
         signalSource.resume()
+
+        // limpet-plan.md L6.1 change B, root cause 2: `launchctl unload` sends
+        // this process SIGTERM, but `Process`'s child (the sync script) is its
+        // own process-group leader (measured live: watcher pgid 24762,
+        // script/rclone/tee pgid 61291) — killing only this process leaves the
+        // script/rclone/tee running, reparented to launchd, still holding the
+        // lock. Forward SIGTERM to the child's process group and exit AT ONCE:
+        // no waiting, so `launchctl unload`/`load` timing (already synchronous
+        // from the CLI's side) is unchanged. This CAN interrupt rclone mid-delete
+        // (unmeasured, and wrong to assume otherwise — a SIGTERM has no reason to
+        // respect rclone's transfer/delete phase boundary, and a profile's
+        // `additionalRcloneFlags` can set `--delete-during`, which interleaves
+        // deletes with transfers instead of phasing them): an interrupted run may
+        // therefore have deleted only PART of what it meant to delete this pass.
+        // That is still safe, by construction rather than by measurement — this
+        // is a one-way sync (`syncDirection`), so `rclone sync` only ever deletes
+        // a copy on the NON-authoritative side that is already absent from the
+        // authoritative side; a delete interrupted partway through never removes
+        // anything the user still has anywhere. The next watcher's catch-up sync
+        // simply re-evaluates the same diff and completes whatever this run
+        // didn't get to. Same handling for SIGINT (manual `kill`/Ctrl-C during
+        // interactive debugging).
+        var terminationSources: [DispatchSourceSignal] = []
+        for sig in [SIGTERM, SIGINT] {
+            signal(sig, SIG_IGN)
+            let terminationSource = DispatchSource.makeSignalSource(signal: sig, queue: .main)
+            terminationSource.setEventHandler { terminateRunningChildAndExit() }
+            terminationSource.resume()
+            terminationSources.append(terminationSource)  // kept alive: `run` never returns
+        }
 
         // Periodic safety sync every profile interval.
         let intervalSeconds = TimeInterval(max(profile.syncIntervalMinutes, 1) * 60)
@@ -164,12 +316,35 @@ enum SyncWatchDaemon {
         process.environment = environment
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
+        runningChild.beginSpawning()
         do {
             try process.run()
         } catch {
+            // finding 7 (verifier gap 2): a termination requested while
+            // `.spawning` returns `.exitNow` here when the spawn itself then
+            // failed — nothing to kill, but the process must still exit; see
+            // `SpawnOutcome.exitNow`'s doc for why leaving this unhandled
+            // silently swallowed the signal.
+            if runningChild.spawned(pid: nil) == .exitNow {
+                exit(0)
+            }
             return -1
         }
+        // finding 7: SIGTERM/SIGINT arriving between `beginSpawning()` above and
+        // this call finds `.spawning` and returns `.wait` (does not exit) from
+        // `requestTermination`; THIS call is the one that finishes the job, since
+        // it is the first point a PID is actually known.
+        switch runningChild.spawned(pid: process.processIdentifier) {
+        case .ok:
+            break
+        case .killAndExitNow(let pid):
+            terminateChildProcessGroup(pid: pid)
+            exit(0)
+        case .exitNow:
+            exit(0)  // unreachable here (a real PID is always non-nil), kept exhaustive
+        }
         process.waitUntilExit()
+        runningChild.cleared()
         return process.terminationStatus
     }
 

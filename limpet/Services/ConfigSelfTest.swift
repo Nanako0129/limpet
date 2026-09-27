@@ -30,13 +30,50 @@ enum ConfigSelfTest {
         return tmpDir.hasSuffix("/") ? "\(tmpDir)limpet-selftest" : "\(tmpDir)/limpet-selftest"
     }
 
+    /// Names, sizes and modification times of every limpet-owned entry in the
+    /// real home, compared before and after a run by AC-GUARD.
+    private static func realHomeFingerprint(_ home: String) -> Set<String> {
+        let fm = FileManager.default
+        var out = Set<String>()
+        func add(_ path: String) {
+            guard let a = try? fm.attributesOfItem(atPath: path) else { return }
+            let size = (a[.size] as? NSNumber)?.int64Value ?? -1
+            let mtime = (a[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
+            out.insert("\(path) \(size) \(mtime)")
+        }
+        let agents = "\(home)/Library/LaunchAgents"
+        for name in (try? fm.contentsOfDirectory(atPath: agents)) ?? [] where name.hasPrefix("com.nanako.limpet") {
+            add("\(agents)/\(name)")
+        }
+        let bin = "\(home)/.local/bin"
+        for name in (try? fm.contentsOfDirectory(atPath: bin)) ?? [] where name.hasPrefix("limpet") {
+            add("\(bin)/\(name)")
+        }
+        for dir in ["\(home)/.config/limpet", "\(home)/.local/state/limpet"] {
+            add(dir)
+            if let e = fm.enumerator(atPath: dir) {
+                for case let rel as String in e { add("\(dir)/\(rel)") }
+            }
+        }
+        add("\(home)/.config/rclone/rclone.conf")
+        return out
+    }
+
     /// Run every self-test. Returns 0 if all passed, 1 otherwise.
     static func run() -> Int32 {
         // No self-test may reach a real keychain (see makeSecurityStub).
         KeychainSecretStore.realKeychainForbidden = true
+        // No self-test may write the real home or change launchd state: every
+        // per-user path resolves under a temp home, and launchctl load/unload/
+        // kill/bootstrap/bootout are refused and recorded (SelfTestGuard).
+        let realHome = NSHomeDirectory()
+        let before = realHomeFingerprint(realHome)
+        SelfTestGuard.active = true
         // Start clean so a previous run's leftovers can't mask a real failure.
         try? FileManager.default.removeItem(atPath: selfTestRoot)
         try? FileManager.default.createDirectory(atPath: selfTestRoot, withIntermediateDirectories: true)
+        LimpetPaths.home = "\(selfTestRoot)/home"
+        try? FileManager.default.createDirectory(atPath: LimpetPaths.home, withIntermediateDirectories: true)
 
         var allPassed = true
         let checks: [() -> Bool] = [
@@ -112,12 +149,31 @@ enum ConfigSelfTest {
             testSourceMissingClearsOnRecheck,
             testRcloneLogEntryFileChangeMapping,
             testExitCodeErrorText,
+            testCLIWriteMarkerClassification,
+            testAppWritesLeaveMarkerDirEmpty,
+            testReconcileClosuresDispatch,
+            testCLIWriteClassifiedThroughRealWriter,
+            testSyncAlreadyRunningSetsSyncing,
+            testInstallThrowsOnLaunchctlLoadFailure,
+            testTerminateChildProcessGroupKillsRealGroup,
+            testSpawnTerminationRaceClosesWithoutOrphan,
+            testCLIWriteMarkerIgnoresNonHashFilenames,
+            testInstallRefreshesLoadedAgentAndCleansUpFailure,
+            testConfigFileWatcherRealDispatchOnCLIMarkerHit,
         ]
 
         for check in checks {
             if !check() { allPassed = false }
         }
 
+        // AC-GUARD: the run left the real home and launchd alone.
+        let after = realHomeFingerprint(realHome)
+        let changed = before.symmetricDifference(after).sorted()
+        if !report("AC-GUARD", "real-home-and-launchd-untouched",
+                   changed.isEmpty && SelfTestGuard.violations.isEmpty,
+                   "(changed: \(changed.prefix(5)); refused launchctl: \(SelfTestGuard.violations.prefix(5)))") {
+            allPassed = false
+        }
         return allPassed ? 0 : 1
     }
 
@@ -294,29 +350,36 @@ enum ConfigSelfTest {
     private static func testSelfWriteSuppression() -> Bool {
         let dir = "\(selfTestRoot)/ac5-selfwrite"
         try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        // `classifyWrite` also consults `CLIWriteMarker`; redirect it to an
+        // isolated, empty temp dir so this test never touches the real
+        // `~/.local/state/limpet/cli-writes` (no marker here is ever expected to
+        // match, but the directory listing itself must stay off the real path).
+        let markerDir = "\(dir)/cli-writes"
 
-        let selfWrittenPath = "\(dir)/self-written.profile.json"
-        let selfWrittenContent = Data("{\"marker\":\"self-write\"}".utf8)
-        guard (try? selfWrittenContent.write(to: URL(fileURLWithPath: selfWrittenPath))) != nil else {
-            return report("AC-5", "self-write-suppression", false, "(failed to write fixture)")
-        }
-        ConfigSelfWriteRegistry.shared.noteSelfWrite(contentHash: ConfigSelfWriteRegistry.hash(selfWrittenContent))
+        return CLIWriteMarker.withDirectory(markerDir) {
+            let selfWrittenPath = "\(dir)/self-written.profile.json"
+            let selfWrittenContent = Data("{\"marker\":\"self-write\"}".utf8)
+            guard (try? selfWrittenContent.write(to: URL(fileURLWithPath: selfWrittenPath))) != nil else {
+                return report("AC-5", "self-write-suppression", false, "(failed to write fixture)")
+            }
+            ConfigSelfWriteRegistry.shared.noteSelfWrite(contentHash: ConfigSelfWriteRegistry.hash(selfWrittenContent))
 
-        guard ConfigFileWatcher.shouldReconcile(forFileAt: selfWrittenPath) == false else {
-            return report("AC-5", "self-write-suppression", false, "(a noted self-write was NOT suppressed)")
-        }
+            guard ConfigFileWatcher.classifyWrite(forFileAt: selfWrittenPath) == .skip else {
+                return report("AC-5", "self-write-suppression", false, "(a noted self-write was NOT suppressed)")
+            }
 
-        // A genuinely external write (different, un-noted content) must still reconcile.
-        let externalPath = "\(dir)/external.profile.json"
-        let externalContent = Data("{\"marker\":\"external-write\"}".utf8)
-        guard (try? externalContent.write(to: URL(fileURLWithPath: externalPath))) != nil else {
-            return report("AC-5", "self-write-suppression", false, "(failed to write external fixture)")
-        }
-        guard ConfigFileWatcher.shouldReconcile(forFileAt: externalPath) == true else {
-            return report("AC-5", "self-write-suppression", false, "(an external write was incorrectly suppressed)")
-        }
+            // A genuinely external write (different, un-noted content) must still reconcile.
+            let externalPath = "\(dir)/external.profile.json"
+            let externalContent = Data("{\"marker\":\"external-write\"}".utf8)
+            guard (try? externalContent.write(to: URL(fileURLWithPath: externalPath))) != nil else {
+                return report("AC-5", "self-write-suppression", false, "(failed to write external fixture)")
+            }
+            guard ConfigFileWatcher.classifyWrite(forFileAt: externalPath) == .external else {
+                return report("AC-5", "self-write-suppression", false, "(an external write was incorrectly suppressed)")
+            }
 
-        return report("AC-5", "self-write-suppression", true)
+            return report("AC-5", "self-write-suppression", true)
+        }
     }
 
     // MARK: - AC-6 — migration v3 (blob -> per-profile files, blob retained)
@@ -3888,6 +3951,756 @@ enum ConfigSelfTest {
             guard text == expected else {
                 return report(id, slug, false, "(exit code \(code) mapped to \"\(text)\", expected \"\(expected)\")")
             }
+        }
+
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L61-1 — CLIWriteMarker + ConfigFileWatcher.classifyWrite
+
+    /// limpet-plan.md L6.1 change A. Drives `CLIWriteMarker.note`/`consume` and
+    /// `ConfigFileWatcher.classifyWrite` directly, always inside
+    /// `CLIWriteMarker.withDirectory` pointed at an isolated temp dir under
+    /// `selfTestRoot` — this NEVER reads or writes the real
+    /// `~/.local/state/limpet/cli-writes` (a hard limit for this repo).
+    private static func testCLIWriteMarkerClassification() -> Bool {
+        let id = "AC-L61-1", slug = "cli-write-marker-classification"
+        let dir = "\(selfTestRoot)/ac-l61-1"
+        try? FileManager.default.removeItem(atPath: dir)
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let markerDir = "\(dir)/cli-writes"
+        let fm = FileManager.default
+
+        return CLIWriteMarker.withDirectory(markerDir) {
+            // (a) a CLI write (marker noted, then the file written) is classified
+            // .cliWrite, and consuming it is one-shot: classifying the same
+            // content again (marker gone, no self-write registry entry either)
+            // is .external.
+            let cliPath = "\(dir)/cli-written.profile.json"
+            let cliContent = Data("{\"marker\":\"cli-write\"}".utf8)
+            let cliHash = ConfigSelfWriteRegistry.hash(cliContent)
+            CLIWriteMarker.note(contentHash: cliHash)
+            guard (try? cliContent.write(to: URL(fileURLWithPath: cliPath))) != nil else {
+                return report(id, slug, false, "(failed to write cli fixture)")
+            }
+            guard ConfigFileWatcher.classifyWrite(forFileAt: cliPath) == .cliWrite else {
+                return report(id, slug, false, "(a marked CLI write was not classified .cliWrite)")
+            }
+            guard ConfigFileWatcher.classifyWrite(forFileAt: cliPath) == .external else {
+                return report(id, slug, false, "(a consumed marker was matched a second time)")
+            }
+
+            // (b) the SAME content with no marker at all is .external.
+            let externalPath = "\(dir)/external.profile.json"
+            let externalContent = Data("{\"marker\":\"external-write\"}".utf8)
+            guard (try? externalContent.write(to: URL(fileURLWithPath: externalPath))) != nil else {
+                return report(id, slug, false, "(failed to write external fixture)")
+            }
+            guard ConfigFileWatcher.classifyWrite(forFileAt: externalPath) == .external else {
+                return report(id, slug, false, "(an unmarked write was not classified .external)")
+            }
+
+            // (c) a marker older than the 10-minute TTL is ignored AND removed
+            // on the next consult, even for content that was never re-checked.
+            let stalePath = "\(dir)/stale.profile.json"
+            let staleContent = Data("{\"marker\":\"stale\"}".utf8)
+            let staleHash = ConfigSelfWriteRegistry.hash(staleContent)
+            CLIWriteMarker.note(contentHash: staleHash, now: Date().addingTimeInterval(-700))
+            guard (try? staleContent.write(to: URL(fileURLWithPath: stalePath))) != nil else {
+                return report(id, slug, false, "(failed to write stale fixture)")
+            }
+            guard fm.fileExists(atPath: "\(markerDir)/\(staleHash)") else {
+                return report(id, slug, false, "(stale marker fixture was not written)")
+            }
+            guard ConfigFileWatcher.classifyWrite(forFileAt: stalePath) == .external else {
+                return report(id, slug, false, "(a marker older than 10 minutes was still honored)")
+            }
+            guard !fm.fileExists(atPath: "\(markerDir)/\(staleHash)") else {
+                return report(id, slug, false, "(a stale marker was not removed)")
+            }
+
+            // (d) the in-process self-write registry is checked FIRST: a hit
+            // there ends the check without even reading a matching marker —
+            // the marker must still be sitting there afterward, unconsumed.
+            let bothPath = "\(dir)/both.profile.json"
+            let bothContent = Data("{\"marker\":\"self-write-and-marker\"}".utf8)
+            let bothHash = ConfigSelfWriteRegistry.hash(bothContent)
+            ConfigSelfWriteRegistry.shared.noteSelfWrite(contentHash: bothHash)
+            CLIWriteMarker.note(contentHash: bothHash)
+            guard (try? bothContent.write(to: URL(fileURLWithPath: bothPath))) != nil else {
+                return report(id, slug, false, "(failed to write both-markers fixture)")
+            }
+            guard ConfigFileWatcher.classifyWrite(forFileAt: bothPath) == .skip else {
+                return report(id, slug, false, "(a self-write registry hit did not win over a CLI marker)")
+            }
+            guard fm.fileExists(atPath: "\(markerDir)/\(bothHash)") else {
+                return report(id, slug, false, "(the CLI marker was consumed even though the registry hit first)")
+            }
+
+            return report(id, slug, true)
+        }
+    }
+
+    // MARK: - AC-L61-2 — ProfileStore's own writes never touch CLIWriteMarker
+
+    /// limpet-plan.md L6.1 change A: "ProfileStore.writeProfileFile stays
+    /// marker-free for the app's own writes". Mutation-check: temporarily add
+    /// a `CLIWriteMarker.note(...)` call inside `ProfileStore.writeProfileFile`
+    /// (using the default, ambient `CLIWriteMarker.directory` — exactly what
+    /// this test redirects), rebuild, and confirm this assertion FAILS; then
+    /// revert.
+    private static func testAppWritesLeaveMarkerDirEmpty() -> Bool {
+        let id = "AC-L61-2", slug = "app-writes-leave-marker-dir-empty"
+        let dir = "\(selfTestRoot)/ac-l61-2"
+        try? FileManager.default.removeItem(atPath: dir)
+        let profilesDir = "\(dir)/profiles"
+        let markerDir = "\(dir)/cli-writes"
+        let fm = FileManager.default
+
+        return CLIWriteMarker.withDirectory(markerDir) {
+            let store = ProfileStore(
+                profilesDirectory: profilesDir,
+                defaults: UserDefaults(suiteName: "com.nanako.limpet.selftest.ac-l61-2.\(UUID().uuidString)")!)
+
+            var profile = sampleProfile(name: "AppWrite")
+            store.add(profile)
+            profile.name = "AppWrite renamed"
+            store.update(profile)
+            store.save()
+
+            let markerFiles = (try? fm.contentsOfDirectory(atPath: markerDir)) ?? []
+            guard markerFiles.isEmpty else {
+                return report(id, slug, false, "(ProfileStore.add/update/save left marker(s): \(markerFiles))")
+            }
+            return report(id, slug, true)
+        }
+    }
+
+    // MARK: - AC-L61-3 — reconcileClosures: the ONE place a marker hit skips launchd, never watch bookkeeping
+
+    /// limpet-plan.md L6.1 change A, code-review findings 2 and 5. Exercises
+    /// the extracted `SyncManager.reconcileClosures` directly — the ONE
+    /// production seam that decides, given `suppressReconcile`, which of the
+    /// four closures (`setupInstall`/`setupUninstall`/`watchStart`/
+    /// `watchStop`) run — instead of a test-local re-implementation of that
+    /// dispatch (finding 5's complaint about the previous version of this
+    /// test). `applyExternalProfileEdit`/`applyExternalProfileCreate` build
+    /// their real closures from the SAME function, so this is production logic,
+    /// not a parallel copy that could silently drift from it.
+    ///
+    /// Finding 2: on a suppressed write, `setupInstall`/`setupUninstall` (the
+    /// `SyncSetupService`/launchctl calls the CLI already made) must NOT fire,
+    /// but `watchStart`/`watchStop` (the in-app `LogWatcher`/`profileStates`
+    /// bookkeeping) MUST fire regardless — the previous version no-op'd the
+    /// whole `install`/`uninstall` closure, so a CLI `profile disable` of a
+    /// syncing/errored profile left `logWatchers`/`profileStates` stale.
+    private static func testReconcileClosuresDispatch() -> Bool {
+        let id = "AC-L61-3", slug = "reconcile-closures-dispatch"
+
+        struct Spies {
+            var setupInstall = 0, setupUninstall = 0, watchStart = 0, watchStop = 0
+        }
+        func run(suppressReconcile: Bool, invoke: (
+            (install: (SyncProfile) throws -> Void, uninstall: (SyncProfile) throws -> Void)
+        ) throws -> Void) rethrows -> Spies {
+            var spies = Spies()
+            let closures = SyncManager.reconcileClosures(
+                suppressReconcile: suppressReconcile,
+                setupInstall: { _ in spies.setupInstall += 1 },
+                setupUninstall: { _ in spies.setupUninstall += 1 },
+                watchStart: { _ in spies.watchStart += 1 },
+                watchStop: { _ in spies.watchStop += 1 })
+            try invoke(closures)
+            return spies
+        }
+        let profile = sampleProfile(name: "Reconcile")
+
+        // Suppressed install: setupInstall skipped, watchStart still runs.
+        guard let suppressedInstall = try? run(suppressReconcile: true, invoke: { try $0.install(profile) }),
+              suppressedInstall.setupInstall == 0, suppressedInstall.watchStart == 1 else {
+            return report(id, slug, false, "(suppressed install ran the wrong closures)")
+        }
+        // Suppressed uninstall: setupUninstall skipped, watchStop still runs.
+        guard let suppressedUninstall = try? run(suppressReconcile: true, invoke: { try $0.uninstall(profile) }),
+              suppressedUninstall.setupUninstall == 0, suppressedUninstall.watchStop == 1 else {
+            return report(id, slug, false, "(suppressed uninstall ran the wrong closures)")
+        }
+        // NOT suppressed (an ordinary external edit / hand edit): both halves run.
+        guard let fullInstall = try? run(suppressReconcile: false, invoke: { try $0.install(profile) }),
+              fullInstall.setupInstall == 1, fullInstall.watchStart == 1 else {
+            return report(id, slug, false, "(un-suppressed install skipped setupInstall)")
+        }
+        guard let fullUninstall = try? run(suppressReconcile: false, invoke: { try $0.uninstall(profile) }),
+              fullUninstall.setupUninstall == 1, fullUninstall.watchStop == 1 else {
+            return report(id, slug, false, "(un-suppressed uninstall skipped setupUninstall)")
+        }
+
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L61-3b — a marker-hit CLI write is classified through the real watcher
+
+    /// limpet-plan.md L6.1 change A. Complements `testReconcileClosuresDispatch`
+    /// (which tests the closure-selection logic in isolation) by proving the
+    /// CLI's actual write — through `ProfileStore.writeProfileFile`, the same
+    /// function `LimpetCLI`'s `writeProfile` closure calls — really is
+    /// classified `.cliWrite` by `ConfigFileWatcher`, for both an edit of an
+    /// existing id and a create of a new one.
+    private static func testCLIWriteClassifiedThroughRealWriter() -> Bool {
+        let id = "AC-L61-3b", slug = "cli-write-classified-through-real-writer"
+        let dir = "\(selfTestRoot)/ac-l61-3b"
+        try? FileManager.default.removeItem(atPath: dir)
+        let profilesDir = "\(dir)/profiles"
+        let markerDir = "\(dir)/cli-writes"
+
+        return CLIWriteMarker.withDirectory(markerDir) {
+            /// Simulates a `limpet profile set`/`create` write: note the marker
+            /// for the exact bytes about to be written, THEN write them — the
+            /// same order `LimpetCLI`'s `writeProfile` closure uses, calling the
+            /// SAME `ProfileStore.writeProfileFile` the CLI does.
+            ///
+            /// `ProfileStore.writeProfileFile` also notes the write in
+            /// `ConfigSelfWriteRegistry` — correct for the app's own writes, and
+            /// harmless in production for the CLI's, since the CLI runs as its
+            /// OWN process with its OWN registry instance, never the running
+            /// app's. This self-test runs everything in one process, so that
+            /// note would otherwise pollute the very registry
+            /// `ConfigFileWatcher.classifyWrite` checks first, making a marker
+            /// hit look like a same-process self-write instead — undo exactly
+            /// that one entry, restoring the cross-process reality.
+            func cliWrite(_ profile: SyncProfile) -> String? {
+                guard let data = ProfileStore.encodedProfileFileData(profile) else { return nil }
+                let hash = ConfigSelfWriteRegistry.hash(data)
+                CLIWriteMarker.note(contentHash: hash)
+                let filename = ProfileStore.writeProfileFile(profile, in: profilesDir)
+                _ = ConfigSelfWriteRegistry.shared.consumeIfSelfWrite(contentHash: hash)
+                return filename
+            }
+
+            var existing = sampleProfile(name: "Existing", isEnabled: true)
+            guard ProfileStore.writeProfileFile(existing, in: profilesDir) != nil else {
+                return report(id, slug, false, "(fixture write failed)")
+            }
+            existing.name = "Existing renamed"
+            let existingPath = "\(profilesDir)/\(existing.shortId).profile.json"
+            guard cliWrite(existing) != nil else {
+                return report(id, slug, false, "(cliWrite of the update failed)")
+            }
+            guard ConfigFileWatcher.classifyWrite(forFileAt: existingPath) == .cliWrite else {
+                return report(id, slug, false, "(a marked update was not classified .cliWrite)")
+            }
+
+            let created = sampleProfile(name: "Created", isEnabled: true)
+            let createdPath = "\(profilesDir)/\(created.shortId).profile.json"
+            guard cliWrite(created) != nil else {
+                return report(id, slug, false, "(cliWrite of the create failed)")
+            }
+            guard ConfigFileWatcher.classifyWrite(forFileAt: createdPath) == .cliWrite else {
+                return report(id, slug, false, "(a marked create was not classified .cliWrite)")
+            }
+
+            return report(id, slug, true)
+        }
+    }
+
+    // MARK: - AC-L61-4 — .syncAlreadyRunning reduces to .syncing
+
+    /// limpet-plan.md L6.1 change C, root cause 3. Mutation: reverting the
+    /// `.syncAlreadyRunning` case added to `SyncManager.reduceProfileState`
+    /// (and the matching `processLogEvent` branch) must fail this.
+    private static func testSyncAlreadyRunningSetsSyncing() -> Bool {
+        let id = "AC-L61-4", slug = "sync-already-running-sets-syncing"
+        let result = SyncManager.reduceProfileState(.idle, for: .syncAlreadyRunning)
+        guard result == .syncing else {
+            return report(id, slug, false, "(.syncAlreadyRunning reduced .idle to \(result), expected .syncing)")
+        }
+        // Idempotent from an already-syncing state too.
+        let result2 = SyncManager.reduceProfileState(.syncing, for: .syncAlreadyRunning)
+        guard result2 == .syncing else {
+            return report(id, slug, false, "(.syncAlreadyRunning reduced .syncing to \(result2), expected .syncing)")
+        }
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L61-5 — install throws when launchctl load fails
+
+    /// limpet-plan.md L6.1 change B. Injects a `loadCommand` that fails
+    /// WITHOUT ever invoking real `launchctl` (a hard limit for this repo).
+    /// Mutation: reverting `install`'s exit-status check back to `_ = ...`
+    /// must fail this.
+    private static func testInstallThrowsOnLaunchctlLoadFailure() -> Bool {
+        let id = "AC-L61-5", slug = "install-throws-on-launchctl-load-failure"
+        let dir = "\(selfTestRoot)/ac-l61-5"
+        try? FileManager.default.removeItem(atPath: dir)
+        var profile = sampleProfile(name: "LoadFails", isEnabled: true)
+        profile.localSyncPath = "\(dir)/local"
+        try? FileManager.default.createDirectory(atPath: profile.localSyncPath, withIntermediateDirectories: true)
+
+        do {
+            try SyncSetupService.shared.install(
+                profile: profile,
+                loadAgent: true,
+                executablePath: "/Applications/limpet.app/Contents/MacOS/limpet",  // not translocated
+                otherProfiles: [],
+                isInstalled: { _ in false },
+                loadCommand: { _ in (output: "launchctl: could not find service", exitCode: 3) })
+            return report(id, slug, false, "(install did not throw on a failing loadCommand)")
+        } catch SyncSetupService.SetupError.launchAgentLoadFailed(let exitCode, let output) {
+            guard exitCode == 3, output.contains("could not find service") else {
+                return report(id, slug, false, "(wrong error payload: exit=\(exitCode) output=\(output))")
+            }
+        } catch {
+            return report(id, slug, false, "(threw the wrong error: \(error))")
+        }
+
+        // A succeeding loadCommand must not throw.
+        do {
+            try SyncSetupService.shared.install(
+                profile: profile, loadAgent: true,
+                executablePath: "/Applications/limpet.app/Contents/MacOS/limpet",
+                otherProfiles: [], isInstalled: { _ in false },
+                loadCommand: { _ in (output: "", exitCode: 0) })
+        } catch {
+            return report(id, slug, false, "(install threw on a succeeding loadCommand: \(error))")
+        }
+
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L61-6 — SIGTERM's killpg helper on a real spawned process group
+
+    /// limpet-plan.md L6.1 change B. `SyncWatchDaemon.run` never returns
+    /// (`dispatchMain()`), so driving its actual `DispatchSource` SIGTERM
+    /// handler in-process is not possible here; per the plan, this instead
+    /// drives the extracted `terminateChildProcessGroup` helper against a
+    /// process group THIS test spawns itself (never touching a real watcher or
+    /// sync). UNTESTED by this: that a real SIGTERM delivered to a running
+    /// `limpet watch` process actually invokes this helper before exiting —
+    /// that wiring (`signal`+`DispatchSource.makeSignalSource` in `run`) is
+    /// covered only by code review and the live check in the plan's Acceptance.
+    private static func testTerminateChildProcessGroupKillsRealGroup() -> Bool {
+        let id = "AC-L61-6", slug = "terminate-child-process-group"
+        let dir = "\(selfTestRoot)/ac-l61-6"
+        try? FileManager.default.removeItem(atPath: dir)
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+
+        // A fake "sync child": a script that is its own process-group leader
+        // (Foundation's Process spawns a new process group by default — the
+        // same fact the plan measured live for the real sync script) and
+        // spawns a `sleep` grandchild in that same group.
+        let scriptPath = "\(dir)/fake-child.sh"
+        let script = "#!/bin/bash\nsleep 30 &\nwait\n"
+        guard (try? script.write(toFile: scriptPath, atomically: true, encoding: .utf8)) != nil,
+              (try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: scriptPath)) != nil
+        else {
+            return report(id, slug, false, "(failed to write the fake child script)")
+        }
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/bash")
+        process.arguments = [scriptPath]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+        } catch {
+            return report(id, slug, false, "(failed to spawn the fake child: \(error))")
+        }
+        let pgid = process.processIdentifier
+
+        // Give the grandchild `sleep` a moment to actually start before we
+        // terminate the group — otherwise this could pass by accident (nothing
+        // spawned yet to leak).
+        Thread.sleep(forTimeInterval: 0.3)
+        guard killpg(pgid, 0) == 0 else {
+            process.waitUntilExit()
+            return report(id, slug, false, "(the fake child's process group was already gone before terminating it)")
+        }
+
+        SyncWatchDaemon.terminateChildProcessGroup(pid: pgid)
+
+        var groupGone = false
+        for _ in 0..<20 {  // up to 2s, matching the plan's acceptance window
+            if killpg(pgid, 0) != 0 { groupGone = true; break }
+            Thread.sleep(forTimeInterval: 0.1)
+        }
+        process.waitUntilExit()  // reap; this test spawned it, so this is the one process it may wait on
+
+        guard groupGone else {
+            return report(id, slug, false, "(script and/or sleep grandchild still alive 2s after terminateChildProcessGroup)")
+        }
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L61-7 — the spawn/termination race closes without an orphan
+
+    /// limpet-plan.md L6.1 change B, code-review finding 7. Drives
+    /// `RunningChildState`'s pure decisions directly — every method returns a
+    /// decision rather than calling `killpg`/`exit` itself, specifically so
+    /// this test can exercise the exact race (SIGTERM arriving between
+    /// `beginSpawning()` and `spawned(pid:)`) without ever calling real
+    /// `exit()` on the self-test process itself.
+    private static func testSpawnTerminationRaceClosesWithoutOrphan() -> Bool {
+        let id = "AC-L61-7", slug = "spawn-termination-race"
+
+        // Idle: nothing running or spawning — terminate now.
+        let idleState = RunningChildState()
+        guard idleState.requestTermination() == .exitNow else {
+            return report(id, slug, false, "(idle state did not decide .exitNow)")
+        }
+
+        // A child already running when termination is requested — kill+exit directly.
+        let runningState = RunningChildState()
+        runningState.beginSpawning()
+        guard runningState.spawned(pid: 555) == .ok else {
+            return report(id, slug, false, "(spawned(pid:) fired early with no pending termination)")
+        }
+        guard runningState.requestTermination() == .killAndExit(555) else {
+            return report(id, slug, false, "(a running child did not decide .killAndExit)")
+        }
+
+        // THE RACE: termination requested while `.spawning`, before the PID is
+        // known. The handler must `.wait` (not exit — nothing to kill yet, and
+        // exiting here would orphan the process `spawned(pid:)` is about to
+        // record). `spawned(pid:)` must then finish the job the instant it has
+        // a PID — this is exactly what closes the finding 7 window.
+        let raceState = RunningChildState()
+        raceState.beginSpawning()
+        guard raceState.requestTermination() == .wait else {
+            return report(id, slug, false, "(a mid-spawn termination request did not decide .wait)")
+        }
+        guard raceState.spawned(pid: 4242) == .killAndExitNow(4242) else {
+            return report(id, slug, false, "(spawned(pid:) after a pending termination did not decide to kill+exit)")
+        }
+
+        // A spawn that fails (`pid: nil`) after a pending termination has
+        // nothing to kill, but MUST still decide to exit — verifier gap 2:
+        // without this, `requestTermination` already returned `.wait` (so the
+        // handler did not exit) and a failed spawn used to report `.ok` (so
+        // this call did not exit either), leaving the watcher alive until a
+        // second signal or launchd's own SIGKILL.
+        let failedSpawnState = RunningChildState()
+        failedSpawnState.beginSpawning()
+        guard failedSpawnState.requestTermination() == .wait else {
+            return report(id, slug, false, "(setup: expected .wait)")
+        }
+        guard failedSpawnState.spawned(pid: nil) == .exitNow else {
+            return report(id, slug, false, "(a failed spawn after a pending termination did not decide to exit)")
+        }
+
+        // Contrast: a failed spawn with NO pending termination must not exit.
+        let failedSpawnNoTermination = RunningChildState()
+        failedSpawnNoTermination.beginSpawning()
+        guard failedSpawnNoTermination.spawned(pid: nil) == .ok else {
+            return report(id, slug, false, "(a failed spawn with no pending termination wrongly decided to exit)")
+        }
+
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L61-8 — CLIWriteMarker.consume ignores non-hex-64 filenames
+
+    /// limpet-plan.md L6.1 change A, code-review finding 6. `note()`'s atomic
+    /// write (`String.write(toFile:atomically:true,…)`) briefly creates a
+    /// differently-named temp file in the SAME directory before renaming it
+    /// into place, and that temp file can be caught by a directory listing
+    /// with its content only PARTIALLY written (a real atomic-write race, not
+    /// simulated content). The previous version's blanket "unparseable →
+    /// delete" cleanup in `consume()` would delete such a file out from under
+    /// the write it belongs to; the fix restricts that cleanup to names that
+    /// are actually 64 lowercase hex characters, so a temp file — under any
+    /// name `note()` could ever give one — is never even inspected, whatever
+    /// its content looks like at the moment of the race. Simulates exactly
+    /// the historical failure mode: a non-hex-64-named file with GARBAGE
+    /// (unparseable-as-timestamp) content, which the OLD code's
+    /// content-parse-failure branch deleted unconditionally.
+    private static func testCLIWriteMarkerIgnoresNonHashFilenames() -> Bool {
+        let id = "AC-L61-8", slug = "cli-write-marker-ignores-non-hash-filenames"
+        let dir = "\(selfTestRoot)/ac-l61-8"
+        try? FileManager.default.removeItem(atPath: dir)
+        let markerDir = "\(dir)/cli-writes"
+        let fm = FileManager.default
+
+        return CLIWriteMarker.withDirectory(markerDir) {
+            try? fm.createDirectory(atPath: markerDir, withIntermediateDirectories: true)
+
+            // A transient temp-file-shaped name (what an atomic write's rename
+            // source looks like) caught mid-write: garbage, unparseable content.
+            let tempPath = "\(markerDir)/.note.tmp.\(UUID().uuidString)"
+            guard fm.createFile(atPath: tempPath, contents: Data("not-a-timestamp".utf8)) else {
+                return report(id, slug, false, "(failed to write the temp-file fixture)")
+            }
+
+            // A real marker for an unrelated hash, so `consume` has something
+            // legitimate to do on the same call.
+            let unrelated = String(repeating: "a", count: 64)
+            CLIWriteMarker.note(contentHash: unrelated)
+
+            // Look up a hash that was never noted — `consume` returns false,
+            // but must still run its sweep pass over the directory.
+            let neverNoted = String(repeating: "b", count: 64)
+            guard CLIWriteMarker.consume(hash: neverNoted) == false else {
+                return report(id, slug, false, "(consume matched a hash that was never noted)")
+            }
+
+            guard fm.fileExists(atPath: tempPath) else {
+                return report(id, slug, false, "(consume deleted a non-hex-64-named file in the marker directory)")
+            }
+            guard CLIWriteMarker.consume(hash: unrelated) else {
+                return report(id, slug, false, "(the unrelated real marker was not left intact/consumable)")
+            }
+
+            return report(id, slug, true)
+        }
+    }
+
+    // MARK: - AC-L61-9 — install refreshes an already-loaded agent and cleans up a failed load
+
+    /// limpet-plan.md L6.1 change B, code-review finding 4. Both halves use
+    /// ONLY injected closures — `isLoadedCheck`/`unloadCommand`/`loadCommand`
+    /// — never real `launchctl`.
+    private static func testInstallRefreshesLoadedAgentAndCleansUpFailure() -> Bool {
+        let id = "AC-L61-9", slug = "install-refreshes-loaded-agent-cleans-up-failure"
+        let dir = "\(selfTestRoot)/ac-l61-9"
+        try? FileManager.default.removeItem(atPath: dir)
+        var profile = sampleProfile(name: "Reload", isEnabled: true)
+        profile.localSyncPath = "\(dir)/local"
+        try? FileManager.default.createDirectory(atPath: profile.localSyncPath, withIntermediateDirectories: true)
+
+        // (a) Already loaded: install must unload BEFORE loading, so `load`
+        // always starts fresh rather than being a no-op over a stale agent.
+        var callOrder: [String] = []
+        do {
+            try SyncSetupService.shared.install(
+                profile: profile, loadAgent: true,
+                executablePath: "/Applications/limpet.app/Contents/MacOS/limpet",
+                otherProfiles: [], isInstalled: { _ in false },
+                loadCommand: { _ in callOrder.append("load"); return (output: "", exitCode: 0) },
+                isLoadedCheck: { _ in true },
+                unloadCommand: { _ in callOrder.append("unload"); return (output: "", exitCode: 0) })
+        } catch {
+            return report(id, slug, false, "(install threw unexpectedly: \(error))")
+        }
+        guard callOrder == ["unload", "load"] else {
+            return report(id, slug, false, "(call order was \(callOrder), expected [unload, load])")
+        }
+
+        // Not loaded: no unload call at all.
+        callOrder = []
+        do {
+            try SyncSetupService.shared.install(
+                profile: profile, loadAgent: true,
+                executablePath: "/Applications/limpet.app/Contents/MacOS/limpet",
+                otherProfiles: [], isInstalled: { _ in false },
+                loadCommand: { _ in callOrder.append("load"); return (output: "", exitCode: 0) },
+                isLoadedCheck: { _ in false },
+                unloadCommand: { _ in callOrder.append("unload"); return (output: "", exitCode: 0) })
+        } catch {
+            return report(id, slug, false, "(install threw unexpectedly: \(error))")
+        }
+        guard callOrder == ["load"] else {
+            return report(id, slug, false, "(call order was \(callOrder), an unnecessary unload ran)")
+        }
+
+        // (b) A failed load must remove the plist it just wrote — otherwise
+        // `agentInstalled`/`isInstalled` reports true with no agent actually
+        // loaded, and the F6 overlap check would count it as a real opponent.
+        // (a) above installed successfully, so a plist is on disk; remove it
+        // to isolate this half's own fixture.
+        try? FileManager.default.removeItem(atPath: profile.plistPath)
+        do {
+            try SyncSetupService.shared.install(
+                profile: profile, loadAgent: true,
+                executablePath: "/Applications/limpet.app/Contents/MacOS/limpet",
+                otherProfiles: [], isInstalled: { _ in false },
+                loadCommand: { _ in (output: "boom", exitCode: 1) },
+                isLoadedCheck: { _ in false },
+                unloadCommand: { _ in (output: "", exitCode: 0) })
+            return report(id, slug, false, "(install did not throw on a failing load)")
+        } catch SyncSetupService.SetupError.launchAgentLoadFailed {
+            // expected
+        } catch {
+            return report(id, slug, false, "(threw the wrong error: \(error))")
+        }
+        guard FileManager.default.fileExists(atPath: profile.plistPath) == false else {
+            return report(id, slug, false, "(the plist was left behind after a failed load)")
+        }
+
+        // (c) CodeRabbit PR #9: a loaded agent that fails to unload must not be
+        // "replaced" by a load on top of it — install throws and never loads.
+        callOrder = []
+        do {
+            try SyncSetupService.shared.install(
+                profile: profile, loadAgent: true,
+                executablePath: "/Applications/limpet.app/Contents/MacOS/limpet",
+                otherProfiles: [], isInstalled: { _ in false },
+                loadCommand: { _ in callOrder.append("load"); return (output: "", exitCode: 0) },
+                isLoadedCheck: { _ in true },
+                unloadCommand: { _ in callOrder.append("unload"); return (output: "busy", exitCode: 5) })
+            return report(id, slug, false, "(install did not throw on a failing unload)")
+        } catch SyncSetupService.SetupError.launchAgentUnloadFailed {
+            // expected
+        } catch {
+            return report(id, slug, false, "(threw the wrong error on a failing unload: \(error))")
+        }
+        guard callOrder == ["unload"] else {
+            return report(id, slug, false, "(call order after a failing unload was \(callOrder), expected [unload] only)")
+        }
+
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L61-10 — a marker-hit CLI write, through the REAL ConfigFileWatcher event path
+
+    /// limpet-plan.md L6.1 v3.1/v3.2 acceptance; verifier gap 1. AC-L61-1 and
+    /// AC-L61-3/3b call `ConfigFileWatcher.classifyWrite` directly — a pure
+    /// function M1 (`case .cliWrite: classify(...)` → `case .cliWrite:
+    /// continue` inside `processChangedPaths`) never touches, so those tests
+    /// cannot fail it. This test drives a REAL `ConfigFileWatcher` — real
+    /// FSEvents, real debounce, real `processChangedPaths` dispatch — pointed
+    /// at a temp directory under `LimpetPaths.home` (never the real
+    /// `~/.config/limpet`), and its `onProfileChange` callback runs the SAME
+    /// static dispatch `SyncManager.applyExternalProfileEdit`/
+    /// `applyExternalProfileCreate` build from (`SyncManager.reconcileClosures`
+    /// + `SyncManager.applyExternalEdit`/`applyExternalCreateIfNeeded`) against
+    /// a REAL `ProfileStore` on that same temp directory — the fallback the
+    /// plan names when wiring to the production `SyncManager` methods directly
+    /// isn't possible headlessly (a full `SyncManager` starts its own
+    /// `ConfigFileWatcher`/workspace observer/LogWatchers, which this
+    /// codebase's self-tests deliberately avoid standing up — see the
+    /// pre-existing comment on `AC-L5-2`).
+    ///
+    /// Real FSEvents delivery + debounce lands `processChangedPaths` on
+    /// `DispatchQueue.main.async`; `ConfigSelfTest.run()` never spins the main
+    /// run loop (self-test exits before `LimpetApp`'s SwiftUI run loop ever
+    /// starts), so this test pumps it itself in short bursts
+    /// (`pumpMainRunLoop`) until the callback fires or a timeout passes — the
+    /// standard way to let real async delegate/closure callbacks run inside a
+    /// synchronous test process.
+    private static func testConfigFileWatcherRealDispatchOnCLIMarkerHit() -> Bool {
+        let id = "AC-L61-10", slug = "config-file-watcher-real-dispatch-cli-marker-hit"
+        let watchDir = "\(LimpetPaths.home)/ac-l61-10-watch"
+        try? FileManager.default.removeItem(atPath: watchDir)
+        guard (try? FileManager.default.createDirectory(
+            atPath: watchDir, withIntermediateDirectories: true)) != nil else {
+            return report(id, slug, false, "(failed to create the watch directory fixture)")
+        }
+
+        let store = ProfileStore(
+            profilesDirectory: watchDir,
+            defaults: UserDefaults(suiteName: "com.nanako.limpet.selftest.ac-l61-10.\(UUID().uuidString)")!)
+
+        var setupInstallCalls = 0, setupUninstallCalls = 0
+        var dispatchedCalls: [(path: String, suppressReconcile: Bool)] = []
+
+        /// EXACTLY the dispatch `SyncManager.applyExternalProfileEdit`/
+        /// `applyExternalProfileCreate` build — `reconcileClosures` decides
+        /// which of the four closures run, `applyExternalEdit`/
+        /// `applyExternalCreateIfNeeded` are the same static functions
+        /// production calls. No test-local re-implementation of the SUPPRESS
+        /// decision itself (that would just repeat AC-L61-3's mistake) — this
+        /// test's only job is proving the REAL watcher reaches this code at
+        /// all on a `.cliWrite`, which M1 breaks.
+        let watcher = ConfigFileWatcher(
+            watchedDirectory: watchDir,
+            debounceInterval: 0.3,
+            onProfileChange: { path, suppressReconcile in
+                dispatchedCalls.append((path, suppressReconcile))
+                guard let data = FileManager.default.contents(atPath: path) else { return }
+                let (install, uninstall) = SyncManager.reconcileClosures(
+                    suppressReconcile: suppressReconcile,
+                    setupInstall: { _ in setupInstallCalls += 1 },
+                    setupUninstall: { _ in setupUninstallCalls += 1 },
+                    watchStart: { _ in }, watchStop: { _ in })
+                let outcome = SyncManager.applyExternalEdit(
+                    data: data, path: path,
+                    known: { store.profile(for: $0) },
+                    others: [], isInstalled: { _ in true },
+                    persist: { store.update($0) },
+                    install: install, uninstall: uninstall,
+                    reportError: { _, _ in })
+                if case .create(let decoded) = outcome {
+                    _ = SyncManager.applyExternalCreateIfNeeded(
+                        decoded: decoded, isKnownId: false, existing: [],
+                        isInstalled: { _ in true },
+                        persist: { store.add($0) },
+                        install: { try? install($0) },
+                        quarantine: { _ in })
+                }
+            },
+            onSettingsChange: {})
+        watcher.start()
+        defer { watcher.stop() }
+
+        /// Pumps the main run loop in short bursts until `condition` is true
+        /// or `timeout` elapses — see the type doc for why this is needed at
+        /// all (the self-test process never otherwise spins the main run loop).
+        func pumpMainRunLoop(timeout: TimeInterval, until condition: () -> Bool) -> Bool {
+            let deadline = Date().addingTimeInterval(timeout)
+            while !condition() && Date() < deadline {
+                RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+            }
+            return condition()
+        }
+
+        /// Simulates a `limpet profile set`/`create` write: notes the marker
+        /// for the exact bytes about to be written (at `CLIWriteMarker`'s
+        /// AMBIENT `directory` — the real default, under this run's redirected
+        /// `LimpetPaths.home`, exactly what the production CLI process would
+        /// use; no `withDirectory` override needed or wanted here), THEN
+        /// writes them — `LimpetCLI`'s `writeProfile` closure's exact order,
+        /// through the SAME `ProfileStore.writeProfileFile`.
+        func cliWrite(_ profile: SyncProfile) -> Bool {
+            guard let data = ProfileStore.encodedProfileFileData(profile) else { return false }
+            let hash = ConfigSelfWriteRegistry.hash(data)
+            CLIWriteMarker.note(contentHash: hash)
+            let ok = ProfileStore.writeProfileFile(profile, in: watchDir) != nil
+            // Same one-entry undo AC-L61-3b documents: this self-test runs the
+            // "CLI" write and the "app" watcher in ONE process, so
+            // `writeProfileFile`'s OWN self-write registry note (correct
+            // in production, where the CLI is a separate process with its own
+            // registry) would otherwise mask this exact marker hit as a
+            // same-process self-write instead.
+            _ = ConfigSelfWriteRegistry.shared.consumeIfSelfWrite(contentHash: hash)
+            return ok
+        }
+
+        // --- set on an existing id ---
+        var existing = sampleProfile(name: "Existing")
+        store.add(existing)  // a real app write: no marker, direct
+        existing.name = "Existing renamed"
+        guard cliWrite(existing) else {
+            return report(id, slug, false, "(cliWrite of the update failed)")
+        }
+        guard pumpMainRunLoop(timeout: 5, until: { dispatchedCalls.count >= 1 }) else {
+            return report(id, slug, false, "(the real watcher never dispatched the update within 5s)")
+        }
+        guard dispatchedCalls[0].suppressReconcile else {
+            return report(id, slug, false, "(the update was dispatched with suppressReconcile=false)")
+        }
+        guard store.profile(for: existing.id)?.name == "Existing renamed" else {
+            return report(id, slug, false, "(profileStore did not reflect the CLI update)")
+        }
+
+        // --- create with a new id ---
+        let created = sampleProfile(name: "Created")
+        guard cliWrite(created) else {
+            return report(id, slug, false, "(cliWrite of the create failed)")
+        }
+        guard pumpMainRunLoop(timeout: 5, until: { dispatchedCalls.count >= 2 }) else {
+            return report(id, slug, false, "(the real watcher never dispatched the create within 5s)")
+        }
+        guard dispatchedCalls[1].suppressReconcile else {
+            return report(id, slug, false, "(the create was dispatched with suppressReconcile=false)")
+        }
+        guard store.profile(for: created.id) == created else {
+            return report(id, slug, false, "(profileStore did not reflect the CLI create)")
+        }
+
+        guard setupInstallCalls == 0, setupUninstallCalls == 0 else {
+            return report(
+                id, slug, false,
+                "(a marker hit ran a real SyncSetupService call: install=\(setupInstallCalls) uninstall=\(setupUninstallCalls))")
         }
 
         return report(id, slug, true)
