@@ -70,7 +70,6 @@ final class SyncManager: ObservableObject {
         setupWorkspaceObserver()
         setupProfileObserver()
         setupService.refreshSharedScriptIfChanged()  // Propagate script template updates
-        detectAndResumeRunningSyncs()  // Detect a sync the watcher already has in flight
         checkInitialState()
         startWatchingAllProfiles()
         refreshSettingsFile()
@@ -385,9 +384,13 @@ final class SyncManager: ObservableObject {
     ///   double-reload the same agent for one edit.
     func applyExternalProfileEdit(fromFileAt path: String, suppressReconcile: Bool = false) {
         guard let data = FileManager.default.contents(atPath: path) else { return }
-        let install: (SyncProfile) throws -> Void = suppressReconcile ? { _ in } : { [self] in try installAndWatch($0) }
-        let uninstall: (SyncProfile) throws -> Void = suppressReconcile
-            ? { _ in } : { [self] in try uninstallAndStopWatching($0) }
+        let (install, uninstall) = Self.reconcileClosures(
+            suppressReconcile: suppressReconcile,
+            setupInstall: { [self] in try setupService.install(profile: $0) },
+            setupUninstall: { [self] in try setupService.uninstall(profile: $0) },
+            watchStart: { [self] in startWatching(profile: $0) },
+            watchStop: { [self] in stopWatching(profileId: $0.id) }
+        )
         let outcome = Self.applyExternalEdit(
             data: data,
             path: path,
@@ -446,15 +449,22 @@ final class SyncManager: ObservableObject {
             },
             // suppressReconcile (limpet-plan.md L6.1 change A): a `limpet
             // profile create` from the CLI already installed the agent itself,
-            // through the SAME `SyncSetupService.install`. `persist` above still
-            // runs — `profileStore.add`'s `$profiles` sink starts a `LogWatcher`
-            // for the new profile via `startWatchingAllProfiles`, with no
-            // install/launchctl call from this process.
+            // through the SAME `SyncSetupService.install` — the shared
+            // `reconcileClosures` dispatch (finding 5) skips `setupInstall` on a
+            // marked write but always runs `watchStart`. `persist` above already
+            // starts a `LogWatcher` for the new profile via `profileStore.add`'s
+            // `$profiles` sink, so this `watchStart` is a harmless re-assignment,
+            // not a second install/launchctl call.
             install: { [weak self] profile in
-                guard !suppressReconcile else { return }
+                guard let self else { return }
                 do {
-                    try self?.setupService.install(profile: profile)
-                    self?.startWatching(profile: profile)
+                    try Self.reconcileClosures(
+                        suppressReconcile: suppressReconcile,
+                        setupInstall: { try self.setupService.install(profile: $0) },
+                        setupUninstall: { _ in },  // unreachable: create never uninstalls
+                        watchStart: { self.startWatching(profile: $0) },
+                        watchStop: { _ in }  // unreachable: create never stops watching
+                    ).install(profile)
                 } catch {
                     print("Failed to install newly-created external profile: \(error)")
                 }
@@ -756,20 +766,18 @@ final class SyncManager: ObservableObject {
         return pid
     }
 
-    /// Detect running syncs at startup and start monitoring them
-    private func detectAndResumeRunningSyncs() {
-        for profile in profileStore.enabledProfiles {
-            if let pid = detectRunningSyncPID(for: profile) {
-                profileStates[profile.id] = .syncing
-                monitoringExternalSyncs.insert(profile.id)
-                startPollingForSyncCompletion(profile: profile, pid: pid)
-            }
-        }
-        updateAggregateState()
-    }
-
-    /// Poll until the sync process exits
+    /// Poll until the sync process exits. code-review finding 1: cancels any
+    /// existing poller for this profile FIRST — `startWatching` (the lock check
+    /// at (re)start) and `.syncAlreadyRunning` (a lock-held log line, finding 3)
+    /// can both want to start one for the same profile; without this, the
+    /// second call replaces `syncCompletionPollers[id]` and leaks the first
+    /// timer, which keeps firing (and can later race the real completion) —
+    /// this is the single choke point that makes every caller safe to call
+    /// unconditionally, rather than relying on each caller's own
+    /// `monitoringExternalSyncs` check to be perfectly race-free.
     private func startPollingForSyncCompletion(profile: SyncProfile, pid: Int32) {
+        syncCompletionPollers[profile.id]?.cancel()
+
         let timer = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
         timer.schedule(deadline: .now() + 3, repeating: 3.0)
 
@@ -836,14 +844,19 @@ final class SyncManager: ObservableObject {
         }
     }
 
-    /// (limpet-plan.md L6.1 change C, root cause 3.) Runs the SAME lock-file
-    /// check `detectAndResumeRunningSyncs` does at launch, so a profile whose
-    /// watching (re)starts later — e.g. after a `.reinstall` reconcile tears
-    /// down and rebuilds its `LogWatcher` — sees a sync already in flight
-    /// instead of defaulting to `.idle` and staying wrong until that sync
-    /// happens to log a line. `monitoringExternalSyncs` is checked first so a
-    /// sync launch already detected (and already being polled) never gets a
-    /// second poller.
+    /// (limpet-plan.md L6.1 change C, root cause 3.) Runs a lock-file check
+    /// EVERY time a profile's watching (re)starts — at launch (via
+    /// `setupProfileObserver`'s `$profiles` sink, which fires synchronously with
+    /// the already-loaded profiles as soon as it subscribes in `init`) and again
+    /// whenever `startWatchingAllProfiles` rebuilds a `LogWatcher` after a
+    /// `.reinstall` reconcile tore one down — so a sync already in flight is
+    /// never mistaken for idle until it happens to log a line. This one check
+    /// used to be duplicated by a separate `detectAndResumeRunningSyncs` called
+    /// once at the end of `init`; that duplicate leaked a `syncCompletionPollers`
+    /// timer every launch (code-review finding 1) and was deleted, since this
+    /// function already covers it — `startPollingForSyncCompletion` itself now
+    /// also cancels any prior timer for the profile, so no caller here needs to
+    /// be perfectly race-free on its own.
     private func startWatching(profile: SyncProfile) {
         let watcher = LogWatcher(logPath: profile.logPath)
         watcher.delegate = self
@@ -858,7 +871,9 @@ final class SyncManager: ObservableObject {
                 startPollingForSyncCompletion(profile: profile, pid: pid)
             }
         } else if profileStates[profile.id] == .syncing {
-            // Set by `detectAndResumeRunningSyncs` moments ago, at launch.
+            // A caller elsewhere (e.g. a manual "sync now") already marked this
+            // profile syncing before this (re)start — keep polling fast rather
+            // than resetting to idle underneath it.
             watcher.setActivelySyncing(true)
         } else {
             profileStates[profile.id] = .idle
@@ -1148,6 +1163,16 @@ final class SyncManager: ObservableObject {
             // pairing started watching) — show it, through the same pure reducer
             // `.syncStarted`/`.syncCompleted` use.
             profileStates[profileId] = Self.reduceProfileState(profileStates[profileId] ?? .idle, for: event.type)
+            // code-review finding 3: without a poller, this sticks at `.syncing`
+            // forever if the lock holder dies without ever writing a completion
+            // line — more likely now that change B's SIGTERM handler can end a
+            // run abruptly. `monitoringExternalSyncs` makes this a no-op when a
+            // poller for this profile is already running.
+            if !monitoringExternalSyncs.contains(profileId),
+               let profile, let pid = detectRunningSyncPID(for: profile) {
+                monitoringExternalSyncs.insert(profileId)
+                startPollingForSyncCompletion(profile: profile, pid: pid)
+            }
 
         case .sourceMissing(let path):
             // Menu only (L5.0) — no notification. Clears through the existing

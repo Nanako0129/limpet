@@ -31,6 +31,42 @@ enum ExternalCreateOutcome: Equatable {
 }
 
 extension SyncManager {
+    /// Builds the `install`/`uninstall` closures `applyExternalProfileEdit` and
+    /// `applyExternalProfileCreate` hand to `applyExternalEdit`/
+    /// `applyExternalCreateIfNeeded` (limpet-plan.md L6.1 change A/code-review
+    /// finding 2/5) — the ONE place that decides what a CLI-marked write skips.
+    ///
+    /// On a CLI-marked write (`suppressReconcile == true`) the `limpet` CLI
+    /// process already drove `SyncSetupService` itself, so `setupInstall`/
+    /// `setupUninstall` are skipped; `watchStart`/`watchStop` (the in-app
+    /// `LogWatcher`/`profileStates` bookkeeping) ALWAYS run regardless, so the
+    /// app's own state never goes stale relative to a CLI-driven change. The
+    /// previous version replaced the ENTIRE `installAndWatch`/
+    /// `uninstallAndStopWatching` calls with no-ops, so a CLI `profile disable`
+    /// of a syncing or errored profile left `logWatchers`/`profileStates`
+    /// pointing at an agent that no longer existed (finding 2). Extracted as its
+    /// own static function (rather than inlined per caller) so a self-test can
+    /// exercise the dispatch itself — collapsing `.cliWrite` into `.skip`
+    /// upstream, or inverting this ternary, is exactly the class of regression
+    /// AC-L61-3 mutation-checks.
+    nonisolated static func reconcileClosures(
+        suppressReconcile: Bool,
+        setupInstall: @escaping (SyncProfile) throws -> Void,
+        setupUninstall: @escaping (SyncProfile) throws -> Void,
+        watchStart: @escaping (SyncProfile) -> Void,
+        watchStop: @escaping (SyncProfile) -> Void
+    ) -> (install: (SyncProfile) throws -> Void, uninstall: (SyncProfile) throws -> Void) {
+        let install: (SyncProfile) throws -> Void = { profile in
+            if !suppressReconcile { try setupInstall(profile) }
+            watchStart(profile)
+        }
+        let uninstall: (SyncProfile) throws -> Void = { profile in
+            if !suppressReconcile { try setupUninstall(profile) }
+            watchStop(profile)
+        }
+        return (install, uninstall)
+    }
+
     /// Decide whether an external `*.profile.json` drop bootstraps a NEW
     /// profile, and dispatch the persist/install side effects via injected
     /// closures — the SAME pure-decision-plus-injected-closure idiom as

@@ -151,7 +151,8 @@ enum ConfigSelfTest {
             testExitCodeErrorText,
             testCLIWriteMarkerClassification,
             testAppWritesLeaveMarkerDirEmpty,
-            testCLIMarkerSuppressesReconcile,
+            testReconcileClosuresDispatch,
+            testCLIWriteClassifiedThroughRealWriter,
             testSyncAlreadyRunningSetsSyncing,
             testInstallThrowsOnLaunchctlLoadFailure,
             testTerminateChildProcessGroupKillsRealGroup,
@@ -4072,28 +4073,84 @@ enum ConfigSelfTest {
         }
     }
 
-    // MARK: - AC-L61-3 — a marker-hit CLI write refreshes profileStore, no reconcile
+    // MARK: - AC-L61-3 — reconcileClosures: the ONE place a marker hit skips launchd, never watch bookkeeping
 
-    /// limpet-plan.md L6.1 change A. Mirrors the exact dispatch
-    /// `ConfigFileWatcher`/`SyncManager.applyExternalProfileEdit` do in
-    /// production: classify the write, and only on `.cliWrite` replace
-    /// install/uninstall with no-ops before calling the SAME
-    /// `applyExternalEdit`/`applyExternalCreateIfNeeded` used for every other
-    /// write. Mutation: collapsing `.cliWrite` into `.skip` in that dispatch
-    /// (the existing self-write early return) must fail this test — the
-    /// `skippedEntirely` guard below exists for exactly that mutation.
-    private static func testCLIMarkerSuppressesReconcile() -> Bool {
-        let id = "AC-L61-3", slug = "cli-write-suppresses-reconcile"
-        let dir = "\(selfTestRoot)/ac-l61-3"
+    /// limpet-plan.md L6.1 change A, code-review findings 2 and 5. Exercises
+    /// the extracted `SyncManager.reconcileClosures` directly — the ONE
+    /// production seam that decides, given `suppressReconcile`, which of the
+    /// four closures (`setupInstall`/`setupUninstall`/`watchStart`/
+    /// `watchStop`) run — instead of a test-local re-implementation of that
+    /// dispatch (finding 5's complaint about the previous version of this
+    /// test). `applyExternalProfileEdit`/`applyExternalProfileCreate` build
+    /// their real closures from the SAME function, so this is production logic,
+    /// not a parallel copy that could silently drift from it.
+    ///
+    /// Finding 2: on a suppressed write, `setupInstall`/`setupUninstall` (the
+    /// `SyncSetupService`/launchctl calls the CLI already made) must NOT fire,
+    /// but `watchStart`/`watchStop` (the in-app `LogWatcher`/`profileStates`
+    /// bookkeeping) MUST fire regardless — the previous version no-op'd the
+    /// whole `install`/`uninstall` closure, so a CLI `profile disable` of a
+    /// syncing/errored profile left `logWatchers`/`profileStates` stale.
+    private static func testReconcileClosuresDispatch() -> Bool {
+        let id = "AC-L61-3", slug = "reconcile-closures-dispatch"
+
+        struct Spies {
+            var setupInstall = 0, setupUninstall = 0, watchStart = 0, watchStop = 0
+        }
+        func run(suppressReconcile: Bool, invoke: (
+            (install: (SyncProfile) throws -> Void, uninstall: (SyncProfile) throws -> Void)
+        ) throws -> Void) rethrows -> Spies {
+            var spies = Spies()
+            let closures = SyncManager.reconcileClosures(
+                suppressReconcile: suppressReconcile,
+                setupInstall: { _ in spies.setupInstall += 1 },
+                setupUninstall: { _ in spies.setupUninstall += 1 },
+                watchStart: { _ in spies.watchStart += 1 },
+                watchStop: { _ in spies.watchStop += 1 })
+            try invoke(closures)
+            return spies
+        }
+        let profile = sampleProfile(name: "Reconcile")
+
+        // Suppressed install: setupInstall skipped, watchStart still runs.
+        guard let suppressedInstall = try? run(suppressReconcile: true, invoke: { try $0.install(profile) }),
+              suppressedInstall.setupInstall == 0, suppressedInstall.watchStart == 1 else {
+            return report(id, slug, false, "(suppressed install ran the wrong closures)")
+        }
+        // Suppressed uninstall: setupUninstall skipped, watchStop still runs.
+        guard let suppressedUninstall = try? run(suppressReconcile: true, invoke: { try $0.uninstall(profile) }),
+              suppressedUninstall.setupUninstall == 0, suppressedUninstall.watchStop == 1 else {
+            return report(id, slug, false, "(suppressed uninstall ran the wrong closures)")
+        }
+        // NOT suppressed (an ordinary external edit / hand edit): both halves run.
+        guard let fullInstall = try? run(suppressReconcile: false, invoke: { try $0.install(profile) }),
+              fullInstall.setupInstall == 1, fullInstall.watchStart == 1 else {
+            return report(id, slug, false, "(un-suppressed install skipped setupInstall)")
+        }
+        guard let fullUninstall = try? run(suppressReconcile: false, invoke: { try $0.uninstall(profile) }),
+              fullUninstall.setupUninstall == 1, fullUninstall.watchStop == 1 else {
+            return report(id, slug, false, "(un-suppressed uninstall skipped setupUninstall)")
+        }
+
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L61-3b — a marker-hit CLI write is classified through the real watcher
+
+    /// limpet-plan.md L6.1 change A. Complements `testReconcileClosuresDispatch`
+    /// (which tests the closure-selection logic in isolation) by proving the
+    /// CLI's actual write — through `ProfileStore.writeProfileFile`, the same
+    /// function `LimpetCLI`'s `writeProfile` closure calls — really is
+    /// classified `.cliWrite` by `ConfigFileWatcher`, for both an edit of an
+    /// existing id and a create of a new one.
+    private static func testCLIWriteClassifiedThroughRealWriter() -> Bool {
+        let id = "AC-L61-3b", slug = "cli-write-classified-through-real-writer"
+        let dir = "\(selfTestRoot)/ac-l61-3b"
         try? FileManager.default.removeItem(atPath: dir)
         let profilesDir = "\(dir)/profiles"
         let markerDir = "\(dir)/cli-writes"
 
         return CLIWriteMarker.withDirectory(markerDir) {
-            let store = ProfileStore(
-                profilesDirectory: profilesDir,
-                defaults: UserDefaults(suiteName: "com.nanako.limpet.selftest.ac-l61-3.\(UUID().uuidString)")!)
-
             /// Simulates a `limpet profile set`/`create` write: note the marker
             /// for the exact bytes about to be written, THEN write them — the
             /// same order `LimpetCLI`'s `writeProfile` closure uses, calling the
@@ -4117,67 +4174,26 @@ enum ConfigSelfTest {
                 return filename
             }
 
-            // --- set on an existing id ---
             var existing = sampleProfile(name: "Existing", isEnabled: true)
-            store.add(existing)  // app write: no marker, direct
+            guard ProfileStore.writeProfileFile(existing, in: profilesDir) != nil else {
+                return report(id, slug, false, "(fixture write failed)")
+            }
+            existing.name = "Existing renamed"
             let existingPath = "\(profilesDir)/\(existing.shortId).profile.json"
-
-            var updated = existing
-            updated.name = "Existing renamed"
-            guard cliWrite(updated) != nil else {
+            guard cliWrite(existing) != nil else {
                 return report(id, slug, false, "(cliWrite of the update failed)")
             }
-
-            var setInstallCalls = 0, setUninstallCalls = 0
-            let setOrigin = ConfigFileWatcher.classifyWrite(forFileAt: existingPath)
-            guard setOrigin == .cliWrite else {
-                return report(id, slug, false, "(expected .cliWrite for the marked update, got \(setOrigin))")
-            }
-            guard let updatedData = FileManager.default.contents(atPath: existingPath) else {
-                return report(id, slug, false, "(could not re-read the updated file)")
-            }
-            let suppressSet = (setOrigin == .cliWrite)  // mirroring applyExternalProfileEdit's ternary
-            let setOutcome = SyncManager.applyExternalEdit(
-                data: updatedData, path: existingPath,
-                known: { $0 == existing.id ? existing : nil },
-                others: [], isInstalled: { _ in true },
-                persist: { store.update($0) },
-                install: { _ in if !suppressSet { setInstallCalls += 1 } },
-                uninstall: { _ in if !suppressSet { setUninstallCalls += 1 } },
-                reportError: { _, _ in })
-            guard setOutcome == .applied, store.profile(for: existing.id)?.name == "Existing renamed",
-                  setInstallCalls == 0, setUninstallCalls == 0 else {
-                return report(
-                    id, slug, false,
-                    "(set: outcome=\(setOutcome) name=\(store.profile(for: existing.id)?.name ?? "nil") "
-                        + "install=\(setInstallCalls) uninstall=\(setUninstallCalls))")
+            guard ConfigFileWatcher.classifyWrite(forFileAt: existingPath) == .cliWrite else {
+                return report(id, slug, false, "(a marked update was not classified .cliWrite)")
             }
 
-            // --- create with a new id ---
             let created = sampleProfile(name: "Created", isEnabled: true)
             let createdPath = "\(profilesDir)/\(created.shortId).profile.json"
             guard cliWrite(created) != nil else {
                 return report(id, slug, false, "(cliWrite of the create failed)")
             }
-            let createOrigin = ConfigFileWatcher.classifyWrite(forFileAt: createdPath)
-            guard createOrigin == .cliWrite else {
-                return report(id, slug, false, "(expected .cliWrite for the marked create, got \(createOrigin))")
-            }
-            var createInstallCalls = 0
-            let suppressCreate = (createOrigin == .cliWrite)  // mirroring applyExternalProfileCreate's guard
-            _ = SyncManager.applyExternalCreateIfNeeded(
-                decoded: created, isKnownId: false, existing: [],  // no overlap check here — see AC-C1/AC-L4-4 for that
-                isInstalled: { _ in true },
-                persist: { store.add($0) },
-                install: { _ in
-                    guard !suppressCreate else { return }
-                    createInstallCalls += 1
-                },
-                quarantine: { _ in })
-            guard store.profile(for: created.id) == created, createInstallCalls == 0 else {
-                return report(
-                    id, slug, false,
-                    "(create: persisted=\(store.profile(for: created.id) == created) install=\(createInstallCalls))")
+            guard ConfigFileWatcher.classifyWrite(forFileAt: createdPath) == .cliWrite else {
+                return report(id, slug, false, "(a marked create was not classified .cliWrite)")
             }
 
             return report(id, slug, true)

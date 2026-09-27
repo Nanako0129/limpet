@@ -376,8 +376,13 @@ minutes are swept on every check, so a crashed CLI can't suppress a later,
 genuinely external edit forever. On `.cliWrite`,
 `SyncManager.applyExternalProfileEdit`/`applyExternalProfileCreate` still run
 `persist` (so `profileStore.profiles`, and through its `$profiles` sink the
-`LogWatcher` wiring, stays current) but replace `install`/`uninstall` with
-no-ops — the CLI process already drove `SyncSetupService` itself.
+`LogWatcher` wiring, stays current); the install/uninstall closures they build
+via `SyncManager.reconcileClosures` (code-review finding 5) skip ONLY the
+`SyncSetupService`/launchctl calls the CLI process already made — the in-app
+`LogWatcher`/`profileStates` bookkeeping (`startWatching`/`stopWatching`)
+always runs regardless, so a CLI `profile disable` of a syncing or errored
+profile can't leave that bookkeeping stale (finding 2; the first version of
+this fix no-op'd BOTH halves).
 `CLIWriteMarker.directory` is `private(set)`, changed only through
 `withDirectory(_:_:)` (redirect for a closure, restore after) — the self-test's
 only way to point it at an isolated temp dir instead of the real path.
