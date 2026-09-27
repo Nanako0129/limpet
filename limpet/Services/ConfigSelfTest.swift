@@ -159,6 +159,7 @@ enum ConfigSelfTest {
             testSpawnTerminationRaceClosesWithoutOrphan,
             testCLIWriteMarkerIgnoresNonHashFilenames,
             testInstallRefreshesLoadedAgentAndCleansUpFailure,
+            testConfigFileWatcherRealDispatchOnCLIMarkerHit,
         ]
 
         for check in checks {
@@ -4523,6 +4524,162 @@ enum ConfigSelfTest {
         }
         guard FileManager.default.fileExists(atPath: profile.plistPath) == false else {
             return report(id, slug, false, "(the plist was left behind after a failed load)")
+        }
+
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L61-10 — a marker-hit CLI write, through the REAL ConfigFileWatcher event path
+
+    /// limpet-plan.md L6.1 v3.1/v3.2 acceptance; verifier gap 1. AC-L61-1 and
+    /// AC-L61-3/3b call `ConfigFileWatcher.classifyWrite` directly — a pure
+    /// function M1 (`case .cliWrite: classify(...)` → `case .cliWrite:
+    /// continue` inside `processChangedPaths`) never touches, so those tests
+    /// cannot fail it. This test drives a REAL `ConfigFileWatcher` — real
+    /// FSEvents, real debounce, real `processChangedPaths` dispatch — pointed
+    /// at a temp directory under `LimpetPaths.home` (never the real
+    /// `~/.config/limpet`), and its `onProfileChange` callback runs the SAME
+    /// static dispatch `SyncManager.applyExternalProfileEdit`/
+    /// `applyExternalProfileCreate` build from (`SyncManager.reconcileClosures`
+    /// + `SyncManager.applyExternalEdit`/`applyExternalCreateIfNeeded`) against
+    /// a REAL `ProfileStore` on that same temp directory — the fallback the
+    /// plan names when wiring to the production `SyncManager` methods directly
+    /// isn't possible headlessly (a full `SyncManager` starts its own
+    /// `ConfigFileWatcher`/workspace observer/LogWatchers, which this
+    /// codebase's self-tests deliberately avoid standing up — see the
+    /// pre-existing comment on `AC-L5-2`).
+    ///
+    /// Real FSEvents delivery + debounce lands `processChangedPaths` on
+    /// `DispatchQueue.main.async`; `ConfigSelfTest.run()` never spins the main
+    /// run loop (self-test exits before `LimpetApp`'s SwiftUI run loop ever
+    /// starts), so this test pumps it itself in short bursts
+    /// (`pumpMainRunLoop`) until the callback fires or a timeout passes — the
+    /// standard way to let real async delegate/closure callbacks run inside a
+    /// synchronous test process.
+    private static func testConfigFileWatcherRealDispatchOnCLIMarkerHit() -> Bool {
+        let id = "AC-L61-10", slug = "config-file-watcher-real-dispatch-cli-marker-hit"
+        let watchDir = "\(LimpetPaths.home)/ac-l61-10-watch"
+        try? FileManager.default.removeItem(atPath: watchDir)
+        guard (try? FileManager.default.createDirectory(
+            atPath: watchDir, withIntermediateDirectories: true)) != nil else {
+            return report(id, slug, false, "(failed to create the watch directory fixture)")
+        }
+
+        let store = ProfileStore(
+            profilesDirectory: watchDir,
+            defaults: UserDefaults(suiteName: "com.nanako.limpet.selftest.ac-l61-10.\(UUID().uuidString)")!)
+
+        var setupInstallCalls = 0, setupUninstallCalls = 0
+        var dispatchedCalls: [(path: String, suppressReconcile: Bool)] = []
+
+        /// EXACTLY the dispatch `SyncManager.applyExternalProfileEdit`/
+        /// `applyExternalProfileCreate` build — `reconcileClosures` decides
+        /// which of the four closures run, `applyExternalEdit`/
+        /// `applyExternalCreateIfNeeded` are the same static functions
+        /// production calls. No test-local re-implementation of the SUPPRESS
+        /// decision itself (that would just repeat AC-L61-3's mistake) — this
+        /// test's only job is proving the REAL watcher reaches this code at
+        /// all on a `.cliWrite`, which M1 breaks.
+        let watcher = ConfigFileWatcher(
+            watchedDirectory: watchDir,
+            debounceInterval: 0.3,
+            onProfileChange: { path, suppressReconcile in
+                dispatchedCalls.append((path, suppressReconcile))
+                guard let data = FileManager.default.contents(atPath: path) else { return }
+                let (install, uninstall) = SyncManager.reconcileClosures(
+                    suppressReconcile: suppressReconcile,
+                    setupInstall: { _ in setupInstallCalls += 1 },
+                    setupUninstall: { _ in setupUninstallCalls += 1 },
+                    watchStart: { _ in }, watchStop: { _ in })
+                let outcome = SyncManager.applyExternalEdit(
+                    data: data, path: path,
+                    known: { store.profile(for: $0) },
+                    others: [], isInstalled: { _ in true },
+                    persist: { store.update($0) },
+                    install: install, uninstall: uninstall,
+                    reportError: { _, _ in })
+                if case .create(let decoded) = outcome {
+                    _ = SyncManager.applyExternalCreateIfNeeded(
+                        decoded: decoded, isKnownId: false, existing: [],
+                        isInstalled: { _ in true },
+                        persist: { store.add($0) },
+                        install: { try? install($0) },
+                        quarantine: { _ in })
+                }
+            },
+            onSettingsChange: {})
+        watcher.start()
+        defer { watcher.stop() }
+
+        /// Pumps the main run loop in short bursts until `condition` is true
+        /// or `timeout` elapses — see the type doc for why this is needed at
+        /// all (the self-test process never otherwise spins the main run loop).
+        func pumpMainRunLoop(timeout: TimeInterval, until condition: () -> Bool) -> Bool {
+            let deadline = Date().addingTimeInterval(timeout)
+            while !condition() && Date() < deadline {
+                RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+            }
+            return condition()
+        }
+
+        /// Simulates a `limpet profile set`/`create` write: notes the marker
+        /// for the exact bytes about to be written (at `CLIWriteMarker`'s
+        /// AMBIENT `directory` — the real default, under this run's redirected
+        /// `LimpetPaths.home`, exactly what the production CLI process would
+        /// use; no `withDirectory` override needed or wanted here), THEN
+        /// writes them — `LimpetCLI`'s `writeProfile` closure's exact order,
+        /// through the SAME `ProfileStore.writeProfileFile`.
+        func cliWrite(_ profile: SyncProfile) -> Bool {
+            guard let data = ProfileStore.encodedProfileFileData(profile) else { return false }
+            let hash = ConfigSelfWriteRegistry.hash(data)
+            CLIWriteMarker.note(contentHash: hash)
+            let ok = ProfileStore.writeProfileFile(profile, in: watchDir) != nil
+            // Same one-entry undo AC-L61-3b documents: this self-test runs the
+            // "CLI" write and the "app" watcher in ONE process, so
+            // `writeProfileFile`'s OWN self-write registry note (correct
+            // in production, where the CLI is a separate process with its own
+            // registry) would otherwise mask this exact marker hit as a
+            // same-process self-write instead.
+            _ = ConfigSelfWriteRegistry.shared.consumeIfSelfWrite(contentHash: hash)
+            return ok
+        }
+
+        // --- set on an existing id ---
+        var existing = sampleProfile(name: "Existing")
+        store.add(existing)  // a real app write: no marker, direct
+        existing.name = "Existing renamed"
+        guard cliWrite(existing) else {
+            return report(id, slug, false, "(cliWrite of the update failed)")
+        }
+        guard pumpMainRunLoop(timeout: 5, until: { dispatchedCalls.count >= 1 }) else {
+            return report(id, slug, false, "(the real watcher never dispatched the update within 5s)")
+        }
+        guard dispatchedCalls[0].suppressReconcile else {
+            return report(id, slug, false, "(the update was dispatched with suppressReconcile=false)")
+        }
+        guard store.profile(for: existing.id)?.name == "Existing renamed" else {
+            return report(id, slug, false, "(profileStore did not reflect the CLI update)")
+        }
+
+        // --- create with a new id ---
+        let created = sampleProfile(name: "Created")
+        guard cliWrite(created) else {
+            return report(id, slug, false, "(cliWrite of the create failed)")
+        }
+        guard pumpMainRunLoop(timeout: 5, until: { dispatchedCalls.count >= 2 }) else {
+            return report(id, slug, false, "(the real watcher never dispatched the create within 5s)")
+        }
+        guard dispatchedCalls[1].suppressReconcile else {
+            return report(id, slug, false, "(the create was dispatched with suppressReconcile=false)")
+        }
+        guard store.profile(for: created.id) == created else {
+            return report(id, slug, false, "(profileStore did not reflect the CLI create)")
+        }
+
+        guard setupInstallCalls == 0, setupUninstallCalls == 0 else {
+            return report(
+                id, slug, false,
+                "(a marker hit ran a real SyncSetupService call: install=\(setupInstallCalls) uninstall=\(setupUninstallCalls))")
         }
 
         return report(id, slug, true)
