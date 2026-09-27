@@ -10,7 +10,51 @@ import Foundation
 /// or the sync script itself, and never touches the lock file — see
 /// `SyncManager.triggerManualSync` and the static grep self-test in
 /// `ConfigSelfTest`.
+/// Thread-safe holder for the currently-running sync child's PID
+/// (limpet-plan.md L6.1 change B). `runSyncChild`/`runChildProcess` run on a
+/// background global queue; the SIGTERM/SIGINT handler runs on `.main` — this
+/// is the one piece of state both sides touch, so it needs its own lock rather
+/// than living as a plain var on either side.
+private final class RunningChildPID {
+    private var pid: pid_t?
+    private let lock = NSLock()
+
+    func set(_ newValue: pid_t?) {
+        lock.lock()
+        pid = newValue
+        lock.unlock()
+    }
+
+    func get() -> pid_t? {
+        lock.lock()
+        defer { lock.unlock() }
+        return pid
+    }
+}
+
 enum SyncWatchDaemon {
+    private static let runningChildPID = RunningChildPID()
+
+    /// Send SIGTERM to the process group led by `pid` — the running sync
+    /// child is its OWN process-group leader (measured live, see `run`'s
+    /// comment), so this reaches the script, rclone and tee together. Not
+    /// private, and taking a bare `pid_t` rather than reading
+    /// `runningChildPID` itself, so a self-test can drive it against a
+    /// process group IT spawned, without a real `limpet watch` process.
+    static func terminateChildProcessGroup(pid: pid_t) {
+        killpg(pid, SIGTERM)
+    }
+
+    /// The SIGTERM/SIGINT handler body: forward to the running child's process
+    /// group, if any, and exit AT ONCE — see `run`'s comment on why this never
+    /// waits.
+    private static func terminateRunningChildAndExit() -> Never {
+        if let pid = runningChildPID.get() {
+            terminateChildProcessGroup(pid: pid)
+        }
+        exit(0)
+    }
+
     /// Runs forever. Everything here dispatches onto the main queue (matching
     /// `DirectoryWatcher`'s own `DispatchQueue.main.async` callback), so the
     /// scheduler's state is only ever mutated from one thread; `dispatchMain()`
@@ -29,6 +73,28 @@ enum SyncWatchDaemon {
         let signalSource = DispatchSource.makeSignalSource(signal: SIGUSR1, queue: .main)
         signalSource.setEventHandler { scheduler.trigger() }
         signalSource.resume()
+
+        // limpet-plan.md L6.1 change B, root cause 2: `launchctl unload` sends
+        // this process SIGTERM, but `Process`'s child (the sync script) is its
+        // own process-group leader (measured live: watcher pgid 24762,
+        // script/rclone/tee pgid 61291) — killing only this process leaves the
+        // script/rclone/tee running, reparented to launchd, still holding the
+        // lock. Forward SIGTERM to the child's process group and exit AT ONCE:
+        // no waiting, so `launchctl unload`/`load` timing (already synchronous
+        // from the CLI's side) is unchanged. rclone's own default
+        // `--delete-after` means an interrupted run has already finished every
+        // transfer before it would ever delete, so this can't leave a partial
+        // delete; the next watcher's catch-up sync resumes whatever the
+        // interrupted run didn't get to. Same handling for SIGINT (manual
+        // `kill`/Ctrl-C during interactive debugging).
+        var terminationSources: [DispatchSourceSignal] = []
+        for sig in [SIGTERM, SIGINT] {
+            signal(sig, SIG_IGN)
+            let terminationSource = DispatchSource.makeSignalSource(signal: sig, queue: .main)
+            terminationSource.setEventHandler { terminateRunningChildAndExit() }
+            terminationSource.resume()
+            terminationSources.append(terminationSource)  // kept alive: `run` never returns
+        }
 
         // Periodic safety sync every profile interval.
         let intervalSeconds = TimeInterval(max(profile.syncIntervalMinutes, 1) * 60)
@@ -169,7 +235,9 @@ enum SyncWatchDaemon {
         } catch {
             return -1
         }
+        runningChildPID.set(process.processIdentifier)
         process.waitUntilExit()
+        runningChildPID.set(nil)
         return process.terminationStatus
     }
 

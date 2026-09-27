@@ -114,7 +114,8 @@ final class SyncSetupService {
         loadAgent: Bool = true,
         executablePath: String = Bundle.main.executablePath ?? "",
         otherProfiles: [SyncProfile] = ProfileStore.profilesOnDisk(in: SyncProfile.configDirectory),
-        isInstalled: (SyncProfile) -> Bool = SyncProfile.agentInstalled
+        isInstalled: (SyncProfile) -> Bool = SyncProfile.agentInstalled,
+        loadCommand: (String) -> (output: String, exitCode: Int32) = { SyncSetupService.shared.runLaunchctlLoad(plistPath: $0) }
     ) throws {
         // F4/F6 (limpet-plan.md L4) come FIRST, before anything is written. The
         // self-test relies on this order: it calls install with a refused profile
@@ -183,10 +184,25 @@ final class SyncSetupService {
         let plist = generateLaunchdPlist(for: profile)
         try plist.write(toFile: profile.plistPath, atomically: true, encoding: .utf8)
 
-        // Load the launchd agent (unless deferred for resync)
+        // Load the launchd agent (unless deferred for resync). limpet-plan.md
+        // L6.1 change B: a failure here used to be silently discarded (`_ =`),
+        // leaving a profile with no running watcher and nothing telling anyone.
+        // Callers already surface a thrown error (CLI stderr via `installProfile`,
+        // the app's `profileErrors` via `applyProfileChange`/`applyExternalProfileEdit`),
+        // so throwing here is enough to reach both.
         if loadAgent {
-            _ = runCommand("/bin/launchctl", arguments: ["load", profile.plistPath])
+            let result = loadCommand(profile.plistPath)
+            guard result.exitCode == 0 else {
+                throw SetupError.launchAgentLoadFailed(exitCode: result.exitCode, output: result.output)
+            }
         }
+    }
+
+    /// `launchctl load` for one plist path. Not private so `install`'s default
+    /// `loadCommand` and `ConfigSelfTest` can call it directly, or replace it
+    /// with a fake that never touches real launchctl.
+    func runLaunchctlLoad(plistPath: String) -> (output: String, exitCode: Int32) {
+        runCommand("/bin/launchctl", arguments: ["load", plistPath])
     }
 
     /// Load the launchd agent for a profile (used after deferred install)
@@ -848,6 +864,7 @@ final class SyncSetupService {
         case shimNotOwned
         case shimInstallFailed
         case refusedProfile(String)
+        case launchAgentLoadFailed(exitCode: Int32, output: String)
 
         var errorDescription: String? {
             switch self {
@@ -872,6 +889,10 @@ final class SyncSetupService {
                 return "Failed to write the limpet CLI shim at ~/.local/bin/limpet"
             case .refusedProfile(let reason):
                 return "Refusing to install: \(reason)"
+            case .launchAgentLoadFailed(let exitCode, let output):
+                return "launchctl load failed (exit \(exitCode)): "
+                    + (output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                        ? "no output" : output.trimmingCharacters(in: .whitespacesAndNewlines))
             }
         }
     }

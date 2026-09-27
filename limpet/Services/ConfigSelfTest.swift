@@ -153,6 +153,8 @@ enum ConfigSelfTest {
             testAppWritesLeaveMarkerDirEmpty,
             testCLIMarkerSuppressesReconcile,
             testSyncAlreadyRunningSetsSyncing,
+            testInstallThrowsOnLaunchctlLoadFailure,
+            testTerminateChildProcessGroupKillsRealGroup,
         ]
 
         for check in checks {
@@ -4196,6 +4198,116 @@ enum ConfigSelfTest {
         let result2 = SyncManager.reduceProfileState(.syncing, for: .syncAlreadyRunning)
         guard result2 == .syncing else {
             return report(id, slug, false, "(.syncAlreadyRunning reduced .syncing to \(result2), expected .syncing)")
+        }
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L61-5 — install throws when launchctl load fails
+
+    /// limpet-plan.md L6.1 change B. Injects a `loadCommand` that fails
+    /// WITHOUT ever invoking real `launchctl` (a hard limit for this repo).
+    /// Mutation: reverting `install`'s exit-status check back to `_ = ...`
+    /// must fail this.
+    private static func testInstallThrowsOnLaunchctlLoadFailure() -> Bool {
+        let id = "AC-L61-5", slug = "install-throws-on-launchctl-load-failure"
+        let dir = "\(selfTestRoot)/ac-l61-5"
+        try? FileManager.default.removeItem(atPath: dir)
+        var profile = sampleProfile(name: "LoadFails", isEnabled: true)
+        profile.localSyncPath = "\(dir)/local"
+        try? FileManager.default.createDirectory(atPath: profile.localSyncPath, withIntermediateDirectories: true)
+
+        do {
+            try SyncSetupService.shared.install(
+                profile: profile,
+                loadAgent: true,
+                executablePath: "/Applications/limpet.app/Contents/MacOS/limpet",  // not translocated
+                otherProfiles: [],
+                isInstalled: { _ in false },
+                loadCommand: { _ in (output: "launchctl: could not find service", exitCode: 3) })
+            return report(id, slug, false, "(install did not throw on a failing loadCommand)")
+        } catch SyncSetupService.SetupError.launchAgentLoadFailed(let exitCode, let output) {
+            guard exitCode == 3, output.contains("could not find service") else {
+                return report(id, slug, false, "(wrong error payload: exit=\(exitCode) output=\(output))")
+            }
+        } catch {
+            return report(id, slug, false, "(threw the wrong error: \(error))")
+        }
+
+        // A succeeding loadCommand must not throw.
+        do {
+            try SyncSetupService.shared.install(
+                profile: profile, loadAgent: true,
+                executablePath: "/Applications/limpet.app/Contents/MacOS/limpet",
+                otherProfiles: [], isInstalled: { _ in false },
+                loadCommand: { _ in (output: "", exitCode: 0) })
+        } catch {
+            return report(id, slug, false, "(install threw on a succeeding loadCommand: \(error))")
+        }
+
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L61-6 — SIGTERM's killpg helper on a real spawned process group
+
+    /// limpet-plan.md L6.1 change B. `SyncWatchDaemon.run` never returns
+    /// (`dispatchMain()`), so driving its actual `DispatchSource` SIGTERM
+    /// handler in-process is not possible here; per the plan, this instead
+    /// drives the extracted `terminateChildProcessGroup` helper against a
+    /// process group THIS test spawns itself (never touching a real watcher or
+    /// sync). UNTESTED by this: that a real SIGTERM delivered to a running
+    /// `limpet watch` process actually invokes this helper before exiting —
+    /// that wiring (`signal`+`DispatchSource.makeSignalSource` in `run`) is
+    /// covered only by code review and the live check in the plan's Acceptance.
+    private static func testTerminateChildProcessGroupKillsRealGroup() -> Bool {
+        let id = "AC-L61-6", slug = "terminate-child-process-group"
+        let dir = "\(selfTestRoot)/ac-l61-6"
+        try? FileManager.default.removeItem(atPath: dir)
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+
+        // A fake "sync child": a script that is its own process-group leader
+        // (Foundation's Process spawns a new process group by default — the
+        // same fact the plan measured live for the real sync script) and
+        // spawns a `sleep` grandchild in that same group.
+        let scriptPath = "\(dir)/fake-child.sh"
+        let script = "#!/bin/bash\nsleep 30 &\nwait\n"
+        guard (try? script.write(toFile: scriptPath, atomically: true, encoding: .utf8)) != nil,
+              (try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: scriptPath)) != nil
+        else {
+            return report(id, slug, false, "(failed to write the fake child script)")
+        }
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/bash")
+        process.arguments = [scriptPath]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+        } catch {
+            return report(id, slug, false, "(failed to spawn the fake child: \(error))")
+        }
+        let pgid = process.processIdentifier
+
+        // Give the grandchild `sleep` a moment to actually start before we
+        // terminate the group — otherwise this could pass by accident (nothing
+        // spawned yet to leak).
+        Thread.sleep(forTimeInterval: 0.3)
+        guard killpg(pgid, 0) == 0 else {
+            process.waitUntilExit()
+            return report(id, slug, false, "(the fake child's process group was already gone before terminating it)")
+        }
+
+        SyncWatchDaemon.terminateChildProcessGroup(pid: pgid)
+
+        var groupGone = false
+        for _ in 0..<20 {  // up to 2s, matching the plan's acceptance window
+            if killpg(pgid, 0) != 0 { groupGone = true; break }
+            Thread.sleep(forTimeInterval: 0.1)
+        }
+        process.waitUntilExit()  // reap; this test spawned it, so this is the one process it may wait on
+
+        guard groupGone else {
+            return report(id, slug, false, "(script and/or sleep grandchild still alive 2s after terminateChildProcessGroup)")
         }
         return report(id, slug, true)
     }
