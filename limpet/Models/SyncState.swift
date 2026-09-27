@@ -192,6 +192,12 @@ struct FileChange: Identifiable, Equatable {
     let path: String
     let operation: Operation
     var profileName: String = ""
+    /// Whether the log line this came from could ALSO be the trash
+    /// mechanism's own backup-move step rather than the genuine `operation`
+    /// (limpet-plan.md L6.2, code-review finding 1/8 on 87bbf67) — see
+    /// `RcloneLogEntry.mayBeTrashArtifact(message:)`. `false` for every
+    /// change parsed outside that seam (never suppressed).
+    var mayBeTrashArtifact: Bool = false
 
     enum Operation: String {
         case copied = "Copied"

@@ -144,7 +144,8 @@ extension RcloneLogEntry {
                 return FileChange(
                     timestamp: date ?? Date(),
                     path: objectPath,
-                    operation: operation
+                    operation: operation,
+                    mayBeTrashArtifact: Self.mayBeTrashArtifact(message: cleanMsg)
                 )
             }
         }
@@ -171,25 +172,21 @@ extension RcloneLogEntry {
     /// see the L5.1 fix commit for the exact lines observed):
     /// "Copied (new)" -> .copied; "Copied (replaced existing)" and
     /// "Updated modification time in destination" -> .updated; "Deleted"
-    /// -> .deleted; "Renamed from \"...\"" (emitted per rename under
-    /// `--track-renames`, which limpet never sets) -> .renamed.
+    /// -> .deleted; "Moved (server-side) to: ..." and "Renamed from \"...\""
+    /// (both emitted per rename under `--track-renames`, which a profile's
+    /// `additionalRcloneFlags` CAN set — limpet does not forbid it) -> .renamed.
     ///
     /// limpet-plan.md L6.2 item 4b (measured 2026-09-28 with a trash root,
     /// `--disable Move`, the S4-path fallback): "Copied (server-side copy)
-    /// to: ..." and "Moved (server-side) to: ..." are the trash mechanism
-    /// moving a version aside BEFORE the real change — never a change to
-    /// report themselves — so both map to no change now (the "Moved
-    /// (server-side) to:" -> .renamed mapping this superseded was never
-    /// actually reachable: limpet has no `--track-renames` path that would
-    /// produce it either). "Moved into backup dir" -> .deleted is the trash
-    /// mechanism's OWN delete report for a real delete (SyncManager separately
-    /// drops the bare "Deleted" line above for a profile with an active trash
-    /// root, since that line also fires for every S4-path overwrite — see
-    /// `SyncManager.shouldReportFileChange`).
+    /// to: ..." is ALWAYS the trash mechanism moving a version aside before
+    /// the real change (a normal same-remote copy never gets a " to:" suffix
+    /// — that only appears when the destination name differs from the
+    /// source's, which a plain copy never does) — never a change to report,
+    /// unconditionally, trash root or not.
     private func parseOperation(from message: String, level: String) -> FileChange.Operation? {
         guard level == "info" else { return nil }
 
-        if message.hasPrefix("Copied (server-side copy) to:") || message.hasPrefix("Moved (server-side) to:") {
+        if message.hasPrefix("Copied (server-side copy) to:") {
             return nil
         }
         // Any other "Copied (…)" success: "(new)" and "(server-side copy)"
@@ -208,10 +205,39 @@ extension RcloneLogEntry {
         if message == "Deleted" || message == "Moved into backup dir" {
             return .deleted
         }
-        if message.hasPrefix("Renamed from") {
+        if message.hasPrefix("Moved (server-side) to:") || message.hasPrefix("Renamed from") {
             return .renamed
         }
 
         return nil
+    }
+
+    /// Whether `message` can ALSO be the trash mechanism's own backup-move
+    /// step, rather than the genuine event its `Operation` suggests
+    /// (code-review finding 1 on 87bbf67 — P1: the previous version mapped
+    /// BOTH this ambiguous line and the trash's unambiguous delete report to
+    /// the same `.deleted` case, so `shouldReportFileChange` dropped every
+    /// `.deleted` on a trash profile, including real ones).
+    ///
+    /// - The bare `Deleted` line fires for BOTH a real delete (immediately
+    ///   followed by `Moved into backup dir`) and an S4-path OVERWRITE's
+    ///   backup step (removing the original after it was copied aside, never
+    ///   followed by `Moved into backup dir`) — measured 2026-09-28, ambiguous.
+    /// - `Moved (server-side) to: ...` fires for BOTH a real `--track-renames`
+    ///   rename and a Move-capable backend's backup-dir move (measured
+    ///   2026-09-28 for reference, since the self-test's local rclone always
+    ///   takes the S4/Copy+Delete path under `--disable Move`; the plan's
+    ///   "(Move-capable backends, for reference)" note lists this exact line
+    ///   for both an overwrite's and a delete's backup step) — ambiguous.
+    /// - `Moved into backup dir` is the trash mechanism's OWN delete report:
+    ///   never ambiguous, always the real event.
+    /// - `Renamed from "..."` is `--track-renames`' OTHER message; no measured
+    ///   backup-dir path ever produces it — never ambiguous.
+    ///
+    /// `SyncManager.shouldReportFileChange` drops a `FileChange` only when
+    /// this is true AND the profile has an active trash root, so a profile
+    /// without trash sees every change exactly as before this flag existed.
+    static func mayBeTrashArtifact(message: String) -> Bool {
+        message == "Deleted" || message.hasPrefix("Moved (server-side) to:")
     }
 }
