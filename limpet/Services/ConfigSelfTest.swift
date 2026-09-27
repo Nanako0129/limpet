@@ -166,7 +166,10 @@ enum ConfigSelfTest {
             testTrashExitSeventySix,
             testTrashBackupNamingAndRestore,
             testTrashRestoreValidationAndNewestMatch,
-            testShouldReportFileChangeDropsTrashDeletes,
+            testRealDeleteSurfacesOnceOverwriteSurfacesZero,
+            testTrashCommandsUsePathFormulaIgnoringActiveRule,
+            testTrashRestoreRclonelinkSymlinkAndAtomicRename,
+            testTrashPurgeCertFlagsFailureAndDryRunVariants,
         ]
 
         for check in checks {
@@ -839,6 +842,7 @@ enum ConfigSelfTest {
         uninstallProfile: @escaping (SyncProfile) -> String? = { _ in nil },
         deleteProfileFile: @escaping (SyncProfile) -> Void = { _ in },
         removeFile: @escaping (String) -> Bool = { _ in true },
+        moveFile: @escaping (String, String) -> Bool = { _, _ in true },
         readStdin: @escaping () -> String? = { nil },
         readFile: @escaping (String) -> String? = { _ in nil },
         readSecret: @escaping (String) -> String? = { _ in nil },
@@ -858,6 +862,7 @@ enum ConfigSelfTest {
             uninstallProfile: uninstallProfile,
             deleteProfileFile: deleteProfileFile,
             removeFile: removeFile,
+            moveFile: moveFile,
             readStdin: readStdin,
             readFile: readFile,
             readSecret: readSecret,
@@ -2073,7 +2078,8 @@ enum ConfigSelfTest {
     /// only the invocations log is always fresh, so `invocations` reflects
     /// just THIS call.
     private static func runScriptFixtureAppending(
-        name: String, overrides: [String: Any], stubBody: String, reset: Bool = true
+        name: String, overrides: [String: Any], stubBody: String, reset: Bool = true,
+        extraEnvironment: [String: String] = [:]
     ) -> (status: Int32, log: String, invocations: [[String]])? {
         let fm = FileManager.default
         let root = (selfTestRoot as NSString).appendingPathComponent(name)
@@ -2117,6 +2123,7 @@ enum ConfigSelfTest {
         process.arguments = [scriptPath, configPath]
         var env = ProcessInfo.processInfo.environment
         env["RCLONE_BIN"] = stubPath
+        env.merge(extraEnvironment) { _, new in new }
         process.environment = env
         process.standardError = FileHandle.nullDevice
         process.standardOutput = FileHandle.nullDevice
@@ -3968,11 +3975,18 @@ enum ConfigSelfTest {
             ("Updated modification time in destination", .updated),
             ("Deleted", .deleted),
             ("Renamed from \"a.txt\"", .renamed),
-            // limpet-plan.md L6.2 item 4b: the trash mechanism's own delete
-            // report (SyncManager separately drops the bare "Deleted" line
-            // above for a trash-enabled profile — see
-            // testShouldReportFileChangeDropsTrashDeletes).
+            // limpet-plan.md L6.2 item 4b: the trash mechanism's own,
+            // UNAMBIGUOUS delete report (SyncManager separately drops the
+            // AMBIGUOUS bare "Deleted" line above for a trash-enabled profile
+            // — see testRealDeleteSurfacesOnceOverwriteSurfacesZero, AC-L62-7,
+            // code-review finding 1 on 87bbf67).
             ("Moved into backup dir", .deleted),
+            // Code-review finding 8 on 87bbf67: restored — a profile's
+            // additionalRcloneFlags CAN set --track-renames, so this line can
+            // be a genuine rename; it is ALSO a Move-capable backend's
+            // backup-dir move, so `mayBeTrashArtifact` (checked below) rather
+            // than the operation mapping itself carries the ambiguity.
+            ("Moved (server-side) to: a-renamed.txt", .renamed),
         ]
         for (msg, expected) in successCases {
             let e = entry(level: "info", msg: msg, object: "a.txt")
@@ -3982,15 +3996,26 @@ enum ConfigSelfTest {
         }
 
         // limpet-plan.md L6.2 item 4b (measured 2026-09-28, --disable Move):
-        // a backup-dir move is never itself a reportable change. This
-        // SUPERSEDES the old "Moved (server-side) to:" -> .renamed mapping —
-        // limpet never sets --track-renames, so that line was never actually
-        // reachable as a rename in production; it is always a backup move.
-        for msg in ["Copied (server-side copy) to: a-100001.txt", "Moved (server-side) to: a-100001.txt"] {
-            let e = entry(level: "info", msg: msg, object: "a.txt")
-            guard e.fileChange == nil else {
-                return report(id, slug, false, "(\"\(msg)\" was reported as a change)")
-            }
+        // "Copied (server-side copy) to: ..." is ALWAYS a backup-dir move,
+        // unconditionally — a normal same-remote copy never gets a " to:"
+        // suffix (that only appears when the destination name differs from
+        // the source's).
+        let backupCopy = entry(level: "info", msg: "Copied (server-side copy) to: a-100001.txt", object: "a.txt")
+        guard backupCopy.fileChange == nil else {
+            return report(id, slug, false, "(a backup-dir \"Copied (server-side copy) to:\" line was reported as a change)")
+        }
+
+        // mayBeTrashArtifact: true for exactly the two ambiguous lines, false
+        // for everything else (code-review finding 1/8 on 87bbf67).
+        let deletedEntry = entry(level: "info", msg: "Deleted", object: "a.txt")
+        let movedIntoBackupEntry = entry(level: "info", msg: "Moved into backup dir", object: "a.txt")
+        let movedServerSideEntry = entry(level: "info", msg: "Moved (server-side) to: a-renamed.txt", object: "a.txt")
+        let renamedFromEntry = entry(level: "info", msg: "Renamed from \"a.txt\"", object: "b.txt")
+        guard deletedEntry.fileChange?.mayBeTrashArtifact == true,
+              movedServerSideEntry.fileChange?.mayBeTrashArtifact == true,
+              movedIntoBackupEntry.fileChange?.mayBeTrashArtifact == false,
+              renamedFromEntry.fileChange?.mayBeTrashArtifact == false else {
+            return report(id, slug, false, "(mayBeTrashArtifact wrong on one of the four lines)")
         }
 
         // The max-delete error line (measured 2026-09-26, AC-L4-11) must never
@@ -5218,21 +5243,381 @@ enum ConfigSelfTest {
         return report(id, slug, true)
     }
 
-    // MARK: - AC-L62-7 — SyncManager drops the bare Deleted line for a trash-enabled profile
+    // MARK: - AC-L62-8 — trash list/restore ignore trashDays/direction/versioning
+    // (code-review finding 4 on 87bbf67): they keep working after trash was
+    // switched off or the profile's direction/versioning changed.
 
-    private static func testShouldReportFileChangeDropsTrashDeletes() -> Bool {
-        let id = "AC-L62-7", slug = "should-report-file-change-drops-trash-deletes"
-        guard SyncManager.shouldReportFileChange(.deleted, hasTrashRoot: false) else {
-            return report(id, slug, false, "(a non-trash profile's Deleted was dropped)")
+    private static func testTrashCommandsUsePathFormulaIgnoringActiveRule() -> Bool {
+        let id = "AC-L62-8", slug = "trash-commands-ignore-active-rule"
+
+        var profile = sampleProfile()
+        profile.rcloneRemote = "s4:"
+        profile.remotePath = "nanako-mirror/Datarget"
+
+        // trashRootPath (the CLI's root) ignores every "is trash ACTIVE" input.
+        let expected = "s4:nanako-mirror/.limpet-trash/Datarget"
+        guard SyncSetupService.trashRootPath(for: profile) == expected else {
+            return report(id, slug, false, "(trashRootPath wrong for the base case)")
         }
-        guard !SyncManager.shouldReportFileChange(.deleted, hasTrashRoot: true) else {
-            return report(id, slug, false, "(a trash profile's Deleted was not dropped)")
+        var trashOff = profile
+        trashOff.trashDays = 0
+        var reversed = profile
+        reversed.syncDirection = .remoteToLocal
+        // AWS (unlike MEGA/Cloudflare) DOES respect remoteVersioning — MEGA
+        // S4 has no versioning at all regardless of the flag, so testing the
+        // versioning-off-switch needs a provider where it actually matters.
+        var versioned = profile
+        versioned.rcloneRemote = "aws:"
+        versioned.remoteVersioning = true
+        let versionedRootExpected = "aws:nanako-mirror/.limpet-trash/Datarget"
+
+        for candidate in [trashOff, reversed] {
+            guard SyncSetupService.trashRootPath(for: candidate) == expected else {
+                return report(id, slug, false, "(trashRootPath changed when trashDays/direction did)")
+            }
+            // trashRoot (the sync/purge root) DOES apply the active-trash rule
+            // — this is the contrast finding 4 is about.
+            guard SyncSetupService.trashRoot(for: candidate, remoteSection: ["type": "s3", "provider": "Mega"]) == nil else {
+                return report(id, slug, false, "(trashRoot stayed active when it should not have)")
+            }
         }
-        guard SyncManager.shouldReportFileChange(.copied, hasTrashRoot: true),
-              SyncManager.shouldReportFileChange(.updated, hasTrashRoot: true),
-              SyncManager.shouldReportFileChange(.renamed, hasTrashRoot: true) else {
-            return report(id, slug, false, "(a non-delete operation was dropped for a trash profile)")
+        guard SyncSetupService.trashRootPath(for: versioned) == versionedRootExpected else {
+            return report(id, slug, false, "(trashRootPath changed when remoteVersioning did)")
         }
+        guard SyncSetupService.trashRoot(for: versioned, remoteSection: ["type": "s3", "provider": "AWS"]) == nil else {
+            return report(id, slug, false, "(trashRoot stayed active for a versioned AWS remote)")
+        }
+        // A bucket-root remotePath has no parent either way — both nil.
+        var bucketRoot = profile
+        bucketRoot.remotePath = "Datarget"
+        guard SyncSetupService.trashRootPath(for: bucketRoot) == nil,
+              SyncSetupService.trashRoot(for: bucketRoot, remoteSection: ["type": "s3", "provider": "Mega"]) == nil else {
+            return report(id, slug, false, "(a bucket-root remotePath produced a root)")
+        }
+
+        // The CLI: `trash list`/`trash restore` succeed in reaching rclone for
+        // a profile whose trash is currently OFF (trashDays = 0) — the OLD
+        // code (which called `trashRoot`, layering the active-trash checks on
+        // top) would have refused before ever calling rclone.
+        var listArgs: [String] = []
+        let env = fakeCLIEnvironment(
+            runRclone: { args, _, _ in listArgs = args; return (0, "2026-09-01/old.txt\n", "") },
+            readProfiles: { [trashOff] })
+        guard LimpetCLI.execute(["trash", "list", trashOff.shortId], env: env) == 0,
+              listArgs.contains(expected) else {
+            return report(id, slug, false, "(trash list refused a profile whose trash is currently off)")
+        }
+
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L62-9 — restore a `.rclonelink` object as a real symlink;
+    // atomic temp-then-rename leaves nothing partial on failure (code-review
+    // findings 2/3 on 87bbf67), via the REAL `LimpetCLI.execute` entry point
+    // against a real local rclone `type = local` pseudo-remote (never a
+    // network remote — a self-test-owned throwaway config under selfTestRoot,
+    // the standard way to address a local directory through the
+    // `<remote>:<path>` shape `trashRootPath` always produces).
+
+    private static func testTrashRestoreRclonelinkSymlinkAndAtomicRename() -> Bool {
+        let id = "AC-L62-9", slug = "trash-restore-rclonelink-symlink-atomic-rename"
+        guard let rclonePath = RcloneLocator.resolve() else {
+            return report(id, slug, true, "(skipped: no local rclone binary found)")
+        }
+
+        let root = "\(selfTestRoot)/ac-l62-9"
+        try? FileManager.default.removeItem(atPath: root)
+        let localDir = "\(root)/local"
+        let dataDir = "\(root)/data"
+        let trashDateDir = "\(dataDir)/parent/.limpet-trash/leaf/2026-09-01"
+        let confPath = "\(root)/rclone.conf"
+        do {
+            try FileManager.default.createDirectory(atPath: localDir, withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(atPath: trashDateDir, withIntermediateDirectories: true)
+            try "hello".write(toFile: "\(trashDateDir)/a-100000.tar.gz", atomically: true, encoding: .utf8)
+            // A symlink stored as a `.rclonelink` CONTENT object — measured
+            // 2026-09-28: this is how a remote without native symlink support
+            // (S3/B2) represents one; the object's BYTES are the link target
+            // text, not an actual on-disk symlink.
+            try "a.tar.gz".write(toFile: "\(trashDateDir)/l-100000.txt.rclonelink", atomically: true, encoding: .utf8)
+            try "[selftest]\ntype = local\n".write(toFile: confPath, atomically: true, encoding: .utf8)
+        } catch {
+            return report(id, slug, false, "(fixture setup failed)")
+        }
+
+        var profile = sampleProfile()
+        // `remotePath` matches production's cloud-relative shape (no leading
+        // slash); the real directory is reached by running rclone with its
+        // CWD set to `dataDir`, exactly like a real local backend resolves a
+        // relative path — measured 2026-09-28:
+        //   cd <dataDir> && rclone --config <conf> lsf -R selftest:parent/.limpet-trash/leaf
+        //   -> lists 2026-09-01/, 2026-09-01/a-100000.tar.gz
+        profile.rcloneRemote = "selftest:"
+        profile.remotePath = "parent/leaf"
+        profile.localSyncPath = localDir
+
+        func realRclone(_ args: [String], _ remote: String?, _ timeout: TimeInterval) -> (Int32, String, String) {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: rclonePath)
+            process.arguments = ["--config", confPath] + args
+            process.currentDirectoryURL = URL(fileURLWithPath: dataDir)
+            let outPipe = Pipe(), errPipe = Pipe()
+            process.standardOutput = outPipe
+            process.standardError = errPipe
+            guard (try? process.run()) != nil else { return (-1, "", "") }
+            process.waitUntilExit()
+            let out = String(data: outPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            let err = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            return (process.terminationStatus, out, err)
+        }
+        func moveFile(_ from: String, _ to: String) -> Bool {
+            _ = try? FileManager.default.removeItem(atPath: to)
+            return (try? FileManager.default.moveItem(atPath: from, toPath: to)) != nil
+        }
+        let env = fakeCLIEnvironment(
+            runRclone: realRclone,
+            readProfiles: { [profile] },
+            fileExists: { FileManager.default.fileExists(atPath: $0) },
+            removeFile: { (try? FileManager.default.removeItem(atPath: $0)) != nil },
+            moveFile: moveFile)
+
+        // Plain-file restore.
+        let plainCode = LimpetCLI.execute(["trash", "restore", profile.shortId, "a.tar.gz"], env: env)
+        guard plainCode == 0,
+              let plainContent = try? String(contentsOfFile: "\(localDir)/a.tar.gz", encoding: .utf8),
+              plainContent == "hello" else {
+            return report(id, slug, false, "(plain restore failed: exit \(plainCode))")
+        }
+        guard !FileManager.default.fileExists(atPath: "\(localDir)/a.tar.gz.limpet-restore-tmp") else {
+            return report(id, slug, false, "(temp restore file left behind after a plain success)")
+        }
+
+        // Symlink restore FROM THE .rclonelink OBJECT FORM — must land as a
+        // real local symlink, not a regular file containing "a.tar.gz" as text.
+        let linkCode = LimpetCLI.execute(["trash", "restore", profile.shortId, "l.txt"], env: env)
+        guard linkCode == 0 else {
+            return report(id, slug, false, "(symlink restore failed: exit \(linkCode))")
+        }
+        let restoredLinkPath = "\(localDir)/l.txt"
+        guard let target = try? FileManager.default.destinationOfSymbolicLink(atPath: restoredLinkPath), target == "a.tar.gz" else {
+            return report(id, slug, false, "(l.txt was not restored as a real symlink to a.tar.gz)")
+        }
+        guard !FileManager.default.fileExists(atPath: "\(restoredLinkPath).limpet-restore-tmp") else {
+            return report(id, slug, false, "(temp restore file left behind after a symlink success)")
+        }
+
+        // Atomic temp-then-rename: an INDUCED copyto failure (a valid match is
+        // found — sourcePath is legitimate — but the copy itself is made to
+        // fail) must never move anything into place and must never leave a
+        // temp file behind.
+        var copytoCalls = 0
+        var moveCalls = 0
+        func failingCopytoRclone(_ args: [String], _ remote: String?, _ timeout: TimeInterval) -> (Int32, String, String) {
+            if args.first == "copyto" {
+                copytoCalls += 1
+                return (1, "", "induced failure for AC-L62-9")
+            }
+            return realRclone(args, remote, timeout)
+        }
+        let failEnv = fakeCLIEnvironment(
+            runRclone: failingCopytoRclone,
+            readProfiles: { [profile] },
+            fileExists: { FileManager.default.fileExists(atPath: $0) },
+            removeFile: { (try? FileManager.default.removeItem(atPath: $0)) != nil },
+            moveFile: { from, to in moveCalls += 1; return moveFile(from, to) })
+        let failCode = LimpetCLI.execute(["trash", "restore", profile.shortId, "a.tar.gz", "--force"], env: failEnv)
+        guard failCode != 0, copytoCalls == 1, moveCalls == 0,
+              !FileManager.default.fileExists(atPath: "\(localDir)/a.tar.gz.limpet-restore-tmp") else {
+            return report(id, slug, false,
+                "(an induced copy failure moved something into place or left a temp file: copyto=\(copytoCalls) move=\(moveCalls))")
+        }
+        // The pre-existing a.tar.gz (from the earlier successful restore) must
+        // be untouched by the failed --force attempt.
+        guard let untouchedContent = try? String(contentsOfFile: "\(localDir)/a.tar.gz", encoding: .utf8),
+              untouchedContent == "hello" else {
+            return report(id, slug, false, "(the existing file was altered by a failed restore attempt)")
+        }
+
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L62-10 — purge: $NO_CHECK_CERT (never additionalRcloneFlags)
+    // reaches lsf/purge; an lsf failure logs one line, writes no stamp, and a
+    // later run retries; -n / --dry-run=true / --dry-run=<non-false> are all
+    // dry runs, --dry-run=false is not (code-review findings 5/7 on 87bbf67).
+
+    private static func testTrashPurgeCertFlagsFailureAndDryRunVariants() -> Bool {
+        let id = "AC-L62-10", slug = "trash-purge-cert-flags-failure-dryrun-variants"
+        let trashRoot = "\(selfTestRoot)/ac-l62-10-trash"
+
+        // --- $NO_CHECK_CERT reaches lsf; additionalRcloneFlags never does ---
+        let homeDir = "\(selfTestRoot)/ac-l62-10-home"
+        try? FileManager.default.removeItem(atPath: homeDir)
+        let rcloneConfDir = "\(homeDir)/.config/rclone"
+        do {
+            try FileManager.default.createDirectory(atPath: rcloneConfDir, withIntermediateDirectories: true)
+            try "[selftest-fixture-remote]\nno_check_certificate = true\n"
+                .write(toFile: "\(rcloneConfDir)/rclone.conf", atomically: true, encoding: .utf8)
+        } catch {
+            return report(id, slug, false, "(HOME fixture setup failed)")
+        }
+        let noopStub = "if [ \"$1\" = \"lsf\" ]; then exit 0; fi\nif [ \"$1\" = \"purge\" ]; then exit 0; fi\nexit 0\n"
+        guard let certResult = runScriptFixtureAppending(
+            name: "ac-l62-10-certflags",
+            overrides: ["trashRoot": trashRoot, "trashDays": 14, "additionalFlags": "--exclude=*.tmp --bwlimit=1M"],
+            stubBody: noopStub, extraEnvironment: ["HOME": homeDir]) else {
+            return report(id, slug, false, "(cert/flags fixture setup failed)")
+        }
+        guard certResult.status == 0, let lsfCall = certResult.invocations.first(where: { $0.first == "lsf" }) else {
+            return report(id, slug, false, "(no lsf invocation recorded: status \(certResult.status))")
+        }
+        guard lsfCall.contains("--no-check-certificate") else {
+            return report(id, slug, false, "(lsf did not receive --no-check-certificate: \(lsfCall))")
+        }
+        guard !lsfCall.contains("--exclude=*.tmp"), !lsfCall.contains("--bwlimit=1M") else {
+            return report(id, slug, false, "(lsf received the profile's additionalRcloneFlags: \(lsfCall))")
+        }
+
+        // --- an lsf failure logs one line, writes NO stamp, and a later run retries ---
+        let failStub = "if [ \"$1\" = \"lsf\" ]; then exit 1; fi\nexit 0\n"
+        let failName = "ac-l62-10-lsf-fail"
+        guard let first = runScriptFixtureAppending(
+            name: failName, overrides: ["trashRoot": trashRoot, "trashDays": 14], stubBody: failStub) else {
+            return report(id, slug, false, "(lsf-failure fixture setup failed)")
+        }
+        guard first.status == 0, first.log.contains("could not list"),
+              first.invocations.contains(where: { $0.first == "lsf" }) else {
+            return report(id, slug, false, "(lsf failure did not log the expected line: \(first.log))")
+        }
+        let stampPath = "\(selfTestRoot)/\(failName)/profile.trash-purged"
+        guard !FileManager.default.fileExists(atPath: stampPath) else {
+            return report(id, slug, false, "(the stamp was written despite an lsf failure)")
+        }
+        guard let second = runScriptFixtureAppending(
+            name: failName, overrides: ["trashRoot": trashRoot, "trashDays": 14], stubBody: failStub, reset: false),
+              second.invocations.contains(where: { $0.first == "lsf" }) else {
+            return report(id, slug, false, "(a later run did not retry the purge after an lsf failure)")
+        }
+
+        // --- dry-run detection: -n, --dry-run=true, --dry-run=<non-false> all
+        // skip; --dry-run=false does not ---
+        let dryRunStub = "if [ \"$1\" = \"lsf\" ]; then exit 0; fi\nexit 0\n"
+        let cases: [(flag: String, isDryRun: Bool)] = [
+            ("-n", true), ("--dry-run=true", true), ("--dry-run=1", true), ("--dry-run=false", false),
+        ]
+        for (index, testCase) in cases.enumerated() {
+            guard let result = runScriptFixtureAppending(
+                name: "ac-l62-10-dry-\(index)",
+                overrides: ["trashRoot": trashRoot, "trashDays": 14, "additionalFlags": testCase.flag],
+                stubBody: dryRunStub) else {
+                return report(id, slug, false, "(dry-run fixture setup failed for \"\(testCase.flag)\")")
+            }
+            let lsfCalled = result.invocations.contains(where: { $0.first == "lsf" })
+            if testCase.isDryRun {
+                guard !lsfCalled else {
+                    return report(id, slug, false, "(\"\(testCase.flag)\" was not treated as a dry run)")
+                }
+            } else {
+                guard lsfCalled else {
+                    return report(id, slug, false, "(\"\(testCase.flag)\" was incorrectly treated as a dry run)")
+                }
+            }
+        }
+
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L62-7 — RcloneLogEntry parsing + SyncManager's filter TOGETHER:
+    // a real delete surfaces exactly once, an overwrite surfaces zero deletes,
+    // and a genuine rename is never confused with a backup-dir move.
+
+    /// Code-review finding 1 (P1) on 87bbf67: the previous `shouldReportFileChange`
+    /// was keyed off `operation == .deleted` alone, which ALSO matched
+    /// `Moved into backup dir` (mapped to the same `.deleted` case as the
+    /// ambiguous bare `Deleted`), so EVERY delete on a trash profile was
+    /// dropped, real ones included. Finding 8: `Moved (server-side) to: ...`
+    /// is ambiguous the same way (a real `--track-renames` rename vs a
+    /// Move-capable backend's backup move) and must be suppressed on a trash
+    /// profile like the bare `Deleted`, while an unambiguous `Renamed from
+    /// "..."` must never be. This drives the REAL production seam end to end:
+    /// `RcloneLogEntry.fileChange` (parsing) THEN `SyncManager.shouldReportFileChange`
+    /// (the filter) — not either one in isolation.
+    private static func testRealDeleteSurfacesOnceOverwriteSurfacesZero() -> Bool {
+        let id = "AC-L62-7", slug = "real-delete-once-overwrite-zero-rename-unambiguous"
+
+        func entry(level: String, msg: String, object: String) -> RcloneLogEntry {
+            RcloneLogEntry(
+                level: level, msg: msg, time: "2026-09-28T00:00:00.000000+08:00",
+                object: object, objectType: "*local.Object", stats: nil, source: nil, size: nil)
+        }
+        /// Reported .deleted count for a sequence of lines, given `hasTrashRoot`.
+        func reportedDeletedCount(_ lines: [RcloneLogEntry], hasTrashRoot: Bool) -> Int {
+            lines.compactMap(\.fileChange)
+                .filter { $0.operation == .deleted && SyncManager.shouldReportFileChange($0, hasTrashRoot: hasTrashRoot) }
+                .count
+        }
+
+        // Measured 2026-09-28 (rclone 1.75.1, --disable Move, the S4 path):
+        // a real delete is "Copied (server-side copy) to: …" + "Deleted" +
+        // "Moved into backup dir" (all for the SAME object, d1.txt); an
+        // overwrite is "Copied (server-side copy) to: …" + "Deleted" only
+        // (object a.txt), no "Moved into backup dir" line at all.
+        let s4Delete = [
+            entry(level: "info", msg: "Copied (server-side copy) to: d1-100002.txt", object: "d1.txt"),
+            entry(level: "info", msg: "Deleted", object: "d1.txt"),
+            entry(level: "info", msg: "Moved into backup dir", object: "d1.txt"),
+        ]
+        let s4Overwrite = [
+            entry(level: "info", msg: "Copied (server-side copy) to: a-100001.tar.gz", object: "a.txt"),
+            entry(level: "info", msg: "Deleted", object: "a.txt"),
+        ]
+        guard reportedDeletedCount(s4Delete, hasTrashRoot: true) == 1 else {
+            return report(id, slug, false, "(a real S4-path delete did not surface exactly one .deleted)")
+        }
+        guard reportedDeletedCount(s4Overwrite, hasTrashRoot: true) == 0 else {
+            return report(id, slug, false, "(an S4-path overwrite surfaced a .deleted)")
+        }
+        // Without a trash root, nothing is ever suppressed: the delete
+        // sequence's "Deleted" AND "Moved into backup dir" BOTH map to
+        // .deleted and both count (2); the overwrite sequence's lone
+        // "Deleted" line counts once (1) — exactly as pre-trash code, since
+        // hasTrashRoot gates the whole filter off.
+        guard reportedDeletedCount(s4Delete, hasTrashRoot: false) == 2,
+              reportedDeletedCount(s4Overwrite, hasTrashRoot: false) == 1 else {
+            return report(id, slug, false, "(a non-trash profile's Deleted lines were suppressed)")
+        }
+
+        // Finding 8, reference measurement (plan's "Move-capable backends, for
+        // reference" note — a Move-capable backend backs up directly, no
+        // Copy+Delete fallback): an overwrite's backup step and a delete's
+        // both log "Moved (server-side) to: …"; the delete ALSO logs "Moved
+        // into backup dir" (no bare "Deleted" at all on this path).
+        let moveCapableOverwrite = entry(level: "info", msg: "Moved (server-side) to: a-renamed.txt", object: "a.txt")
+        let moveCapableDelete = [
+            entry(level: "info", msg: "Moved (server-side) to: d1-100003.txt", object: "d1.txt"),
+            entry(level: "info", msg: "Moved into backup dir", object: "d1.txt"),
+        ]
+        let genuineRename = entry(level: "info", msg: "Renamed from \"old.txt\"", object: "new.txt")
+
+        guard let overwriteChange = moveCapableOverwrite.fileChange, overwriteChange.operation == .renamed,
+              overwriteChange.mayBeTrashArtifact else {
+            return report(id, slug, false, "(the Move-capable overwrite line did not parse as an ambiguous .renamed)")
+        }
+        guard !SyncManager.shouldReportFileChange(overwriteChange, hasTrashRoot: true),
+              SyncManager.shouldReportFileChange(overwriteChange, hasTrashRoot: false) else {
+            return report(id, slug, false, "(the ambiguous rename was not suppressed for trash / shown without it)")
+        }
+        let deleteRenamedChanges = moveCapableDelete.compactMap(\.fileChange)
+        guard deleteRenamedChanges.filter({ SyncManager.shouldReportFileChange($0, hasTrashRoot: true) }).count == 1 else {
+            return report(id, slug, false, "(the Move-capable delete did not surface exactly one change under trash)")
+        }
+        guard let genuineChange = genuineRename.fileChange, genuineChange.operation == .renamed,
+              !genuineChange.mayBeTrashArtifact,
+              SyncManager.shouldReportFileChange(genuineChange, hasTrashRoot: true),
+              SyncManager.shouldReportFileChange(genuineChange, hasTrashRoot: false) else {
+            return report(id, slug, false, "(a genuine \"Renamed from\" line was suppressed or misparsed)")
+        }
+
         return report(id, slug, true)
     }
 
