@@ -157,6 +157,7 @@ enum ConfigSelfTest {
             testInstallThrowsOnLaunchctlLoadFailure,
             testTerminateChildProcessGroupKillsRealGroup,
             testSpawnTerminationRaceClosesWithoutOrphan,
+            testInstallRefreshesLoadedAgentAndCleansUpFailure,
         ]
 
         for check in checks {
@@ -4379,6 +4380,81 @@ enum ConfigSelfTest {
         }
         guard failedSpawnState.spawned(pid: nil) == .ok else {
             return report(id, slug, false, "(a failed spawn after a pending termination claimed a PID to kill)")
+        }
+
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L61-9 — install refreshes an already-loaded agent and cleans up a failed load
+
+    /// limpet-plan.md L6.1 change B, code-review finding 4. Both halves use
+    /// ONLY injected closures — `isLoadedCheck`/`unloadCommand`/`loadCommand`
+    /// — never real `launchctl`.
+    private static func testInstallRefreshesLoadedAgentAndCleansUpFailure() -> Bool {
+        let id = "AC-L61-9", slug = "install-refreshes-loaded-agent-cleans-up-failure"
+        let dir = "\(selfTestRoot)/ac-l61-9"
+        try? FileManager.default.removeItem(atPath: dir)
+        var profile = sampleProfile(name: "Reload", isEnabled: true)
+        profile.localSyncPath = "\(dir)/local"
+        try? FileManager.default.createDirectory(atPath: profile.localSyncPath, withIntermediateDirectories: true)
+
+        // (a) Already loaded: install must unload BEFORE loading, so `load`
+        // always starts fresh rather than being a no-op over a stale agent.
+        var callOrder: [String] = []
+        do {
+            try SyncSetupService.shared.install(
+                profile: profile, loadAgent: true,
+                executablePath: "/Applications/limpet.app/Contents/MacOS/limpet",
+                otherProfiles: [], isInstalled: { _ in false },
+                loadCommand: { _ in callOrder.append("load"); return (output: "", exitCode: 0) },
+                isLoadedCheck: { _ in true },
+                unloadCommand: { _ in callOrder.append("unload"); return (output: "", exitCode: 0) })
+        } catch {
+            return report(id, slug, false, "(install threw unexpectedly: \(error))")
+        }
+        guard callOrder == ["unload", "load"] else {
+            return report(id, slug, false, "(call order was \(callOrder), expected [unload, load])")
+        }
+
+        // Not loaded: no unload call at all.
+        callOrder = []
+        do {
+            try SyncSetupService.shared.install(
+                profile: profile, loadAgent: true,
+                executablePath: "/Applications/limpet.app/Contents/MacOS/limpet",
+                otherProfiles: [], isInstalled: { _ in false },
+                loadCommand: { _ in callOrder.append("load"); return (output: "", exitCode: 0) },
+                isLoadedCheck: { _ in false },
+                unloadCommand: { _ in callOrder.append("unload"); return (output: "", exitCode: 0) })
+        } catch {
+            return report(id, slug, false, "(install threw unexpectedly: \(error))")
+        }
+        guard callOrder == ["load"] else {
+            return report(id, slug, false, "(call order was \(callOrder), an unnecessary unload ran)")
+        }
+
+        // (b) A failed load must remove the plist it just wrote — otherwise
+        // `agentInstalled`/`isInstalled` reports true with no agent actually
+        // loaded, and the F6 overlap check would count it as a real opponent.
+        // (a) above installed successfully, so a plist is on disk; remove it
+        // to isolate this half's own fixture.
+        try? FileManager.default.removeItem(atPath: profile.plistPath)
+        do {
+            try SyncSetupService.shared.install(
+                profile: profile, loadAgent: true,
+                executablePath: "/Applications/limpet.app/Contents/MacOS/limpet",
+                otherProfiles: [], isInstalled: { _ in false },
+                loadCommand: { _ in (output: "boom", exitCode: 1) },
+                isLoadedCheck: { _ in false },
+                unloadCommand: { _ in (output: "", exitCode: 0) })
+            return report(id, slug, false, "(install did not throw on a failing load)")
+        } catch SyncSetupService.SetupError.launchAgentLoadFailed {
+            // expected
+        } catch {
+            return report(id, slug, false, "(threw the wrong error: \(error))")
+        }
+        guard FileManager.default.fileExists(atPath: profile.plistPath) == false else {
+            return report(id, slug, false, "(the plist was left behind after a failed load)")
         }
 
         return report(id, slug, true)

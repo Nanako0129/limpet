@@ -115,7 +115,9 @@ final class SyncSetupService {
         executablePath: String = Bundle.main.executablePath ?? "",
         otherProfiles: [SyncProfile] = ProfileStore.profilesOnDisk(in: SyncProfile.configDirectory),
         isInstalled: (SyncProfile) -> Bool = SyncProfile.agentInstalled,
-        loadCommand: (String) -> (output: String, exitCode: Int32) = { SyncSetupService.shared.runLaunchctlLoad(plistPath: $0) }
+        loadCommand: (String) -> (output: String, exitCode: Int32) = { SyncSetupService.shared.runLaunchctlLoad(plistPath: $0) },
+        isLoadedCheck: (SyncProfile) -> Bool = { SyncSetupService.shared.isLoaded(profile: $0) },
+        unloadCommand: (String) -> (output: String, exitCode: Int32) = { SyncSetupService.shared.runLaunchctlUnload(plistPath: $0) }
     ) throws {
         // F4/F6 (limpet-plan.md L4) come FIRST, before anything is written. The
         // self-test relies on this order: it calls install with a refused profile
@@ -190,9 +192,24 @@ final class SyncSetupService {
         // Callers already surface a thrown error (CLI stderr via `installProfile`,
         // the app's `profileErrors` via `applyProfileChange`/`applyExternalProfileEdit`),
         // so throwing here is enough to reach both.
+        //
+        // code-review finding 4: an edit path (the wizard's "save" in particular)
+        // can call `install` on a profile whose agent is ALREADY loaded — a plain
+        // `launchctl load` on top of a running one is a no-op that does NOT pick
+        // up the plist/script this call just rewrote. Unload first whenever the
+        // agent is currently loaded, so `load` always starts fresh.
         if loadAgent {
+            if isLoadedCheck(profile) {
+                _ = unloadCommand(profile.plistPath)
+            }
             let result = loadCommand(profile.plistPath)
             guard result.exitCode == 0 else {
+                // code-review finding 4: a plist left behind after a failed load
+                // makes `isInstalled`/`agentInstalled` report true with no agent
+                // actually running, so a later profile would see this one as an
+                // "installed" overlap opponent it can never actually collide
+                // with in practice, and `doctor` would call it installed too.
+                try? FileManager.default.removeItem(atPath: profile.plistPath)
                 throw SetupError.launchAgentLoadFailed(exitCode: result.exitCode, output: result.output)
             }
         }
@@ -203,6 +220,13 @@ final class SyncSetupService {
     /// with a fake that never touches real launchctl.
     func runLaunchctlLoad(plistPath: String) -> (output: String, exitCode: Int32) {
         runCommand("/bin/launchctl", arguments: ["load", plistPath])
+    }
+
+    /// `launchctl unload` for one plist path. Not private so `install`'s default
+    /// `unloadCommand` and `ConfigSelfTest` can call it directly, or replace it
+    /// with a fake that never touches real launchctl.
+    func runLaunchctlUnload(plistPath: String) -> (output: String, exitCode: Int32) {
+        runCommand("/bin/launchctl", arguments: ["unload", plistPath])
     }
 
     /// Load the launchd agent for a profile (used after deferred install)
