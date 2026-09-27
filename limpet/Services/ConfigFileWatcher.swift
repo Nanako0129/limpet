@@ -72,6 +72,71 @@ final class ConfigSelfWriteRegistry {
     }
 }
 
+/// Cross-process counterpart to `ConfigSelfWriteRegistry` (limpet-plan.md
+/// L6.1 change A). `ConfigSelfWriteRegistry` only works within one process, so
+/// it cannot suppress a reconcile the running GUI app would otherwise do in
+/// response to a write made by the SEPARATE `limpet` CLI process (e.g.
+/// `limpet profile set`, which already reconciles launchd itself). The CLI's
+/// write closure notes a marker file — named by the content hash it is ABOUT
+/// to write — under `directory` BEFORE writing the profile file; the watcher
+/// consumes (reads and deletes) a matching marker on a registry miss and, on a
+/// hit, still refreshes the in-memory profile but skips install/uninstall.
+///
+/// `directory` is `private(set)` and overridable only through `withDirectory`,
+/// so a self-test can redirect every marker read/write to an isolated temp
+/// root for the duration of one test without ever touching the real path.
+enum CLIWriteMarker {
+    static private(set) var directory = "\(LimpetPaths.home)/.local/state/limpet/cli-writes"
+
+    /// Markers older than this are stale (a crashed CLI, or a marker no
+    /// matching FSEvent ever arrived to consume) and are removed on sight.
+    static let maxAge: TimeInterval = 600
+
+    /// Run `body` with `directory` redirected to `dir`, restoring the previous
+    /// value afterward — the ONLY way `directory` changes, so self-test
+    /// isolation can never leak into a later test or the real path.
+    static func withDirectory<T>(_ dir: String, _ body: () -> T) -> T {
+        let previous = directory
+        directory = dir
+        defer { directory = previous }
+        return body()
+    }
+
+    /// Record that the CLI is about to write content hashing to `contentHash`.
+    /// Called BEFORE the profile file itself is written, so a watcher FSEvent
+    /// racing the write can never arrive before the marker exists.
+    static func note(contentHash: String, now: Date = Date()) {
+        let fm = FileManager.default
+        guard (try? fm.createDirectory(
+            atPath: directory, withIntermediateDirectories: true)) != nil else { return }
+        let path = "\(directory)/\(contentHash)"
+        try? "\(now.timeIntervalSince1970)".write(toFile: path, atomically: true, encoding: .utf8)
+    }
+
+    /// Removes every stale (>`maxAge`) marker, then consumes (reads and
+    /// deletes) a fresh marker matching `hash`, if any. Returns whether one
+    /// was consumed.
+    static func consume(hash: String, now: Date = Date()) -> Bool {
+        let fm = FileManager.default
+        guard let files = try? fm.contentsOfDirectory(atPath: directory) else { return false }
+        for file in files {
+            let path = "\(directory)/\(file)"
+            guard let content = try? String(contentsOfFile: path, encoding: .utf8),
+                  let noted = TimeInterval(content) else {
+                try? fm.removeItem(atPath: path)  // not a marker this type wrote; drop it
+                continue
+            }
+            if now.timeIntervalSince1970 - noted > maxAge {
+                try? fm.removeItem(atPath: path)
+            }
+        }
+        let markerPath = "\(directory)/\(hash)"
+        guard fm.fileExists(atPath: markerPath) else { return false }
+        try? fm.removeItem(atPath: markerPath)
+        return true
+    }
+}
+
 /// Watches `~/.config/limpet` for external edits to `*.profile.json` and
 /// `settings.json` and routes debounced changes through the SAME reconcile
 /// path the in-app Save button uses — never a bare in-memory struct swap.
@@ -84,7 +149,11 @@ final class ConfigSelfWriteRegistry {
 final class ConfigFileWatcher {
     private var stream: FSEventStreamRef?
     private let watchedDirectory: String
-    private let onProfileChange: (String) -> Void
+    /// `suppressReconcile` is true for a write the CLI marked as its own
+    /// (limpet-plan.md L6.1 change A): the caller must still refresh its
+    /// in-memory profile, but make no install/uninstall/launchctl call, since
+    /// the CLI process already reconciled launchd for this write.
+    private let onProfileChange: (_ path: String, _ suppressReconcile: Bool) -> Void
     private let onSettingsChange: () -> Void
     private let debounceInterval: TimeInterval
 
@@ -100,7 +169,7 @@ final class ConfigFileWatcher {
     init(
         watchedDirectory: String = "\(LimpetPaths.home)/.config/limpet",
         debounceInterval: TimeInterval = 1.0,
-        onProfileChange: @escaping (String) -> Void,
+        onProfileChange: @escaping (_ path: String, _ suppressReconcile: Bool) -> Void,
         onSettingsChange: @escaping () -> Void
     ) {
         self.watchedDirectory = watchedDirectory
@@ -197,20 +266,24 @@ final class ConfigFileWatcher {
 
     private func processChangedPaths(_ paths: [String]) {
         for path in paths {
-            // A half-written file (partial JSON) either fails `shouldReconcile`'s
+            // A half-written file (partial JSON) either fails `classifyWrite`'s
             // read/decode-adjacent hash check trivially (still reconciles — the
-            // hash just won't match a self-write) or the downstream decode in
-            // `applyExternalProfileEdit`/`applyExternalSettingsEdit` fails and is
-            // skipped there; either way the next complete-write event reconciles.
-            guard Self.shouldReconcile(forFileAt: path) else { continue }
-            classify(path)
+            // hash just won't match a self-write or a CLI marker) or the
+            // downstream decode in `applyExternalProfileEdit`/
+            // `applyExternalSettingsEdit` fails and is skipped there; either way
+            // the next complete-write event reconciles.
+            switch Self.classifyWrite(forFileAt: path) {
+            case .skip: continue
+            case .cliWrite: classify(path, suppressReconcile: true)
+            case .external: classify(path, suppressReconcile: false)
+            }
         }
     }
 
-    private func classify(_ path: String) {
+    private func classify(_ path: String, suppressReconcile: Bool) {
         let filename = (path as NSString).lastPathComponent
         if filename.hasSuffix(".profile.json") {
-            onProfileChange(path)
+            onProfileChange(path, suppressReconcile)
         } else if filename == "settings.json" {
             onSettingsChange()
         }
@@ -219,17 +292,45 @@ final class ConfigFileWatcher {
         // surface and is intentionally ignored here.
     }
 
-    /// Pure, directly-testable suppression check: reads the file at `path`,
-    /// hashes its content, and returns false (do not reconcile) if that hash
-    /// matches a write limpet itself just performed. A missing/unreadable
-    /// file (e.g. deleted, or caught mid-write) also returns false.
-    static func shouldReconcile(forFileAt path: String) -> Bool {
-        guard let data = FileManager.default.contents(atPath: path) else { return false }
+    /// Whether — and why — a changed file should be reconciled: the writer of
+    /// a file under `~/.config/limpet` (limpet-plan.md L6.1 change A).
+    enum WriteOrigin: Equatable {
+        /// limpet's own in-process write (`ConfigSelfWriteRegistry` hit), or a
+        /// missing/unreadable file (e.g. deleted, or caught mid-write). Do
+        /// nothing.
+        case skip
+        /// The CLI's own write (a fresh `CLIWriteMarker` hit): refresh the
+        /// in-memory profile, but make no install/uninstall/launchctl call —
+        /// the CLI process already reconciled launchd for this write.
+        case cliWrite
+        /// Neither of the above: a hand edit, or a genuinely external tool.
+        /// Reconcile normally.
+        case external
+    }
+
+    /// Pure, directly-testable classification: reads the file at `path`,
+    /// hashes its content, and checks the in-process self-write registry
+    /// FIRST (a hit ends the check — markers are not even read) and only on a
+    /// miss consults `CLIWriteMarker`.
+    static func classifyWrite(forFileAt path: String) -> WriteOrigin {
+        guard let data = FileManager.default.contents(atPath: path) else { return .skip }
         let hash = ConfigSelfWriteRegistry.hash(data)
         if ConfigSelfWriteRegistry.shared.consumeIfSelfWrite(contentHash: hash) {
-            return false
+            return .skip
         }
-        return true
+        if CLIWriteMarker.consume(hash: hash) {
+            return .cliWrite
+        }
+        return .external
+    }
+
+    /// Legacy bool view of `classifyWrite`, kept only because it reads more
+    /// directly in a plain self-write-suppression test (AC-5): `true` unless
+    /// the write should be skipped entirely. Touches `CLIWriteMarker` exactly
+    /// like `classifyWrite` — a caller in a self-test MUST wrap it in
+    /// `CLIWriteMarker.withDirectory` to avoid ever reading the real path.
+    static func shouldReconcile(forFileAt path: String) -> Bool {
+        classifyWrite(forFileAt: path) != .skip
     }
 }
 

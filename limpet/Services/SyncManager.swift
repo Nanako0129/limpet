@@ -342,8 +342,10 @@ final class SyncManager: ObservableObject {
     /// `ConfigSchemaInstaller.writeSchemas()`, called before `SyncManager` is created).
     private func startConfigWatcher() {
         let watcher = ConfigFileWatcher(
-            onProfileChange: { [weak self] path in
-                Task { @MainActor in self?.applyExternalProfileEdit(fromFileAt: path) }
+            onProfileChange: { [weak self] path, suppressReconcile in
+                Task { @MainActor in
+                    self?.applyExternalProfileEdit(fromFileAt: path, suppressReconcile: suppressReconcile)
+                }
             },
             onSettingsChange: { [weak self] in
                 Task { @MainActor in self?.applyExternalSettingsEdit() }
@@ -371,8 +373,21 @@ final class SyncManager: ObservableObject {
     /// id is not ignored: it CREATES the profile (see `applyExternalProfileCreate`
     /// / `SyncManager.applyExternalCreateIfNeeded`), so an agent can bootstrap a
     /// new sync purely by dropping a file.
-    func applyExternalProfileEdit(fromFileAt path: String) {
+    ///
+    /// - Parameter suppressReconcile: true when `ConfigFileWatcher` matched this
+    ///   write to a `CLIWriteMarker` (limpet-plan.md L6.1 change A) — the `limpet`
+    ///   CLI process already installed/uninstalled/reinstalled for this exact
+    ///   write, so `install`/`uninstall` below are replaced with no-ops; `persist`
+    ///   still runs, refreshing `profileStore.profiles` (and, through its
+    ///   `$profiles` sink, `logWatchers`) so the running app's in-memory state
+    ///   never drifts from the file the CLI just wrote. Without this, the CLI's
+    ///   `launchctl load`/`unload` and this app's own reconcile would race and
+    ///   double-reload the same agent for one edit.
+    func applyExternalProfileEdit(fromFileAt path: String, suppressReconcile: Bool = false) {
         guard let data = FileManager.default.contents(atPath: path) else { return }
+        let install: (SyncProfile) throws -> Void = suppressReconcile ? { _ in } : { [self] in try installAndWatch($0) }
+        let uninstall: (SyncProfile) throws -> Void = suppressReconcile
+            ? { _ in } : { [self] in try uninstallAndStopWatching($0) }
         let outcome = Self.applyExternalEdit(
             data: data,
             path: path,
@@ -383,8 +398,8 @@ final class SyncManager: ObservableObject {
                 clearError(for: profile.id)
                 profileStore.update(profile)
             },
-            install: { [self] in try installAndWatch($0) },
-            uninstall: { [self] in try uninstallAndStopWatching($0) },
+            install: install,
+            uninstall: uninstall,
             reportError: { [self] id, message in
                 profileErrors[id] = message
                 print(message)
@@ -392,7 +407,7 @@ final class SyncManager: ObservableObject {
             })
         switch outcome {
         case .create(let profile):
-            applyExternalProfileCreate(decoded: profile, sourcePath: path)
+            applyExternalProfileCreate(decoded: profile, sourcePath: path, suppressReconcile: suppressReconcile)
         case .ignored:
             LimpetSettings.debugLog("[ConfigFileWatcher] \(path) is not a complete profile yet; skipping")
         case .applied, .restored:
@@ -413,7 +428,7 @@ final class SyncManager: ObservableObject {
     /// content hash in `ConfigSelfWriteRegistry`) — the resulting missing-source
     /// FSEvent is a no-op (`ConfigFileWatcher.shouldReconcile` returns false for
     /// a missing file), so this can never loop.
-    private func applyExternalProfileCreate(decoded: SyncProfile, sourcePath: String) {
+    private func applyExternalProfileCreate(decoded: SyncProfile, sourcePath: String, suppressReconcile: Bool = false) {
         let outcome = Self.applyExternalCreateIfNeeded(
             decoded: decoded,
             isKnownId: false,
@@ -429,7 +444,14 @@ final class SyncManager: ObservableObject {
                     try? FileManager.default.removeItem(atPath: sourcePath)
                 }
             },
+            // suppressReconcile (limpet-plan.md L6.1 change A): a `limpet
+            // profile create` from the CLI already installed the agent itself,
+            // through the SAME `SyncSetupService.install`. `persist` above still
+            // runs — `profileStore.add`'s `$profiles` sink starts a `LogWatcher`
+            // for the new profile via `startWatchingAllProfiles`, with no
+            // install/launchctl call from this process.
             install: { [weak self] profile in
+                guard !suppressReconcile else { return }
                 do {
                     try self?.setupService.install(profile: profile)
                     self?.startWatching(profile: profile)

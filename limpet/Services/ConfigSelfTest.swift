@@ -149,6 +149,9 @@ enum ConfigSelfTest {
             testSourceMissingClearsOnRecheck,
             testRcloneLogEntryFileChangeMapping,
             testExitCodeErrorText,
+            testCLIWriteMarkerClassification,
+            testAppWritesLeaveMarkerDirEmpty,
+            testCLIMarkerSuppressesReconcile,
         ]
 
         for check in checks {
@@ -339,29 +342,36 @@ enum ConfigSelfTest {
     private static func testSelfWriteSuppression() -> Bool {
         let dir = "\(selfTestRoot)/ac5-selfwrite"
         try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        // `shouldReconcile`/`classifyWrite` also consult `CLIWriteMarker`; redirect
+        // it to an isolated, empty temp dir so this test never touches the real
+        // `~/.local/state/limpet/cli-writes` (no marker here is ever expected to
+        // match, but the directory listing itself must stay off the real path).
+        let markerDir = "\(dir)/cli-writes"
 
-        let selfWrittenPath = "\(dir)/self-written.profile.json"
-        let selfWrittenContent = Data("{\"marker\":\"self-write\"}".utf8)
-        guard (try? selfWrittenContent.write(to: URL(fileURLWithPath: selfWrittenPath))) != nil else {
-            return report("AC-5", "self-write-suppression", false, "(failed to write fixture)")
-        }
-        ConfigSelfWriteRegistry.shared.noteSelfWrite(contentHash: ConfigSelfWriteRegistry.hash(selfWrittenContent))
+        return CLIWriteMarker.withDirectory(markerDir) {
+            let selfWrittenPath = "\(dir)/self-written.profile.json"
+            let selfWrittenContent = Data("{\"marker\":\"self-write\"}".utf8)
+            guard (try? selfWrittenContent.write(to: URL(fileURLWithPath: selfWrittenPath))) != nil else {
+                return report("AC-5", "self-write-suppression", false, "(failed to write fixture)")
+            }
+            ConfigSelfWriteRegistry.shared.noteSelfWrite(contentHash: ConfigSelfWriteRegistry.hash(selfWrittenContent))
 
-        guard ConfigFileWatcher.shouldReconcile(forFileAt: selfWrittenPath) == false else {
-            return report("AC-5", "self-write-suppression", false, "(a noted self-write was NOT suppressed)")
-        }
+            guard ConfigFileWatcher.shouldReconcile(forFileAt: selfWrittenPath) == false else {
+                return report("AC-5", "self-write-suppression", false, "(a noted self-write was NOT suppressed)")
+            }
 
-        // A genuinely external write (different, un-noted content) must still reconcile.
-        let externalPath = "\(dir)/external.profile.json"
-        let externalContent = Data("{\"marker\":\"external-write\"}".utf8)
-        guard (try? externalContent.write(to: URL(fileURLWithPath: externalPath))) != nil else {
-            return report("AC-5", "self-write-suppression", false, "(failed to write external fixture)")
-        }
-        guard ConfigFileWatcher.shouldReconcile(forFileAt: externalPath) == true else {
-            return report("AC-5", "self-write-suppression", false, "(an external write was incorrectly suppressed)")
-        }
+            // A genuinely external write (different, un-noted content) must still reconcile.
+            let externalPath = "\(dir)/external.profile.json"
+            let externalContent = Data("{\"marker\":\"external-write\"}".utf8)
+            guard (try? externalContent.write(to: URL(fileURLWithPath: externalPath))) != nil else {
+                return report("AC-5", "self-write-suppression", false, "(failed to write external fixture)")
+            }
+            guard ConfigFileWatcher.shouldReconcile(forFileAt: externalPath) == true else {
+                return report("AC-5", "self-write-suppression", false, "(an external write was incorrectly suppressed)")
+            }
 
-        return report("AC-5", "self-write-suppression", true)
+            return report("AC-5", "self-write-suppression", true)
+        }
     }
 
     // MARK: - AC-6 — migration v3 (blob -> per-profile files, blob retained)
@@ -3936,6 +3946,238 @@ enum ConfigSelfTest {
         }
 
         return report(id, slug, true)
+    }
+
+    // MARK: - AC-L61-1 — CLIWriteMarker + ConfigFileWatcher.classifyWrite
+
+    /// limpet-plan.md L6.1 change A. Drives `CLIWriteMarker.note`/`consume` and
+    /// `ConfigFileWatcher.classifyWrite` directly, always inside
+    /// `CLIWriteMarker.withDirectory` pointed at an isolated temp dir under
+    /// `selfTestRoot` — this NEVER reads or writes the real
+    /// `~/.local/state/limpet/cli-writes` (a hard limit for this repo).
+    private static func testCLIWriteMarkerClassification() -> Bool {
+        let id = "AC-L61-1", slug = "cli-write-marker-classification"
+        let dir = "\(selfTestRoot)/ac-l61-1"
+        try? FileManager.default.removeItem(atPath: dir)
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let markerDir = "\(dir)/cli-writes"
+        let fm = FileManager.default
+
+        return CLIWriteMarker.withDirectory(markerDir) {
+            // (a) a CLI write (marker noted, then the file written) is classified
+            // .cliWrite, and consuming it is one-shot: classifying the same
+            // content again (marker gone, no self-write registry entry either)
+            // is .external.
+            let cliPath = "\(dir)/cli-written.profile.json"
+            let cliContent = Data("{\"marker\":\"cli-write\"}".utf8)
+            let cliHash = ConfigSelfWriteRegistry.hash(cliContent)
+            CLIWriteMarker.note(contentHash: cliHash)
+            guard (try? cliContent.write(to: URL(fileURLWithPath: cliPath))) != nil else {
+                return report(id, slug, false, "(failed to write cli fixture)")
+            }
+            guard ConfigFileWatcher.classifyWrite(forFileAt: cliPath) == .cliWrite else {
+                return report(id, slug, false, "(a marked CLI write was not classified .cliWrite)")
+            }
+            guard ConfigFileWatcher.classifyWrite(forFileAt: cliPath) == .external else {
+                return report(id, slug, false, "(a consumed marker was matched a second time)")
+            }
+
+            // (b) the SAME content with no marker at all is .external.
+            let externalPath = "\(dir)/external.profile.json"
+            let externalContent = Data("{\"marker\":\"external-write\"}".utf8)
+            guard (try? externalContent.write(to: URL(fileURLWithPath: externalPath))) != nil else {
+                return report(id, slug, false, "(failed to write external fixture)")
+            }
+            guard ConfigFileWatcher.classifyWrite(forFileAt: externalPath) == .external else {
+                return report(id, slug, false, "(an unmarked write was not classified .external)")
+            }
+
+            // (c) a marker older than the 10-minute TTL is ignored AND removed
+            // on the next consult, even for content that was never re-checked.
+            let stalePath = "\(dir)/stale.profile.json"
+            let staleContent = Data("{\"marker\":\"stale\"}".utf8)
+            let staleHash = ConfigSelfWriteRegistry.hash(staleContent)
+            CLIWriteMarker.note(contentHash: staleHash, now: Date().addingTimeInterval(-700))
+            guard (try? staleContent.write(to: URL(fileURLWithPath: stalePath))) != nil else {
+                return report(id, slug, false, "(failed to write stale fixture)")
+            }
+            guard fm.fileExists(atPath: "\(markerDir)/\(staleHash)") else {
+                return report(id, slug, false, "(stale marker fixture was not written)")
+            }
+            guard ConfigFileWatcher.classifyWrite(forFileAt: stalePath) == .external else {
+                return report(id, slug, false, "(a marker older than 10 minutes was still honored)")
+            }
+            guard !fm.fileExists(atPath: "\(markerDir)/\(staleHash)") else {
+                return report(id, slug, false, "(a stale marker was not removed)")
+            }
+
+            // (d) the in-process self-write registry is checked FIRST: a hit
+            // there ends the check without even reading a matching marker —
+            // the marker must still be sitting there afterward, unconsumed.
+            let bothPath = "\(dir)/both.profile.json"
+            let bothContent = Data("{\"marker\":\"self-write-and-marker\"}".utf8)
+            let bothHash = ConfigSelfWriteRegistry.hash(bothContent)
+            ConfigSelfWriteRegistry.shared.noteSelfWrite(contentHash: bothHash)
+            CLIWriteMarker.note(contentHash: bothHash)
+            guard (try? bothContent.write(to: URL(fileURLWithPath: bothPath))) != nil else {
+                return report(id, slug, false, "(failed to write both-markers fixture)")
+            }
+            guard ConfigFileWatcher.classifyWrite(forFileAt: bothPath) == .skip else {
+                return report(id, slug, false, "(a self-write registry hit did not win over a CLI marker)")
+            }
+            guard fm.fileExists(atPath: "\(markerDir)/\(bothHash)") else {
+                return report(id, slug, false, "(the CLI marker was consumed even though the registry hit first)")
+            }
+
+            return report(id, slug, true)
+        }
+    }
+
+    // MARK: - AC-L61-2 — ProfileStore's own writes never touch CLIWriteMarker
+
+    /// limpet-plan.md L6.1 change A: "ProfileStore.writeProfileFile stays
+    /// marker-free for the app's own writes". Mutation-check: temporarily add
+    /// a `CLIWriteMarker.note(...)` call inside `ProfileStore.writeProfileFile`
+    /// (using the default, ambient `CLIWriteMarker.directory` — exactly what
+    /// this test redirects), rebuild, and confirm this assertion FAILS; then
+    /// revert.
+    private static func testAppWritesLeaveMarkerDirEmpty() -> Bool {
+        let id = "AC-L61-2", slug = "app-writes-leave-marker-dir-empty"
+        let dir = "\(selfTestRoot)/ac-l61-2"
+        try? FileManager.default.removeItem(atPath: dir)
+        let profilesDir = "\(dir)/profiles"
+        let markerDir = "\(dir)/cli-writes"
+        let fm = FileManager.default
+
+        return CLIWriteMarker.withDirectory(markerDir) {
+            let store = ProfileStore(
+                profilesDirectory: profilesDir,
+                defaults: UserDefaults(suiteName: "com.nanako.limpet.selftest.ac-l61-2.\(UUID().uuidString)")!)
+
+            var profile = sampleProfile(name: "AppWrite")
+            store.add(profile)
+            profile.name = "AppWrite renamed"
+            store.update(profile)
+            store.save()
+
+            let markerFiles = (try? fm.contentsOfDirectory(atPath: markerDir)) ?? []
+            guard markerFiles.isEmpty else {
+                return report(id, slug, false, "(ProfileStore.add/update/save left marker(s): \(markerFiles))")
+            }
+            return report(id, slug, true)
+        }
+    }
+
+    // MARK: - AC-L61-3 — a marker-hit CLI write refreshes profileStore, no reconcile
+
+    /// limpet-plan.md L6.1 change A. Mirrors the exact dispatch
+    /// `ConfigFileWatcher`/`SyncManager.applyExternalProfileEdit` do in
+    /// production: classify the write, and only on `.cliWrite` replace
+    /// install/uninstall with no-ops before calling the SAME
+    /// `applyExternalEdit`/`applyExternalCreateIfNeeded` used for every other
+    /// write. Mutation: collapsing `.cliWrite` into `.skip` in that dispatch
+    /// (the existing self-write early return) must fail this test — the
+    /// `skippedEntirely` guard below exists for exactly that mutation.
+    private static func testCLIMarkerSuppressesReconcile() -> Bool {
+        let id = "AC-L61-3", slug = "cli-write-suppresses-reconcile"
+        let dir = "\(selfTestRoot)/ac-l61-3"
+        try? FileManager.default.removeItem(atPath: dir)
+        let profilesDir = "\(dir)/profiles"
+        let markerDir = "\(dir)/cli-writes"
+
+        return CLIWriteMarker.withDirectory(markerDir) {
+            let store = ProfileStore(
+                profilesDirectory: profilesDir,
+                defaults: UserDefaults(suiteName: "com.nanako.limpet.selftest.ac-l61-3.\(UUID().uuidString)")!)
+
+            /// Simulates a `limpet profile set`/`create` write: note the marker
+            /// for the exact bytes about to be written, THEN write them — the
+            /// same order `LimpetCLI`'s `writeProfile` closure uses, calling the
+            /// SAME `ProfileStore.writeProfileFile` the CLI does.
+            ///
+            /// `ProfileStore.writeProfileFile` also notes the write in
+            /// `ConfigSelfWriteRegistry` — correct for the app's own writes, and
+            /// harmless in production for the CLI's, since the CLI runs as its
+            /// OWN process with its OWN registry instance, never the running
+            /// app's. This self-test runs everything in one process, so that
+            /// note would otherwise pollute the very registry
+            /// `ConfigFileWatcher.classifyWrite` checks first, making a marker
+            /// hit look like a same-process self-write instead — undo exactly
+            /// that one entry, restoring the cross-process reality.
+            func cliWrite(_ profile: SyncProfile) -> String? {
+                guard let data = ProfileStore.encodedProfileFileData(profile) else { return nil }
+                let hash = ConfigSelfWriteRegistry.hash(data)
+                CLIWriteMarker.note(contentHash: hash)
+                let filename = ProfileStore.writeProfileFile(profile, in: profilesDir)
+                _ = ConfigSelfWriteRegistry.shared.consumeIfSelfWrite(contentHash: hash)
+                return filename
+            }
+
+            // --- set on an existing id ---
+            var existing = sampleProfile(name: "Existing", isEnabled: true)
+            store.add(existing)  // app write: no marker, direct
+            let existingPath = "\(profilesDir)/\(existing.shortId).profile.json"
+
+            var updated = existing
+            updated.name = "Existing renamed"
+            guard cliWrite(updated) != nil else {
+                return report(id, slug, false, "(cliWrite of the update failed)")
+            }
+
+            var setInstallCalls = 0, setUninstallCalls = 0
+            let setOrigin = ConfigFileWatcher.classifyWrite(forFileAt: existingPath)
+            guard setOrigin == .cliWrite else {
+                return report(id, slug, false, "(expected .cliWrite for the marked update, got \(setOrigin))")
+            }
+            guard let updatedData = FileManager.default.contents(atPath: existingPath) else {
+                return report(id, slug, false, "(could not re-read the updated file)")
+            }
+            let suppressSet = (setOrigin == .cliWrite)  // mirroring applyExternalProfileEdit's ternary
+            let setOutcome = SyncManager.applyExternalEdit(
+                data: updatedData, path: existingPath,
+                known: { $0 == existing.id ? existing : nil },
+                others: [], isInstalled: { _ in true },
+                persist: { store.update($0) },
+                install: { _ in if !suppressSet { setInstallCalls += 1 } },
+                uninstall: { _ in if !suppressSet { setUninstallCalls += 1 } },
+                reportError: { _, _ in })
+            guard setOutcome == .applied, store.profile(for: existing.id)?.name == "Existing renamed",
+                  setInstallCalls == 0, setUninstallCalls == 0 else {
+                return report(
+                    id, slug, false,
+                    "(set: outcome=\(setOutcome) name=\(store.profile(for: existing.id)?.name ?? "nil") "
+                        + "install=\(setInstallCalls) uninstall=\(setUninstallCalls))")
+            }
+
+            // --- create with a new id ---
+            let created = sampleProfile(name: "Created", isEnabled: true)
+            let createdPath = "\(profilesDir)/\(created.shortId).profile.json"
+            guard cliWrite(created) != nil else {
+                return report(id, slug, false, "(cliWrite of the create failed)")
+            }
+            let createOrigin = ConfigFileWatcher.classifyWrite(forFileAt: createdPath)
+            guard createOrigin == .cliWrite else {
+                return report(id, slug, false, "(expected .cliWrite for the marked create, got \(createOrigin))")
+            }
+            var createInstallCalls = 0
+            let suppressCreate = (createOrigin == .cliWrite)  // mirroring applyExternalProfileCreate's guard
+            _ = SyncManager.applyExternalCreateIfNeeded(
+                decoded: created, isKnownId: false, existing: [],  // no overlap check here — see AC-C1/AC-L4-4 for that
+                isInstalled: { _ in true },
+                persist: { store.add($0) },
+                install: { _ in
+                    guard !suppressCreate else { return }
+                    createInstallCalls += 1
+                },
+                quarantine: { _ in })
+            guard store.profile(for: created.id) == created, createInstallCalls == 0 else {
+                return report(
+                    id, slug, false,
+                    "(create: persisted=\(store.profile(for: created.id) == created) install=\(createInstallCalls))")
+            }
+
+            return report(id, slug, true)
+        }
     }
 
 }
