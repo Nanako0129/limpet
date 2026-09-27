@@ -252,14 +252,23 @@ now attaches a `SIGTERM`/`SIGINT` `DispatchSource` (`SIG_IGN` first, exactly
 like the existing `SIGUSR1` pattern) whose handler sends `SIGTERM` to the
 CHILD'S PROCESS GROUP (`SyncWatchDaemon.terminateChildProcessGroup(pid:)`,
 `killpg(childPid, SIGTERM)`) and calls `exit(0)` immediately — no waiting, so
-`launchctl unload`/`load` timing is unchanged. rclone's default
-`--delete-after` means an interrupted run has already finished every
-transfer before it would ever start deleting, so this can't leave a partial
-delete; the next watcher's catch-up sync resumes whatever didn't finish.
-The running child's PID crosses from the background queue that spawns it
+`launchctl unload`/`load` timing is unchanged. This CAN interrupt rclone
+mid-delete (unmeasured, and not assumed otherwise — a SIGTERM has no reason
+to respect rclone's transfer/delete phase boundary, and a profile's
+`additionalRcloneFlags` can set `--delete-during`, interleaving deletes with
+transfers). That is still safe by construction, not by measurement: this is
+a one-way sync, so `rclone sync` only ever deletes a copy on the
+NON-authoritative side that is already absent from the authoritative side —
+a delete interrupted partway through never removes anything the user still
+has anywhere, and the next watcher's catch-up sync re-evaluates the same
+diff and completes whatever didn't finish. The running child's PID and
+spawn state cross from the background queue that spawns it
 (`runChildProcess`) to the main-queue signal handler through a small
-`NSLock`-guarded box (`RunningChildPID`), the one piece of state both sides
-touch.
+`NSLock`-guarded state machine (`RunningChildState`) with a `.spawning` case
+specifically for the SIGTERM-between-spawn-and-PID-known race (code-review
+finding 7): if termination is requested while `.spawning`, the signal
+handler does not exit — `spawned(pid:)` does, the moment it actually has a
+PID to kill.
 
 **`SyncSetupService.install` surfaces a `launchctl load` failure (limpet-plan.md
 L6.1 change B).** `install` previously discarded `launchctl load`'s exit

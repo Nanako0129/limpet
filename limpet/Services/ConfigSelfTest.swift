@@ -155,6 +155,7 @@ enum ConfigSelfTest {
             testSyncAlreadyRunningSetsSyncing,
             testInstallThrowsOnLaunchctlLoadFailure,
             testTerminateChildProcessGroupKillsRealGroup,
+            testSpawnTerminationRaceClosesWithoutOrphan,
         ]
 
         for check in checks {
@@ -4309,6 +4310,61 @@ enum ConfigSelfTest {
         guard groupGone else {
             return report(id, slug, false, "(script and/or sleep grandchild still alive 2s after terminateChildProcessGroup)")
         }
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L61-7 — the spawn/termination race closes without an orphan
+
+    /// limpet-plan.md L6.1 change B, code-review finding 7. Drives
+    /// `RunningChildState`'s pure decisions directly — every method returns a
+    /// decision rather than calling `killpg`/`exit` itself, specifically so
+    /// this test can exercise the exact race (SIGTERM arriving between
+    /// `beginSpawning()` and `spawned(pid:)`) without ever calling real
+    /// `exit()` on the self-test process itself.
+    private static func testSpawnTerminationRaceClosesWithoutOrphan() -> Bool {
+        let id = "AC-L61-7", slug = "spawn-termination-race"
+
+        // Idle: nothing running or spawning — terminate now.
+        let idleState = RunningChildState()
+        guard idleState.requestTermination() == .exitNow else {
+            return report(id, slug, false, "(idle state did not decide .exitNow)")
+        }
+
+        // A child already running when termination is requested — kill+exit directly.
+        let runningState = RunningChildState()
+        runningState.beginSpawning()
+        guard runningState.spawned(pid: 555) == .ok else {
+            return report(id, slug, false, "(spawned(pid:) fired early with no pending termination)")
+        }
+        guard runningState.requestTermination() == .killAndExit(555) else {
+            return report(id, slug, false, "(a running child did not decide .killAndExit)")
+        }
+
+        // THE RACE: termination requested while `.spawning`, before the PID is
+        // known. The handler must `.wait` (not exit — nothing to kill yet, and
+        // exiting here would orphan the process `spawned(pid:)` is about to
+        // record). `spawned(pid:)` must then finish the job the instant it has
+        // a PID — this is exactly what closes the finding 7 window.
+        let raceState = RunningChildState()
+        raceState.beginSpawning()
+        guard raceState.requestTermination() == .wait else {
+            return report(id, slug, false, "(a mid-spawn termination request did not decide .wait)")
+        }
+        guard raceState.spawned(pid: 4242) == .killAndExitNow(4242) else {
+            return report(id, slug, false, "(spawned(pid:) after a pending termination did not decide to kill+exit)")
+        }
+
+        // A spawn that fails (`pid: nil`) after a pending termination has
+        // nothing to kill — must not claim it does.
+        let failedSpawnState = RunningChildState()
+        failedSpawnState.beginSpawning()
+        guard failedSpawnState.requestTermination() == .wait else {
+            return report(id, slug, false, "(setup: expected .wait)")
+        }
+        guard failedSpawnState.spawned(pid: nil) == .ok else {
+            return report(id, slug, false, "(a failed spawn after a pending termination claimed a PID to kill)")
+        }
+
         return report(id, slug, true)
     }
 
