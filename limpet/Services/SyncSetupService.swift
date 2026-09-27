@@ -645,12 +645,17 @@ final class SyncSetupService {
                 BACKUP_DATE=$(date +%F)
                 BACKUP_TIME=$(date +%H%M%S)
                 # Recognise every rclone spelling of "this run is a dry run",
-                # not only the bare flag: -n (short form), --dry-run=true, and
-                # --dry-run=<anything but exactly "false"> (rclone's own bool
-                # flag parsing treats a non-"false" value as true).
+                # not only the bare flag: -n (short form), a bundled short-flag
+                # cluster containing n (e.g. -vn, -nv — measured 2026-09-28:
+                # `rclone -vn sync ...` logs "Skipped copy as --dry-run is
+                # set"), --dry-run=true, and --dry-run=<anything but exactly
+                # "false"> (rclone's own bool flag parsing treats a
+                # non-"false" value as true).
                 IS_DRY_RUN=false
                 for flag_token in "${ADDITIONAL_FLAGS_ARRAY[@]}"; do
-                    if [[ "$flag_token" == "--dry-run" || "$flag_token" == "-n" ]]; then
+                    if [[ "$flag_token" == "--dry-run" ]]; then
+                        IS_DRY_RUN=true
+                    elif [[ "$flag_token" =~ ^-[a-zA-Z]*n[a-zA-Z]*$ ]]; then
                         IS_DRY_RUN=true
                     elif [[ "$flag_token" == --dry-run=* ]]; then
                         dry_run_value="${flag_token#--dry-run=}"

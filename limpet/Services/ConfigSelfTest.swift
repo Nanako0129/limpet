@@ -5443,8 +5443,10 @@ enum ConfigSelfTest {
 
     // MARK: - AC-L62-10 — purge: $NO_CHECK_CERT (never additionalRcloneFlags)
     // reaches lsf/purge; an lsf failure logs one line, writes no stamp, and a
-    // later run retries; -n / --dry-run=true / --dry-run=<non-false> are all
-    // dry runs, --dry-run=false is not (code-review findings 5/7 on 87bbf67).
+    // later run retries; -n, a bundled short-flag cluster containing n (-vn,
+    // -nv), --dry-run=true and --dry-run=<non-false> are all dry runs,
+    // --dry-run=false is not (code-review findings 5/7 on 87bbf67; the
+    // bundled-cluster case from a fresh-verifier follow-up review).
 
     private static func testTrashPurgeCertFlagsFailureAndDryRunVariants() -> Bool {
         let id = "AC-L62-10", slug = "trash-purge-cert-flags-failure-dryrun-variants"
@@ -5499,11 +5501,14 @@ enum ConfigSelfTest {
             return report(id, slug, false, "(a later run did not retry the purge after an lsf failure)")
         }
 
-        // --- dry-run detection: -n, --dry-run=true, --dry-run=<non-false> all
-        // skip; --dry-run=false does not ---
+        // --- dry-run detection: -n, a bundled short-flag cluster containing n
+        // (-vn, -nv — measured 2026-09-28: rclone -vn logs "Skipped copy as
+        // --dry-run is set"), --dry-run=true, --dry-run=<non-false> all skip;
+        // --dry-run=false does not ---
         let dryRunStub = "if [ \"$1\" = \"lsf\" ]; then exit 0; fi\nexit 0\n"
         let cases: [(flag: String, isDryRun: Bool)] = [
-            ("-n", true), ("--dry-run=true", true), ("--dry-run=1", true), ("--dry-run=false", false),
+            ("-n", true), ("-vn", true), ("-nv", true),
+            ("--dry-run=true", true), ("--dry-run=1", true), ("--dry-run=false", false),
         ]
         for (index, testCase) in cases.enumerated() {
             guard let result = runScriptFixtureAppending(
