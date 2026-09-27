@@ -787,27 +787,42 @@ final class SyncSetupService {
         return neverVersioned || !profile.remoteVersioning
     }
 
+    /// The trash root's PATH FORMULA alone — `<remote>:<parent>/.limpet-trash/<leaf>`
+    /// — requiring only that `remotePath` has a parent (a bucket-root
+    /// `remotePath` has nowhere to put a `.limpet-trash` SIBLING without it
+    /// becoming part of what gets synced/deleted). Ignores `trashDays`,
+    /// `syncDirection` and `remoteVersioning` on purpose (code-review finding
+    /// 4 on 87bbf67): `limpet trash list`/`trash restore` call this directly
+    /// so they keep working to inspect/restore OLD trash after the profile's
+    /// direction or versioning changed, or after trash was switched off
+    /// (`trashDays` set to 0) — the sync and purge instead call `trashRoot`
+    /// below, which layers the "is trash currently ACTIVE" checks on top of
+    /// this formula. A trash whose profile no longer actively uses it is
+    /// therefore never purged automatically; deleting it is on the user.
+    static func trashRootPath(for profile: SyncProfile) -> String? {
+        let components = profile.remotePath.split(separator: "/").filter { !$0.isEmpty }
+        guard components.count > 1, let leaf = components.last else { return nil }
+        let parent = components.dropLast().joined(separator: "/")
+        let remoteName = profile.rcloneRemote.hasSuffix(":") ? String(profile.rcloneRemote.dropLast()) : profile.rcloneRemote
+        return "\(remoteName):\(parent)/.limpet-trash/\(leaf)"
+    }
+
     /// Where deleted/overwritten files for `profile` are kept, or `nil` if
     /// trash does not apply (limpet-plan.md L6.2 item 1). Resolved ONLY here
     /// (and by `maxDeleteArgument` below, which calls this for its own 5000
     /// bump) — never anywhere else — so every reader (the script, the CLI,
     /// `SyncManager`'s drop-bare-Deleted check) sees the exact same decision by
     /// going through the derived config or this function, not by re-deriving
-    /// it. Applies only when: the profile uploads (a download's remote is the
-    /// SOURCE, so nothing to keep a remote trash of); `trashDays > 0`;
-    /// `remoteKeepsNoDeletedVersions`; and `remotePath` has a parent (a
-    /// bucket-root remotePath has nowhere to put a `.limpet-trash` SIBLING —
-    /// putting it inside the bucket root would make it part of what gets
-    /// synced/deleted).
+    /// it. Applies only when the trash is currently ACTIVE: the profile
+    /// uploads (a download's remote is the SOURCE, so nothing to keep a
+    /// remote trash of), `trashDays > 0`, `remoteKeepsNoDeletedVersions`, and
+    /// `trashRootPath` resolves (i.e. `remotePath` has a parent). `limpet
+    /// trash list`/`trash restore` do NOT call this — see `trashRootPath`.
     static func trashRoot(for profile: SyncProfile, remoteSection: [String: String]?) -> String? {
         guard profile.syncDirection == .localToRemote,
               profile.trashDays > 0,
               remoteKeepsNoDeletedVersions(for: profile, remoteSection: remoteSection) else { return nil }
-        let components = profile.remotePath.split(separator: "/").filter { !$0.isEmpty }
-        guard components.count > 1, let leaf = components.last else { return nil }
-        let parent = components.dropLast().joined(separator: "/")
-        let remoteName = profile.rcloneRemote.hasSuffix(":") ? String(profile.rcloneRemote.dropLast()) : profile.rcloneRemote
-        return "\(remoteName):\(parent)/.limpet-trash/\(leaf)"
+        return trashRootPath(for: profile)
     }
 
     /// `--max-delete` for `profile`, or 0 for none (limpet-plan.md L4 F6): only
