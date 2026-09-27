@@ -1416,7 +1416,14 @@ enum LimpetCLI {
         // place on success — a failed copyto must never leave a partial file
         // at `localTarget` (code-review finding 3 on 87bbf67).
         let tempTarget = "\(localTarget).limpet-restore-tmp"
-        _ = env.removeFile(tempTarget)  // clear a leftover from a prior failed attempt
+        // Never delete whatever sits at the temp path: it may be the user's own
+        // file. limpet removes its temp on every failure path, so an existing
+        // one is not ours to discard (CodeRabbit, PR #10); --force does not
+        // bypass this.
+        guard !env.itemExists(tempTarget) else {
+            env.stderr("error: \(tempTarget) already exists; refusing to overwrite it — move or delete it, then retry\n")
+            return 1
+        }
 
         // A `.rclonelink` MATCH is a symlink stored as a plain content object
         // (the remote has no native symlink support) — `rclone copyto` alone

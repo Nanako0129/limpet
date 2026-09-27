@@ -5534,6 +5534,15 @@ enum ConfigSelfTest {
             return report(id, slug, false, "(a non-force restore replaced a file created during the copy: exit \(raceCode), b.txt=\(content("\(localDir)/b.txt") ?? "nil"))")
         }
 
+        // An existing item at the temp path is never deleted, even with
+        // --force (CodeRabbit, PR #10).
+        try? "mine".write(toFile: "\(localDir)/a.txt.limpet-restore-tmp", atomically: true, encoding: .utf8)
+        let tempCode = LimpetCLI.execute(["trash", "restore", profile.shortId, "a.txt", "--force"], env: env)
+        guard tempCode == 1, content("\(localDir)/a.txt.limpet-restore-tmp") == "mine" else {
+            return report(id, slug, false, "(an existing temp-path file was deleted or overwritten: exit \(tempCode))")
+        }
+        try? fm.removeItem(atPath: "\(localDir)/a.txt.limpet-restore-tmp")
+
         // A non-empty directory in the way: refused, directory intact (the
         // old removeItem deleted it recursively, then "succeeded").
         try? "x".write(toFile: "\(root)/tmp-file", atomically: true, encoding: .utf8)
