@@ -299,8 +299,11 @@ ever purged. If `lsf` itself fails (non-zero exit), the script logs one line
 and does NOT write the stamp, so a later run the same day (the periodic
 safety sync, a manual "sync now", the next login) retries instead of waiting
 until tomorrow; a `purge` failure for one entry logs one line without failing
-the sync or blocking the rest of the loop. Two profiles sharing a parent get
-disjoint roots (`.limpet-trash/Datarget`, `.limpet-trash/side-project`), and
+the sync or blocking the rest of the loop. The script accepts `trashDays` only
+as exactly 0-365 (exit 64 otherwise, before rclone), and if `date -v-<N>d`
+still yields no cutoff it logs `Trash purge skipped: could not compute the
+cutoff date` and skips the purge without writing the stamp. Two profiles
+sharing a parent get disjoint roots (`.limpet-trash/Datarget`, `.limpet-trash/side-project`), and
 a profile's own sync never lists its trash (it sits outside `remotePath`).
 
 `limpet trash list <name|shortId> [--date YYYY-MM-DD]` lists a profile's

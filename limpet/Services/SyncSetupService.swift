@@ -514,10 +514,11 @@ final class SyncSetupService {
                 exit 64
             fi
 
-            # trashDays reaches `date -v-Nd` below; accept digits only, same
-            # reasoning as TRANSFERS/MAX_DELETE (limpet-plan.md L6.2).
-            if [[ ! "$TRASH_DAYS" =~ ^[0-9]+$ ]]; then
-                echo "$(date '+%Y-%m-%d %H:%M:%S') - Refusing to sync: trashDays must be a whole number" >> "$LOG_FILE"
+            # trashDays reaches `date -v-Nd` below; accept exactly 0-365, the
+            # range SyncProfile.validationError allows (limpet-plan.md L6.2).
+            # A bare `^[0-9]+$` let an unbounded digit string through to `date`.
+            if [[ ! "$TRASH_DAYS" =~ ^([0-9]|[1-9][0-9]|[12][0-9][0-9]|3[0-5][0-9]|36[0-5])$ ]]; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S') - Refusing to sync: trashDays must be a whole number from 0 to 365" >> "$LOG_FILE"
                 exit 64
             fi
 
@@ -676,30 +677,36 @@ final class SyncSetupService {
                             PURGE_ARGS+=("$NO_CHECK_CERT")
                         fi
                         CUTOFF=$(date -v-"${TRASH_DAYS}"d +%F)
-                        LSF_OUTPUT=$("$RCLONE_BIN" lsf --dirs-only "${PURGE_ARGS[@]}" "$TRASH_ROOT" 2>/dev/null)
-                        LSF_STATUS=$?
-                        if [[ $LSF_STATUS -ne 0 ]]; then
-                            # Do NOT write the stamp: a later run today (the
-                            # periodic safety sync, a manual "sync now", the
-                            # next login) retries the purge instead of waiting
-                            # until tomorrow.
-                            echo "$(date '+%Y-%m-%d %H:%M:%S') - Trash purge: could not list $TRASH_ROOT (rclone lsf exit $LSF_STATUS); will retry" >> "$LOG_FILE"
+                        if [[ -z "$CUTOFF" ]]; then
+                            # No cutoff to compare against: skip, and leave the stamp
+                            # alone so a later run retries.
+                            echo "$(date '+%Y-%m-%d %H:%M:%S') - Trash purge skipped: could not compute the cutoff date" >> "$LOG_FILE"
                         else
-                            while IFS= read -r entry; do
-                                [[ -z "$entry" ]] && continue
-                                # Only a top-level dir matching YYYY-MM-DD/ exactly is
-                                # ever purged — never anything `rclone lsf` might also
-                                # list (a stray file, an odd-named dir, a nested path).
-                                if [[ "$entry" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}/$ ]]; then
-                                    entry_date="${entry%/}"
-                                    if [[ "$entry_date" < "$CUTOFF" ]]; then
-                                        if ! "$RCLONE_BIN" purge "${PURGE_ARGS[@]}" "$TRASH_ROOT/$entry" > /dev/null 2>&1; then
-                                            echo "$(date '+%Y-%m-%d %H:%M:%S') - Trash purge failed for $TRASH_ROOT/$entry" >> "$LOG_FILE"
+                            LSF_OUTPUT=$("$RCLONE_BIN" lsf --dirs-only "${PURGE_ARGS[@]}" "$TRASH_ROOT" 2>/dev/null)
+                            LSF_STATUS=$?
+                            if [[ $LSF_STATUS -ne 0 ]]; then
+                                # Do NOT write the stamp: a later run today (the
+                                # periodic safety sync, a manual "sync now", the
+                                # next login) retries the purge instead of waiting
+                                # until tomorrow.
+                                echo "$(date '+%Y-%m-%d %H:%M:%S') - Trash purge: could not list $TRASH_ROOT (rclone lsf exit $LSF_STATUS); will retry" >> "$LOG_FILE"
+                            else
+                                while IFS= read -r entry; do
+                                    [[ -z "$entry" ]] && continue
+                                    # Only a top-level dir matching YYYY-MM-DD/ exactly is
+                                    # ever purged — never anything `rclone lsf` might also
+                                    # list (a stray file, an odd-named dir, a nested path).
+                                    if [[ "$entry" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}/$ ]]; then
+                                        entry_date="${entry%/}"
+                                        if [[ "$entry_date" < "$CUTOFF" ]]; then
+                                            if ! "$RCLONE_BIN" purge "${PURGE_ARGS[@]}" "$TRASH_ROOT/$entry" > /dev/null 2>&1; then
+                                                echo "$(date '+%Y-%m-%d %H:%M:%S') - Trash purge failed for $TRASH_ROOT/$entry" >> "$LOG_FILE"
+                                            fi
                                         fi
                                     fi
-                                fi
-                            done <<< "$LSF_OUTPUT"
-                            echo "$BACKUP_DATE" > "$PURGE_STAMP"
+                                done <<< "$LSF_OUTPUT"
+                                echo "$BACKUP_DATE" > "$PURGE_STAMP"
+                            fi
                         fi
                     fi
                 fi

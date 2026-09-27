@@ -5731,6 +5731,40 @@ enum ConfigSelfTest {
             }
         }
 
+        // --- trashDays is exactly 0...365 (CodeRabbit, PR #10): an unbounded
+        // digit string never reaches `date -v-Nd` ---
+        for (value, accepted) in [("0", true), ("365", true), ("366", false), ("014", false),
+                                  ("99999999999999999999", false)] {
+            guard let result = runScriptFixtureAppending(
+                name: "ac-l62-10-days", overrides: ["trashRoot": trashRoot, "trashDays": value], stubBody: noopStub) else {
+                return report(id, slug, false, "(trashDays fixture setup failed for \(value))")
+            }
+            let refused = result.status == 64 && result.invocations.isEmpty
+                && result.log.contains("trashDays must be a whole number from 0 to 365")
+            guard refused != accepted, accepted ? result.status == 0 : true else {
+                return report(id, slug, false, "(trashDays \(value): status \(result.status), expected accepted=\(accepted))")
+            }
+        }
+
+        // --- an empty CUTOFF skips the purge with one log line and writes no
+        // stamp. `date -v...` is made to fail with an exported bash function
+        // (measured 2026-09-28: /bin/bash 3.2.57 imports `BASH_FUNC_date%%`
+        // and it shadows /bin/date despite the script's own PATH export) ---
+        let noCutoffName = "ac-l62-10-no-cutoff"
+        guard let noCutoff = runScriptFixtureAppending(
+            name: noCutoffName, overrides: ["trashRoot": trashRoot, "trashDays": 14], stubBody: noopStub,
+            extraEnvironment: ["BASH_FUNC_date%%": "() { if [[ \"$1\" == -v* ]]; then return 1; fi; command date \"$@\"; }"]) else {
+            return report(id, slug, false, "(no-cutoff fixture setup failed)")
+        }
+        let skipLines = noCutoff.log.components(separatedBy: "\n")
+            .filter { $0.contains("Trash purge skipped: could not compute the cutoff date") }
+        guard noCutoff.status == 0, skipLines.count == 1,
+              !noCutoff.invocations.contains(where: { $0.first == "lsf" || $0.first == "purge" }),
+              !FileManager.default.fileExists(atPath: "\(selfTestRoot)/\(noCutoffName)/profile.trash-purged") else {
+            return report(id, slug, false,
+                "(empty cutoff: status \(noCutoff.status), skip lines \(skipLines.count), invocations \(noCutoff.invocations))")
+        }
+
         return report(id, slug, true)
     }
 
