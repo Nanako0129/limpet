@@ -1138,10 +1138,13 @@ extension CLIEnvironment {
                 // this" from "a hand edit, reconcile normally". A refused
                 // profile hashes to `nil` and notes nothing, matching
                 // `writeProfileFile`'s own refusal a line below.
-                if let data = ProfileStore.encodedProfileFileData(profile) {
-                    CLIWriteMarker.note(contentHash: ConfigSelfWriteRegistry.hash(data))
-                }
-                return ProfileStore.writeProfileFile(profile, in: SyncProfile.configDirectory) != nil
+                let hash = ProfileStore.encodedProfileFileData(profile).map(ConfigSelfWriteRegistry.hash)
+                if let hash { CLIWriteMarker.note(contentHash: hash) }
+                let wrote = ProfileStore.writeProfileFile(profile, in: SyncProfile.configDirectory) != nil
+                // A marker for a write that never happened would let a later
+                // identical hand edit skip its reconcile (CodeRabbit, PR #9).
+                if !wrote, let hash { _ = CLIWriteMarker.consume(hash: hash) }
+                return wrote
             },
             installProfile: { profile in
                 do { try SyncSetupService.shared.install(profile: profile); return nil }
