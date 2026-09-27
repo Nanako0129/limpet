@@ -116,14 +116,24 @@ enum CLIWriteMarker {
     /// Removes every stale (>`maxAge`) marker, then consumes (reads and
     /// deletes) a fresh marker matching `hash`, if any. Returns whether one
     /// was consumed.
+    ///
+    /// Only considers files whose NAME is a marker this type could have
+    /// written — exactly 64 lowercase hex characters, `note`'s
+    /// `ConfigSelfWriteRegistry.hash` format (code-review finding 6). Anything
+    /// else in the directory is left alone entirely, never read or deleted:
+    /// `note`'s own atomic write (`String.write(toFile:atomically:true,…)`)
+    /// briefly creates a differently-named temp file in this SAME directory
+    /// before renaming it into place, and the previous version's blanket
+    /// "unparseable → delete" cleanup could race that temp file out from under
+    /// the write it belongs to.
     static func consume(hash: String, now: Date = Date()) -> Bool {
         let fm = FileManager.default
         guard let files = try? fm.contentsOfDirectory(atPath: directory) else { return false }
-        for file in files {
+        for file in files where isMarkerFilename(file) {
             let path = "\(directory)/\(file)"
             guard let content = try? String(contentsOfFile: path, encoding: .utf8),
                   let noted = TimeInterval(content) else {
-                try? fm.removeItem(atPath: path)  // not a marker this type wrote; drop it
+                try? fm.removeItem(atPath: path)  // marker-named, but not our content; drop it
                 continue
             }
             if now.timeIntervalSince1970 - noted > maxAge {
@@ -131,9 +141,16 @@ enum CLIWriteMarker {
             }
         }
         let markerPath = "\(directory)/\(hash)"
-        guard fm.fileExists(atPath: markerPath) else { return false }
+        guard isMarkerFilename(hash), fm.fileExists(atPath: markerPath) else { return false }
         try? fm.removeItem(atPath: markerPath)
         return true
+    }
+
+    /// True iff `name` is exactly 64 lowercase hex characters — the shape of
+    /// every hash `ConfigSelfWriteRegistry.hash` produces, and so the only
+    /// shape a name `note()` ever gives a FINISHED marker file.
+    private static func isMarkerFilename(_ name: String) -> Bool {
+        name.count == 64 && name.allSatisfy { "0123456789abcdef".contains($0) }
     }
 }
 

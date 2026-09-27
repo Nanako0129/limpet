@@ -157,6 +157,7 @@ enum ConfigSelfTest {
             testInstallThrowsOnLaunchctlLoadFailure,
             testTerminateChildProcessGroupKillsRealGroup,
             testSpawnTerminationRaceClosesWithoutOrphan,
+            testCLIWriteMarkerIgnoresNonHashFilenames,
             testInstallRefreshesLoadedAgentAndCleansUpFailure,
         ]
 
@@ -4383,6 +4384,62 @@ enum ConfigSelfTest {
         }
 
         return report(id, slug, true)
+    }
+
+    // MARK: - AC-L61-8 — CLIWriteMarker.consume ignores non-hex-64 filenames
+
+    /// limpet-plan.md L6.1 change A, code-review finding 6. `note()`'s atomic
+    /// write (`String.write(toFile:atomically:true,…)`) briefly creates a
+    /// differently-named temp file in the SAME directory before renaming it
+    /// into place, and that temp file can be caught by a directory listing
+    /// with its content only PARTIALLY written (a real atomic-write race, not
+    /// simulated content). The previous version's blanket "unparseable →
+    /// delete" cleanup in `consume()` would delete such a file out from under
+    /// the write it belongs to; the fix restricts that cleanup to names that
+    /// are actually 64 lowercase hex characters, so a temp file — under any
+    /// name `note()` could ever give one — is never even inspected, whatever
+    /// its content looks like at the moment of the race. Simulates exactly
+    /// the historical failure mode: a non-hex-64-named file with GARBAGE
+    /// (unparseable-as-timestamp) content, which the OLD code's
+    /// content-parse-failure branch deleted unconditionally.
+    private static func testCLIWriteMarkerIgnoresNonHashFilenames() -> Bool {
+        let id = "AC-L61-8", slug = "cli-write-marker-ignores-non-hash-filenames"
+        let dir = "\(selfTestRoot)/ac-l61-8"
+        try? FileManager.default.removeItem(atPath: dir)
+        let markerDir = "\(dir)/cli-writes"
+        let fm = FileManager.default
+
+        return CLIWriteMarker.withDirectory(markerDir) {
+            try? fm.createDirectory(atPath: markerDir, withIntermediateDirectories: true)
+
+            // A transient temp-file-shaped name (what an atomic write's rename
+            // source looks like) caught mid-write: garbage, unparseable content.
+            let tempPath = "\(markerDir)/.note.tmp.\(UUID().uuidString)"
+            guard fm.createFile(atPath: tempPath, contents: Data("not-a-timestamp".utf8)) else {
+                return report(id, slug, false, "(failed to write the temp-file fixture)")
+            }
+
+            // A real marker for an unrelated hash, so `consume` has something
+            // legitimate to do on the same call.
+            let unrelated = String(repeating: "a", count: 64)
+            CLIWriteMarker.note(contentHash: unrelated)
+
+            // Look up a hash that was never noted — `consume` returns false,
+            // but must still run its sweep pass over the directory.
+            let neverNoted = String(repeating: "b", count: 64)
+            guard CLIWriteMarker.consume(hash: neverNoted) == false else {
+                return report(id, slug, false, "(consume matched a hash that was never noted)")
+            }
+
+            guard fm.fileExists(atPath: tempPath) else {
+                return report(id, slug, false, "(consume deleted a non-hex-64-named file in the marker directory)")
+            }
+            guard CLIWriteMarker.consume(hash: unrelated) else {
+                return report(id, slug, false, "(the unrelated real marker was not left intact/consumable)")
+            }
+
+            return report(id, slug, true)
+        }
     }
 
     // MARK: - AC-L61-9 — install refreshes an already-loaded agent and cleans up a failed load
