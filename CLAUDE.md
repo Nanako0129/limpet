@@ -622,7 +622,7 @@ isn't limpet's own.
 | Command | Purpose |
 |---------|---------|
 | `limpet sync <name\|shortId>` | Send the running watcher SIGUSR1 (`launchctl kill SIGUSR1 gui/$(id -u)/<launchdLabel>`) to ask it to sync now, and return immediately — it does NOT block until the sync finishes. On success prints `sync requested for "<name>" (<shortId>) — see: limpet logs <shortId>` and exits 0; if the agent isn't loaded prints `error: no watcher running for "<name>" (<shortId>)` to stderr and exits 1. Use `limpet logs <name\|shortId> --follow` to watch the run it triggered. |
-| `limpet trash list <name\|shortId> [--date YYYY-MM-DD]` | List a profile's trashed (deleted/overwritten) files (see **Trash** above). Prints "no trash root configured" and exits 0 for a profile with no active trash root. |
+| `limpet trash list <name\|shortId> [--date YYYY-MM-DD]` | List a profile's trashed (deleted/overwritten) files (see **Trash** above). Works on any profile whose `remotePath` has a parent, regardless of `trashDays`/`syncDirection`/`remoteVersioning` — old trash stays inspectable after the profile changed or trash was turned off. Exits 0 printing "can have no trash root: remotePath ... has no parent" only when `remotePath` itself has no parent. |
 
 `<name|shortId>` resolution tries an exact `shortId` match first, then a
 case-insensitive `name` match; an unmatched (or ambiguous) target exits

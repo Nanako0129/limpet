@@ -181,12 +181,13 @@ enum LimpetCLI {
     profile set keys: name, rcloneRemote, remotePath, localSyncPath,
       drivePathToMonitor, additionalRcloneFlags,
       syncDirection (localToRemote|remoteToLocal), syncIntervalMinutes,
-      transfers, isMuted, maxDelete, remoteVersioning.
+      transfers, isMuted, maxDelete, remoteVersioning, trashDays.
       Use enable/disable for isEnabled.
 
-    trash list/restore apply only to a profile with an active trash root
-    (localToRemote, trashDays > 0, a remote that keeps no deleted versions,
-    remotePath with a parent) — see CLAUDE.md's Delete-limit/Trash sections.
+    trash list/restore work on any profile whose remotePath has a parent
+    (the trash root is a path formula, independent of trashDays/syncDirection/
+    remoteVersioning), so they keep reaching OLD trash after trash was turned
+    off or the profile changed — see CLAUDE.md's Delete-limit/Trash sections.
 
     Profiles author JSON against schema/profile.schema.json under the config
     directory; the same file an agent can drop in or edit directly.
@@ -1096,6 +1097,12 @@ enum LimpetCLI {
         case "maxDelete":
             guard let n = int(value), n >= 1 else { return "maxDelete must be an integer ≥ 1" }
             profile.maxDelete = n
+        case "trashDays":
+            // 0...365, matching SyncProfile.validationError's rule (0 = off).
+            guard let n = int(value), (0...365).contains(n) else {
+                return "trashDays must be an integer from 0 to 365"
+            }
+            profile.trashDays = n
         case "remoteVersioning":
             guard let b = bool(value) else { return "remoteVersioning must be true or false" }
             profile.remoteVersioning = b

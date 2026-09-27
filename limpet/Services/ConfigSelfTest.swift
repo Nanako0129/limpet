@@ -1084,6 +1084,21 @@ enum ConfigSelfTest {
         guard LimpetCLI.applyProfileAssignment(&p, key: "isMuted", value: "yes") == nil, p.isMuted == true else {
             return report("AC-CLI8", "cli-profile-set-and-show", false, "(valid bool assignment failed)")
         }
+        // trashDays: 0...365, matching SyncProfile.validationError (code-review
+        // follow-up, finding C: `profile set <p> trashDays N` used to be
+        // rejected as an unknown key).
+        guard LimpetCLI.applyProfileAssignment(&p, key: "trashDays", value: "30") == nil, p.trashDays == 30 else {
+            return report("AC-CLI8", "cli-profile-set-and-show", false, "(valid trashDays assignment failed)")
+        }
+        guard LimpetCLI.applyProfileAssignment(&p, key: "trashDays", value: "0") == nil, p.trashDays == 0 else {
+            return report("AC-CLI8", "cli-profile-set-and-show", false, "(trashDays=0, the off value, was rejected)")
+        }
+        guard LimpetCLI.applyProfileAssignment(&p, key: "trashDays", value: "366") != nil else {
+            return report("AC-CLI8", "cli-profile-set-and-show", false, "(out-of-range trashDays was accepted)")
+        }
+        guard LimpetCLI.applyProfileAssignment(&p, key: "trashDays", value: "-1") != nil else {
+            return report("AC-CLI8", "cli-profile-set-and-show", false, "(negative trashDays was accepted)")
+        }
         // Invalid values.
         guard LimpetCLI.applyProfileAssignment(&p, key: "syncIntervalMinutes", value: "0") != nil else {
             return report("AC-CLI8", "cli-profile-set-and-show", false, "(out-of-range syncIntervalMinutes was accepted)")
