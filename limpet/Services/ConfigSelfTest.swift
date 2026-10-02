@@ -6534,6 +6534,31 @@ enum ConfigSelfTest {
             return report(id, slug, false, "(the next run was skipped or failed)")
         }
 
+        // A group `.giveUp` left alive blocks the next run until it is gone
+        // (CodeRabbit on PR #11): no spawn, 79, one log line; then a normal run.
+        let holder = Process()
+        holder.executableURL = URL(fileURLWithPath: "/bin/sleep")
+        holder.arguments = ["30"]
+        try? holder.run()
+        SyncWatchDaemon.lingeringGroup = (holder.processIdentifier, false)
+        var refusals: [String] = []
+        let blockedLen = (try? String(contentsOfFile: log, encoding: .utf8))?.count ?? 0
+        let blocked1 = SyncWatchDaemon.runChildProcess(
+            scriptPath: scriptPath, configPath: configPath, environment: env, logPath: log, log: { refusals.append($0) }, timings: timings)
+        let blocked2 = SyncWatchDaemon.runChildProcess(
+            scriptPath: scriptPath, configPath: configPath, environment: env, logPath: log, log: { refusals.append($0) }, timings: timings)
+        let startedWhileBlocked = ((try? String(contentsOfFile: log, encoding: .utf8))?.count ?? 0) != blockedLen
+        holder.terminate()
+        holder.waitUntilExit()
+        let unblocked = SyncWatchDaemon.runChildProcess(
+            scriptPath: scriptPath, configPath: configPath, environment: env, logPath: log, log: { _ in }, timings: timings)
+        evidence.append("\(ts()) lingering group: blocked \(blocked1)/\(blocked2), refusal lines \(refusals.count), script ran while blocked \(startedWhileBlocked), after group gone exit \(unblocked)")
+        guard blocked1 == 79, blocked2 == 79, refusals.count == 1, !startedWhileBlocked,
+              unblocked == 0, SyncWatchDaemon.lingeringGroup.value == nil else {
+            for e in evidence { print("    A5 \(e)") }
+            return report(id, slug, false, "(a lingering stalled group did not block the next run, or never released it)")
+        }
+
         // The 79 line parses to .syncFailed(79), whose text is "Sync stalled".
         guard let line = lines.first(where: { $0.contains("Sync failed with exit code 79") }),
               let event = LogParser().parse(line: line), case .syncFailed(let code, _) = event.type, code == 79,

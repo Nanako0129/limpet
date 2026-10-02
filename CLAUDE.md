@@ -544,7 +544,11 @@ would make a healthy run look stalled after the Mac sleeps. If bash exits on its
 own just as a check times out, the decision is `.exited`: its own status is
 returned and no stall is logged. If the group is still alive 60 s after SIGKILL
 (a process in uninterruptible sleep survives it) with bash reaped, one line says
-so and the run is finished as stalled (79) anyway. The stall line is written
+so and the run is finished as stalled (79) anyway; that group is remembered
+(`SyncWatchDaemon.lingeringGroup`) and every later `runChildProcess` refuses
+to start a script while `killpg(group, 0)` still finds it (one `Sync not
+started: …` line, returns 79), so a woken-up old rclone can never run beside a
+new one; the first run after the group is gone proceeds normally. The stall line is written
 BEFORE the SIGTERM and the `exit code 79` line only after the group is gone, and
 the lock can vanish in between, so `SyncManager.readLastErrorFromLog` treats
 `Sync stalled:` as the failure of the current run (returns "Sync stalled");

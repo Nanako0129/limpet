@@ -341,6 +341,11 @@ enum SyncWatchDaemon {
     /// maps it to "Sync stalled". Not 78: `secretUnavailableExitCode` already is.
     static let stalledExitCode: Int32 = 79
 
+    /// The process group a `.giveUp` left alive, and whether the refusal was
+    /// logged. Only `runChildProcess` touches it, and the scheduler never runs
+    /// two of those at once, so no lock.
+    nonisolated(unsafe) static var lingeringGroup: (value: pid_t?, logged: Bool) = (nil, false)
+
     /// Every time value the watchdog uses comes from this ONE clock: the
     /// system uptime, which stops while the Mac sleeps, like the `DispatchTime`
     /// the waits use. A wall clock (`Date`) jumps across a sleep and would make a
@@ -404,6 +409,21 @@ enum SyncWatchDaemon {
         scriptPath: String, configPath: String, environment: [String: String],
         logPath: String, log: (String) -> Void, timings: WatchdogTimings = .standard
     ) -> Int32 {
+        // A group `.giveUp` left behind (a member in uninterruptible sleep that
+        // survived SIGKILL) still counts as a running sync: starting another
+        // script would put a second rclone beside it if the old one wakes up
+        // (CodeRabbit on PR #11). Refuse until the group is gone; logged once
+        // per lingering group.
+        if let lingering = lingeringGroup.value {
+            if killpg(lingering, 0) == 0 {
+                if !lingeringGroup.logged {
+                    log("Sync not started: process group \(lingering) from the stalled run is still alive")
+                    lingeringGroup.logged = true
+                }
+                return stalledExitCode
+            }
+            lingeringGroup = (nil, false)
+        }
         let process = Process()
         let exited = DispatchSemaphore(value: 0)
         process.terminationHandler = { _ in exited.signal() }
@@ -486,6 +506,7 @@ enum SyncWatchDaemon {
                 killpg(pgid, SIGKILL)
             case .giveUp:
                 log("Sync stalled: process group \(pgid) still alive \(describe(timings.postKillWait)) after SIGKILL (uninterruptible state?) — giving up waiting for it")
+                lingeringGroup = (pgid, false)
                 runningChild.cleared()
                 log("Sync failed with exit code \(stalledExitCode)")
                 return stalledExitCode
