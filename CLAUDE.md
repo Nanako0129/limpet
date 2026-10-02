@@ -69,7 +69,7 @@ limpet/
 | `SyncManager.swift` | Central orchestrator - manages all profile states, log watchers, directory watchers |
 | `ProfileStore.swift` | File-backed, file-authoritative profile persistence — reads/writes per-profile `{shortId}.profile.json` files (see "File-Backed Configuration" below); dual-writes the legacy `syncProfiles` UserDefaults blob write-only |
 | `SyncSetupService.swift` | Generates sync scripts, launchd plists, manages agent install/uninstall |
-| `LogWatcher.swift` | FSEvents + polling hybrid file watcher for rclone log files |
+| `LogWatcher.swift` | FSEvents + polling hybrid log tailer; every stored property is owned by its serial `pollQueue`, batches reach the main queue once per second (see "GUI responsiveness, log rotation and the stalled-sync watchdog") |
 | `LogParser.swift` | Parses plain text and JSON log lines into typed `ParsedLogEvent` |
 | `DirectoryWatcher.swift` | FSEvents-based directory monitoring with debouncing |
 | `ConfigFileWatcher.swift` | FSEvents watcher on `~/.config/limpet` for external profile/settings edits; self-write suppression via `ConfigSelfWriteRegistry` |
@@ -454,9 +454,125 @@ is the single pure mapping from a `syncFailed` exit code to the text shown in
 `profileStates[id] = .error(...)` and, when no more specific error message is
 available, in the failure notification: 76 (the delete-limit trip, see
 **Delete limit** above) -> "Delete limit reached"; every other code keeps
-the prior generic "Exit code N". A refusal (exit 64) is not mapped: the
+the prior generic "Exit code N"; 79 (the stalled-sync watchdog's code, see
+**GUI responsiveness, log rotation and the stalled-sync watchdog** below) ->
+"Sync stalled". A refusal (exit 64) is not mapped: the
 script exits before writing "Sync failed with exit code", so the GUI never
 sees that code — showing a refusal in the menu is open work.
+
+**GUI responsiveness, log rotation and the stalled-sync watchdog
+(limpet-plan.md L6.3, plan v1-v3).** Three defects found by reading the code
+(none is claimed to be THE cause of the multi-day menu freeze; the decisive
+check is the user running the app for 3+ days, plan A1) and one watchdog.
+
+*`LogWatcher` threading contract.* `pollQueue` OWNS every stored property: file
+handle, dispatch source, poll and flush timers, read offset, partial-line
+buffer, inode and the pending batch. `startWatching`/`stopWatching` hop onto it
+with `sync` (a caller on main returns only after setup/teardown is complete);
+`setActivelySyncing` uses `async`; `deinit` tears down with
+`pollQueue.sync` unless already on the queue (`DispatchSpecificKey`). Reads, the
+poll tick, `reopenFile` and the flush all run on that queue only, and the
+source's cancel handler (queued on the same queue) closes the handle it
+captured, so a stop never closes a handle mid-read. Lines are accumulated and
+delivered at most once per second (flush timer on `pollQueue`); a line that
+matches started, completed, failed or the lock-skip pattern
+(`LogWatcher.isTransitionLine`) flushes at once. Each batch is posted with
+`DispatchQueue.main.async` from `pollQueue` — one FIFO channel, never a `Task`
+per batch — so batches apply in order; `LogWatcherDelegate` is therefore always
+called on the main queue. `SyncManager.processLogLinesForWatcher` parses the
+batch, `SyncManager.coalesceLogEvents` drops every `.stats` event except the
+last (each only overwrites `profileProgress`; the others keep their order), and
+`updateAggregateState` runs once per batch (`processLogEvent(updateAggregate:)`).
+Reads keep their unterminated tail as BYTES (`pendingBytes`) and decode only up
+to the last newline, so a read ending inside a multibyte character cannot drop
+the line (AC-L63-9). Before parsing, `SyncManager.dropSupersededStatsLines`
+discards every raw rclone JSON stats line but the last in the batch (a line
+starting `{` containing `"stats":{`, checked against captured rclone 1.75.1
+output); `LogParser` compiles its regexes once. The startup replay of the last
+50 lines is gone (it was already inert: it ran
+before `logWatchers[id]` was set); the initial state comes from the lock check
+in `startWatching(profile:)`. The watcher NEVER creates or truncates the log:
+a missing path keeps the poll timer running and keeps no handle; when the file
+appears it is opened at offset 0. An existing file at start is tailed from its
+end. `reopenFile` is idempotent (it re-reads the inode and returns when it is
+already `lastKnownInode`), so the poll tick and the source event cannot both
+reset the offset. Only `stopWatching` (and `start()`, which begins with a stop)
+stops polling outright; `setActivelySyncing` replaces the poll timer with one
+of the other interval, so a missing path keeps being polled until a stop.
+
+*Bounded per-run memory.* `SyncManager.currentSyncChanges` is a per-profile
+`Int` (its only reader was the count). `NotificationService` keeps at most the
+first 50 pending changes plus a true total (`pendingChangeCounts`, so "N files
+synced" stays right) and pushes the batch timer back at most once per second
+instead of once per change; the batch can therefore fire up to a second sooner
+than 2 s after the last change.
+
+*Log rotation (generated script).* After the lock is held and before the trash
+purge, a log over 20 MB (`stat -f %z`) is moved with `mv -f "$LOG_FILE"
+"$LOG_FILE.1" && : >> "$LOG_FILE"` (one old generation; the new file exists at
+once, so a watcher takes the inode-change path). Worst case on disk: 2 x 20 MB
+plus one run's output. `limpet logs` and `limpet status` read only the current
+file, so `status` right after a rotation reports `last=` from the new file.
+
+*Purge stats lines.* The trash purge now runs `rclone lsf` and `rclone purge`
+with `--stats 1m --stats-one-line --stats-log-level NOTICE` and appends their
+stderr to `$LOG_FILE`: a per-object purge of a large day folder can be silent
+for hours, and the watchdog reads silence as a stall. Measured 2026-10-03
+(local backend): with `--stats 5s` it writes one stderr line per interval, e.g.
+`2026/10/03 03:28:49 NOTICE:           0 B / 0 B, -, 0 B/s, ETA -`;
+`--stats-one-line` is required because the multi-line format also prints
+continuation lines such as `Deleted:  106 (files), 0 (dirs), 0 B (freed)`.
+`LogParser` returns nil for that line (no `YYYY-MM-DD HH:MM:SS - ` prefix), so
+it is never a stats, change or failure event (AC-L63-6).
+
+*Stalled-sync watchdog (`SyncWatchDaemon.runChildProcess`).* While the sync
+script runs, the profile log is checked every 60 s. Progress = the size grew or
+the inode changed. With none for 30 min it appends `Sync stalled: no log output
+for 30 min - stopping it`, sends SIGTERM to the child's process group, and
+after a 30 s grace sends SIGKILL. Escalation is keyed on the process GROUP, not
+the bash child: after the SIGTERM `runChildProcess` polls `killpg(pgid, 0)`
+every second and returns only when the group is gone, and only then appends
+`Sync failed with exit code 79` and returns 79 (`SyncManager.exitCodeErrorText`
+-> "Sync stalled", the menu turns red; not 78, which is already
+`secretUnavailableExitCode` and stays unmapped). It never touches `runningChild`'s
+termination state, so the watcher stays up and the scheduler carries on, and a
+SIGTERM to the watcher during the escalation still forwards to the group. The
+decision is the pure `SyncWatchDaemon.watchdogDecision` (`.wait`/`.exited`/
+`.terminate`/`.kill`/`.done`/`.giveUp`, AC-L63-3), and it also reports whether the
+log progressed, so that comparison lives in one place (`LogFileStat`, shared with
+`LogWatcher`). Every time value comes from one clock, system uptime (`monotonicNow()`,
+the same family as the `DispatchTime` waits; documented by Apple not to advance
+during sleep, not measured here); a wall clock
+would make a healthy run look stalled after the Mac sleeps. If bash exits on its
+own just as a check times out, the decision is `.exited`: its own status is
+returned and no stall is logged. If the group is still alive 60 s after SIGKILL
+(a process in uninterruptible sleep survives it) with bash reaped, one line says
+so and the run is finished as stalled (79) anyway; that group is remembered
+(`SyncWatchDaemon.lingeringGroup`) and every later `runChildProcess` refuses
+to start a script while `killpg(group, 0)` still finds it (one `Sync not
+started: …` line, returns 79), so a woken-up old rclone can never run beside a
+new one; the first run after the group is gone proceeds normally. The block lasts at most
+1 h (`lingeringGroupMaxAge`): a dead group's pgid can be reused by an unrelated
+process, so after that one `Sync resuming: …` line is logged and runs resume.
+Not covered: the record lives only in the watcher process, so a watcher restart
+forgets it. The stall line is written
+BEFORE the SIGTERM and the `exit code 79` line only after the group is gone, and
+the lock can vanish in between, so `SyncManager.readLastErrorFromLog` treats
+`Sync stalled:` as the failure of the current run (returns "Sync stalled");
+`LogParser` still yields `.unknown` for it.
+
+What the watchdog does NOT catch: its progress signal is log growth, and
+rclone's own `--stats` lines keep the log growing while rclone is stuck retrying
+a dead network. It catches only a SILENT stall (a frozen process tree, like the
+2026-09-29 case), not a network-stuck rclone. Known limit, not solved. The
+thresholds are injectable
+(`WatchdogTimings`) from the self-test only, never from a profile field. Limit:
+a frozen or suspended WATCHER process is not covered. Observed in the A5 run
+(AC-L63-8): bash's EXIT trap runs on SIGTERM and removes the lock, so the next
+run started without needing the stale-PID path. A SIGSTOP'd stub died once the
+group leader was gone unless it also ignored SIGHUP (likely the POSIX
+orphaned-group SIGHUP+SIGCONT rule, not separately verified), so the test stub
+ignores TERM and HUP.
 
 **Wizard remote creation (limpet-plan.md L5.1 finding 1).**
 `SetupWizardView.advanceToNextStep` returns early while `createRemote`'s
@@ -615,7 +731,7 @@ isn't limpet's own.
 | `limpet status [name\|shortId]` | One tab-separated line per profile (or a single one): `enabled=`, `agent=loaded\|unloaded\|n/a`, `running=` (lock present), `last=started\|completed\|failed\|none` (from the log tail via the shared `SyncLogPatterns`). |
 | `limpet profiles` | List every profile: name, shortId, mode, `enabled=`, `remote=` — no secrets. (`profile list` is an alias.) |
 | `limpet profile show <name\|shortId>` | Print one profile's FULL config as pretty, sorted-key JSON — the same shape as its `.profile.json`, so an agent can `show` → edit → `profile create`/`profile set` round-trip. No secrets (credentials live in `rclone.conf` or the login keychain). |
-| `limpet logs <name\|shortId> [--follow]` | Print (or `tail -f`) that profile's sync log. |
+| `limpet logs <name\|shortId> [--follow]` | Print (or `tail -F`, which follows the name across rotation) that profile's sync log. |
 | `limpet test-remote <name\|shortId>` | Probe one profile's remote with `rclone lsd` under a hard timeout; prints `reachable: <remote>` or the real rclone stderr. |
 | `limpet listremotes` | `rclone listremotes`, passthrough. |
 
@@ -741,9 +857,9 @@ Background work (process execution, file I/O) happens on dispatch queues with re
 
 LogWatcher uses FSEvents as primary mechanism with polling fallback:
 
-1. **FSEvents**: Low-latency file change detection via `DispatchSource.makeFileSystemObjectSource`
-2. **Polling fallback**: Timer-based check every 2.5-5 seconds catches missed events
-3. **Inode tracking**: Detects file replacement (atomic writes) and reopens file handle
+1. **FSEvents**: Low-latency file change detection via `DispatchSource.makeFileSystemObjectSource`, on the watcher's own serial queue (not `.main`)
+2. **Polling fallback**: Timer-based check every 2.5-5 seconds catches missed events; the same tick also handles a log path that is missing, deleted or being rotated
+3. **Inode tracking**: Detects file replacement (rotation) and reopens the new file at offset 0
 
 ### Centralized Log Pattern Matching
 

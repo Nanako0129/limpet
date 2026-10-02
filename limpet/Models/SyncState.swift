@@ -275,6 +275,14 @@ enum SyncLogPatterns {
         message.lowercased().contains("failed with exit code")
     }
 
+    /// The watchdog's own line (`Sync stalled: ...`), written before it stops a run.
+    /// Deliberately not a started/completed/failed/already-running match, so
+    /// `LogParser` yields `.unknown` for it; the failure event is the later
+    /// `Sync failed with exit code 79` line.
+    static func isSyncStalled(_ message: String) -> Bool {
+        message.contains("Sync stalled:")
+    }
+
     /// Patterns indicating drive not mounted
     static func isDriveNotMounted(_ message: String) -> Bool {
         let lower = message.lowercased()
@@ -371,10 +379,11 @@ enum SyncLogPatterns {
 
     // MARK: - Exit Code Extraction
 
+    private static let exitCodeRegex = try? NSRegularExpression(pattern: #"exit code (\d+)"#)
+
     /// Extract exit code from a failure message like "Sync failed with exit code 1"
     static func extractExitCode(from message: String) -> Int? {
-        let pattern = #"exit code (\d+)"#
-        guard let regex = try? NSRegularExpression(pattern: pattern),
+        guard let regex = exitCodeRegex,
               let match = regex.firstMatch(in: message, range: NSRange(message.startIndex..., in: message)),
               let codeRange = Range(match.range(at: 1), in: message),
               let code = Int(message[codeRange]) else {

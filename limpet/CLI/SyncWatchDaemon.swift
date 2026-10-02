@@ -248,7 +248,9 @@ enum SyncWatchDaemon {
                             runChildProcess(
                                 scriptPath: SyncProfile.sharedScriptPath,
                                 configPath: profile.configPath,
-                                environment: environment)
+                                environment: environment,
+                                logPath: profile.logPath,
+                                log: { appendProfileLogLine($0, profile: profile) })
                         })
                     DispatchQueue.main.async { completion(code) }
                 }
@@ -304,13 +306,143 @@ enum SyncWatchDaemon {
         return spawn(environment)
     }
 
+    /// Stalled-sync watchdog timings (limpet-plan.md L6.3 change 4). Production
+    /// always uses `.standard`; only the self-test / A5 harness passes others.
+    struct WatchdogTimings {
+        /// No log growth for this long = stalled.
+        var stallThreshold: TimeInterval = 30 * 60
+        /// SIGTERM to SIGKILL on the process group.
+        var killGrace: TimeInterval = 30
+        /// After SIGKILL, how long to keep waiting for a group that is still alive
+        /// (a process in uninterruptible sleep survives SIGKILL) before giving up.
+        var postKillWait: TimeInterval = 60
+        /// How often the log is checked while the child runs.
+        var checkInterval: TimeInterval = 60
+        /// How often group liveness is polled once SIGTERM has been sent.
+        var groupPollInterval: TimeInterval = 1
+        static let standard = WatchdogTimings()
+    }
+
+    /// What the watchdog does next (AC-L63-3).
+    enum WatchdogDecision: Equatable {
+        case wait
+        /// bash exited on its own before the watchdog acted: return its own status.
+        case exited
+        case terminate
+        case kill
+        /// Group gone and child reaped after our SIGTERM/SIGKILL: finish as stalled.
+        case done
+        /// The group survived SIGKILL for `postKillWait`: finish as stalled anyway.
+        case giveUp
+    }
+
+    /// Exit code the watcher reports (and logs as `Sync failed with exit code
+    /// 79`) for a run it stopped as stalled; `SyncManager.exitCodeErrorText`
+    /// maps it to "Sync stalled". Not 78: `secretUnavailableExitCode` already is.
+    static let stalledExitCode: Int32 = 79
+
+    /// Whether any process in group `pgid` still exists. `killpg(_, 0)` fails
+    /// with EPERM when a member exists but cannot be signalled, which still
+    /// means the group is alive; only ESRCH means it is gone.
+    static func processGroupExists(_ pgid: pid_t) -> Bool {
+        killpg(pgid, 0) == 0 || errno == EPERM
+    }
+
+    /// The process group a `.giveUp` left alive, and whether the refusal was
+    /// logged. Only `runChildProcess` touches it, and the scheduler never runs
+    /// two of those at once, so no lock.
+    nonisolated(unsafe) static var lingeringGroup: (value: pid_t?, logged: Bool, since: TimeInterval) = (nil, false, 0)
+    static let lingeringGroupMaxAge: TimeInterval = 3600
+
+    /// Every time value the watchdog uses comes from this ONE clock: the
+    /// system uptime, the same clock family as the `DispatchTime` waits. Apple
+    /// documents `systemUptime` as the time the system has been awake since
+    /// restart, i.e. it does not advance during sleep; that was NOT measured
+    /// here (no sleep/wake test). A wall clock (`Date`) jumps across a sleep and
+    /// would make a healthy run look stalled on wake.
+    static func monotonicNow() -> TimeInterval { ProcessInfo.processInfo.systemUptime }
+
+    /// Pure watchdog decision (all times in `monotonicNow()` seconds). Progress =
+    /// the log's size or inode differs from the last progress sample (`progressed`
+    /// tells the caller to take a new sample; it is the only place that
+    /// comparison lives).
+    ///
+    /// The watchdog's progress signal is log GROWTH. rclone's own `--stats` lines
+    /// keep the log growing while rclone is stuck retrying a dead network, so this
+    /// catches only a SILENT stall (a frozen process tree, like the 2026-09-29
+    /// case), not a network-stuck rclone. Known limit, deliberately not solved here.
+    ///
+    /// Before SIGTERM: `.exited` if bash already exited on its own (never log a
+    /// stall for it), `.terminate` once there has been no progress for
+    /// `stallThreshold`, else `.wait`. After SIGTERM it is keyed on the process
+    /// GROUP, not the bash child (R7): `.done` once the group is gone and the child
+    /// reaped; `.giveUp` once the child is reaped and `postKillWait` has passed
+    /// since SIGKILL with the group still alive; `.kill` once `killGrace` has
+    /// elapsed and the group is still alive; else `.wait`.
+    static func watchdogDecision(
+        lastProgress: LogFileStat, lastProgressTime: TimeInterval,
+        current: LogFileStat, now: TimeInterval,
+        sigtermSentAt: TimeInterval?, sigkillSentAt: TimeInterval? = nil,
+        groupAlive: Bool, childReaped: Bool, timings: WatchdogTimings
+    ) -> (decision: WatchdogDecision, progressed: Bool) {
+        let progressed = current != lastProgress
+        guard let sentAt = sigtermSentAt else {
+            if childReaped { return (.exited, progressed) }
+            if progressed { return (.wait, true) }
+            return (now - lastProgressTime >= timings.stallThreshold ? .terminate : .wait, false)
+        }
+        if !groupAlive { return (childReaped ? .done : .wait, progressed) }
+        if let killedAt = sigkillSentAt, childReaped, now - killedAt >= timings.postKillWait {
+            return (.giveUp, progressed)
+        }
+        return (now - sentAt >= timings.killGrace ? .kill : .wait, progressed)
+    }
+
+    private static func describe(_ t: TimeInterval) -> String {
+        t >= 60 ? "\(Int(t / 60)) min" : "\(Int(t)) s"
+    }
+
     /// Run the shared sync script as a child. stdout/stderr go to
     /// `/dev/null` — the script already tees rclone's output into the
     /// profile log itself (`tee -a "$LOG_FILE"`), so piping the child's
     /// stdout through here too would duplicate every line (limpet-plan.md
     /// v2→v3 disposition #6).
-    private static func runChildProcess(scriptPath: String, configPath: String, environment: [String: String]) -> Int32 {
+    ///
+    /// While it runs, a watchdog checks `logPath` every `checkInterval`. With no
+    /// growth (and no inode change) for `stallThreshold` it logs the stall,
+    /// SIGTERMs the process group, escalates to SIGKILL after `killGrace`, waits
+    /// until the whole group is gone, and only then logs `Sync failed with exit
+    /// code 79` and returns 79. It never touches `runningChild`'s termination
+    /// state, so the watcher keeps running and the scheduler carries on.
+    /// Not private so the self-test / A5 harness drives this exact code path.
+    static func runChildProcess(
+        scriptPath: String, configPath: String, environment: [String: String],
+        logPath: String, log: (String) -> Void, timings: WatchdogTimings = .standard
+    ) -> Int32 {
+        // A group `.giveUp` left behind (a member in uninterruptible sleep that
+        // survived SIGKILL) still counts as a running sync: starting another
+        // script would put a second rclone beside it if the old one wakes up
+        // (CodeRabbit on PR #11). Refuse until the group is gone; logged once
+        // per lingering group.
+        if let lingering = lingeringGroup.value {
+            // Bounded: once the stuck group really dies its pgid can be reused
+            // by an unrelated process group, which would otherwise block syncing
+            // indefinitely. After `lingeringGroupMaxAge` the block is dropped.
+            if monotonicNow() - lingeringGroup.since > lingeringGroupMaxAge {
+                log("Sync resuming: stopped waiting for process group \(lingering) from the stalled run after \(describe(lingeringGroupMaxAge))")
+                lingeringGroup = (nil, false, 0)
+            } else if processGroupExists(lingering) {
+                if !lingeringGroup.logged {
+                    log("Sync not started: process group \(lingering) from the stalled run is still alive")
+                    lingeringGroup.logged = true
+                }
+                return stalledExitCode
+            }
+            else { lingeringGroup = (nil, false, 0) }
+        }
         let process = Process()
+        let exited = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in exited.signal() }
         process.executableURL = URL(fileURLWithPath: "/bin/bash")
         process.arguments = [scriptPath, configPath]
         process.environment = environment
@@ -343,9 +475,63 @@ enum SyncWatchDaemon {
         case .exitNow:
             exit(0)  // unreachable here (a real PID is always non-nil), kept exhaustive
         }
-        process.waitUntilExit()
-        runningChild.cleared()
-        return process.terminationStatus
+
+        let pgid = process.processIdentifier
+        let unreadable = LogFileStat(size: 0, inode: 0)
+        var progress = LogFileStat.read(logPath) ?? unreadable
+        var lastProgressTime = monotonicNow()
+        var sigtermSentAt: TimeInterval?
+        var sigkillSentAt: TimeInterval?
+        var reaped = false
+        while true {
+            if !reaped {
+                let wait = sigtermSentAt == nil ? timings.checkInterval : timings.groupPollInterval
+                reaped = exited.wait(timeout: .now() + wait) == .success
+            } else {
+                Thread.sleep(forTimeInterval: timings.groupPollInterval)
+            }
+            // Re-check right before acting: bash may have exited on its own just
+            // after the timed wait gave up (the decision then is `.exited`).
+            if !reaped { reaped = exited.wait(timeout: .now()) == .success }
+
+            let now = monotonicNow()
+            let current = LogFileStat.read(logPath) ?? unreadable
+            let step = watchdogDecision(
+                lastProgress: progress, lastProgressTime: lastProgressTime, current: current, now: now,
+                sigtermSentAt: sigtermSentAt, sigkillSentAt: sigkillSentAt,
+                groupAlive: processGroupExists(pgid), childReaped: reaped, timings: timings)
+            if step.progressed {
+                progress = current
+                lastProgressTime = now
+            }
+            switch step.decision {
+            case .wait:
+                break
+            case .exited:
+                runningChild.cleared()
+                return process.terminationStatus
+            case .terminate:
+                log("Sync stalled: no log output for \(describe(timings.stallThreshold)) — stopping it")
+                sigtermSentAt = now
+                terminateChildProcessGroup(pid: pgid)
+            case .kill:
+                if sigkillSentAt == nil {
+                    log("Sync stalled: still running \(describe(timings.killGrace)) after SIGTERM — killing it")
+                    sigkillSentAt = now
+                }
+                killpg(pgid, SIGKILL)
+            case .giveUp:
+                log("Sync stalled: process group \(pgid) still alive \(describe(timings.postKillWait)) after SIGKILL (uninterruptible state?) — giving up waiting for it")
+                lingeringGroup = (pgid, false, monotonicNow())
+                runningChild.cleared()
+                log("Sync failed with exit code \(stalledExitCode)")
+                return stalledExitCode
+            case .done:
+                runningChild.cleared()
+                log("Sync failed with exit code \(stalledExitCode)")
+                return stalledExitCode
+            }
+        }
     }
 
     /// Append a fixed `YYYY-MM-DD HH:MM:SS - <message>` line (e.g. `Source

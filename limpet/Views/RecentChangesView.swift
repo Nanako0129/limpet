@@ -14,7 +14,16 @@ struct RecentChangesView: View {
                 emptyState
             } else {
                 ScrollView {
-                    LazyVStack(spacing: 2) {
+                    // A plain VStack, not LazyVStack: the list is capped at
+                    // `maxRecentChanges` (20) rows, so laziness buys nothing, and
+                    // a busy sync replaces rows continuously. The app crashed at
+                    // 2026-10-03 06:03 +0800 (2026-10-02 22:03 UTC) (AttributeGraph `grow_region` precondition,
+                    // SIGABRT) while a LazyVStack built a new FileChangeRow
+                    // with an insertion transition; insert/remove animations
+                    // are switched off for the same reason. Which view grew the
+                    // graph is not established; this removes the lazy cache and
+                    // the transitions from the one place the crash points at.
+                    VStack(spacing: 2) {
                         ForEach(syncManager.recentChanges) { change in
                             FileChangeRow(change: change)
                                 .onTapGesture {
@@ -22,6 +31,7 @@ struct RecentChangesView: View {
                                 }
                         }
                     }
+                    .transaction { $0.animation = nil }
                     .padding(.horizontal, 8)
                 }
                 .frame(height: 210)

@@ -637,6 +637,17 @@ final class SyncSetupService {
             fi
             trap 'rm -f "$LOCK_FILE"' EXIT
 
+            # Log rotation (limpet-plan.md L6.3 change 3): under the lock, before
+            # anything is logged by this run. Over 20 MB, the log moves to
+            # "$LOG_FILE.1" (replacing the previous generation) and the new file
+            # is created at once, so a LogWatcher sees an inode change rather
+            # than a missing path. One old generation: at most 2 x 20 MB plus one
+            # run's output on disk. `>>` here runs under bash, not zsh noclobber.
+            LOG_SIZE=$(stat -f %z "$LOG_FILE" 2>/dev/null || echo 0)
+            if [[ "$LOG_SIZE" =~ ^[0-9]+$ ]] && (( LOG_SIZE > 20971520 )); then
+                mv -f "$LOG_FILE" "$LOG_FILE.1" && : >> "$LOG_FILE"
+            fi
+
             # Trash purge (limpet-plan.md L6.2 item 3, code-review findings 5/7
             # on 87bbf67): once per LOCAL day, before the sync, skipped under a
             # dry run. BACKUP_DATE/BACKUP_TIME are taken ONCE here and reused
@@ -682,7 +693,7 @@ final class SyncSetupService {
                             # alone so a later run retries.
                             echo "$(date '+%Y-%m-%d %H:%M:%S') - Trash purge skipped: could not compute the cutoff date" >> "$LOG_FILE"
                         else
-                            LSF_OUTPUT=$("$RCLONE_BIN" lsf --dirs-only "${PURGE_ARGS[@]}" "$TRASH_ROOT" 2>/dev/null)
+                            LSF_OUTPUT=$("$RCLONE_BIN" lsf --dirs-only "${PURGE_ARGS[@]}" --stats 1m --stats-one-line --stats-log-level NOTICE "$TRASH_ROOT" 2>> "$LOG_FILE")
                             LSF_STATUS=$?
                             if [[ $LSF_STATUS -ne 0 ]]; then
                                 # Do NOT write the stamp: a later run today (the
@@ -699,7 +710,10 @@ final class SyncSetupService {
                                     if [[ "$entry" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}/$ ]]; then
                                         entry_date="${entry%/}"
                                         if [[ "$entry_date" < "$CUTOFF" ]]; then
-                                            if ! "$RCLONE_BIN" purge "${PURGE_ARGS[@]}" "$TRASH_ROOT/$entry" > /dev/null 2>&1; then
+                                            # One plain-text stats line a minute goes to the log, so the
+                                            # stalled-sync watchdog sees progress during a long
+                                            # per-object purge (L6.3 change 4).
+                                            if ! "$RCLONE_BIN" purge "${PURGE_ARGS[@]}" --stats 1m --stats-one-line --stats-log-level NOTICE "$TRASH_ROOT/$entry" > /dev/null 2>> "$LOG_FILE"; then
                                                 echo "$(date '+%Y-%m-%d %H:%M:%S') - Trash purge failed for $TRASH_ROOT/$entry" >> "$LOG_FILE"
                                             fi
                                         fi

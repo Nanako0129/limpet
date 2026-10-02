@@ -67,11 +67,14 @@ struct SyncProgressDetailView: View {
                     .foregroundStyle(.secondary)
 
                 ScrollView {
-                    LazyVStack(spacing: 2) {
+                    // At most 20 rows, replaced on every stats line: plain
+                    // VStack and no row animations, as in RecentChangesView.
+                    VStack(spacing: 2) {
                         ForEach(progress.transferringFiles.prefix(20)) { file in
                             TransferringFileRow(file: file)
                         }
                     }
+                    .transaction { $0.animation = nil }
                 }
                 .frame(maxHeight: 150)
             }

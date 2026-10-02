@@ -172,6 +172,17 @@ enum ConfigSelfTest {
             testTrashPurgeCertFlagsFailureAndDryRunVariants,
             testTrashRestoreSymlinkContainment,
             testForcedRestoreReplaceIsAtomic,
+            testCoalesceLogEventsAndFIFODelivery,
+            testExitCodeErrorTextStalled,
+            testWatchdogDecision,
+            testScriptLogRotation,
+            testLogWatcherRotationAndStop,
+            testLogWatcherMissingPathNeverCreated,
+            testPurgeStatsLineIsInertAndFlagged,
+            testStartupTailStaysIdle,
+            testLogWatcherSplitMultibyteLine,
+            testStalledLineIsAFailureMarker,
+            testStalledSyncWatchdogEndToEnd,
         ]
 
         for check in checks {
@@ -4951,7 +4962,8 @@ enum ConfigSelfTest {
                 exit 0
             fi
             if [ "$1" = "purge" ]; then
-                echo "$2" >> "\(purgedLog)"
+                for last in "$@"; do :; done  # the path is the last argument (L6.3 added stats flags before it)
+                echo "$last" >> "\(purgedLog)"
                 exit 0
             fi
             exit 0
@@ -5886,6 +5898,680 @@ enum ConfigSelfTest {
 
         return report(id, slug, true)
     }
+
+    // MARK: - L6.3 helpers
+
+    /// Runs the main run loop (the main queue's `async` blocks only run there)
+    /// until `done()` or `timeout`.
+    private static func pumpMain(timeout: TimeInterval, until done: () -> Bool) -> Bool {
+        let end = Date().addingTimeInterval(timeout)
+        while !done() && Date() < end {
+            RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.02))
+        }
+        return done()
+    }
+
+    private final class RecordingDelegate: LogWatcherDelegate {
+        var batches: [[String]] = []
+        var allOnMain = true
+        func logWatcher(_ watcher: LogWatcher, didReceiveNewLines lines: [String]) {
+            if !Thread.isMainThread { allOnMain = false }
+            batches.append(lines)
+        }
+        func count(of needle: String) -> Int { batches.joined().filter { $0.contains(needle) }.count }
+    }
+
+    private static func appendLine(_ text: String, to path: String) {
+        guard let h = FileHandle(forWritingAtPath: path) else { return }
+        h.seekToEndOfFile()
+        h.write(Data((text + "\n").utf8))
+        try? h.close()
+    }
+
+    private static func inode(_ path: String) -> UInt64? {
+        ((try? FileManager.default.attributesOfItem(atPath: path))?[.systemFileNumber] as? NSNumber)?.uint64Value
+    }
+
+    // MARK: - AC-L63-1 — batch coalescing (stats keep-last, events in order) and FIFO delivery
+
+    private static func testCoalesceLogEventsAndFIFODelivery() -> Bool {
+        let id = "AC-L63-1", slug = "coalesce-and-fifo-delivery"
+        let parser = LogParser()
+        func stats(_ n: Int) -> String {
+            #"{"level":"info","msg":"stats","time":"2026-10-03T00:00:00.000000+08:00","stats":{"bytes":\#(n),"totalBytes":1000}}"#
+        }
+        let lines = [
+            "2026-10-03 00:00:00 - Starting sync (local → remote)", stats(1), stats(2),
+            #"{"level":"info","msg":"Copied (new)","time":"2026-10-03T00:00:00.000000+08:00","object":"a.txt","objectType":"*local.Object"}"#,
+            stats(3), "2026-10-03 00:00:09 - Sync completed successfully", stats(4),
+        ]
+        let events = lines.compactMap { parser.parse(line: $0) }
+        guard events.count == lines.count else {
+            return report(id, slug, false, "(parser produced \(events.count) of \(lines.count) events)")
+        }
+        let out = SyncManager.coalesceLogEvents(events)
+        var kinds: [String] = []
+        var lastBytes = -1
+        for e in out {
+            switch e.type {
+            case .syncStarted: kinds.append("started")
+            case .stats(let st): kinds.append("stats"); lastBytes = st.bytes ?? -1
+            case .fileChange: kinds.append("change")
+            case .syncCompleted: kinds.append("completed")
+            default: kinds.append("other")
+            }
+        }
+        guard kinds == ["started", "change", "completed", "stats"], lastBytes == 4 else {
+            return report(id, slug, false, "(coalesced to \(kinds), last stats bytes \(lastBytes))")
+        }
+        guard SyncManager.coalesceLogEvents([]).isEmpty else {
+            return report(id, slug, false, "(empty batch not empty)")
+        }
+
+        // Raw prefilter (runs before JSON decoding): lines below are verbatim rclone 1.75.1
+        // `--use-json-log --stats 1s` output captured 2026-10-03, plus a file name that
+        // contains the stats text (JSON-escaped, so it must not match).
+        let realStats = #"{"time":"2026-10-03T03:57:24.892833+08:00","level":"info","msg":"\nTransferred:   \t   28.610 MiB / 28.610 MiB, 100%, 0 B/s, ETA -\nChecks:                 0 / 0, -, Listed 2\nTransferred:            2 / 2, 100%\nServer Side Copies:     2 @ 28.610 MiB\nElapsed time:         0.0s\n\n","stats":{"bytes":30000003,"checks":0,"deletedDirs":0,"deletes":0,"elapsedTime":0.03785025,"errors":0,"eta":null,"fatalError":false,"listed":2,"renames":0,"retryError":false,"serverSideCopies":2,"serverSideCopyBytes":30000003,"serverSideMoveBytes":0,"serverSideMoves":0,"speed":0,"totalBytes":30000003,"totalChecks":0,"totalTransfers":2,"transferTime":0.037651209,"transfers":2},"source":"accounting/stats.go:549"}"#
+        let realCopied = #"{"time":"2026-10-03T03:57:24.855461+08:00","level":"info","msg":"Copied (server-side copy)","size":3,"object":"a.txt","objectType":"*local.Object","source":"operations/copy.go:380"}"#
+        let tricky = #"{"level":"info","msg":"Copied (new)","object":"x\"stats\":{y.txt","objectType":"*local.Object"}"#
+        let laterStats = realStats.replacingOccurrences(of: "\"bytes\":30000003", with: "\"bytes\":1")
+        let raw = [realStats, "2026-10-03 00:00:00 - note", realCopied, laterStats, tricky]
+        guard let firstEvent = parser.parse(line: realStats), case .stats = firstEvent.type else {
+            return report(id, slug, false, "(the captured rclone stats line did not parse as .stats)")
+        }
+        let kept = SyncManager.dropSupersededStatsLines(raw)
+        guard kept == [raw[1], raw[2], raw[3], raw[4]] else {
+            return report(id, slug, false, "(prefilter kept \(kept.count) lines: \(kept.map { $0.prefix(30) }))")
+        }
+        guard SyncManager.dropSupersededStatsLines([raw[1], raw[2], raw[4]]) == [raw[1], raw[2], raw[4]],
+              SyncManager.dropSupersededStatsLines([]).isEmpty else {
+            return report(id, slug, false, "(prefilter changed a batch without stats lines)")
+        }
+        // Same final events as coalescing the fully parsed batch.
+        func summary(_ ls: [String]) -> [String] {
+            SyncManager.coalesceLogEvents(ls.compactMap { parser.parse(line: $0) }).map { e in
+                if case .stats(let st) = e.type { return "stats\(st.bytes ?? -1)" }
+                return String(e.rawLine.prefix(20))
+            }
+        }
+        guard summary(SyncManager.dropSupersededStatsLines(raw)) == summary(raw) else {
+            return report(id, slug, false, "(prefilter changed the coalesced result)")
+        }
+
+        // FIFO: batches N and N+1 flushed from the watcher queue arrive on main in order.
+        guard Thread.isMainThread else { return report(id, slug, false, "(self-test not on main)") }
+        let dir = "\(selfTestRoot)/ac-l63-1"
+        try? FileManager.default.removeItem(atPath: dir)
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let log = "\(dir)/w.log"
+        FileManager.default.createFile(atPath: log, contents: nil)
+        let delegate = RecordingDelegate()
+        let watcher = LogWatcher(logPath: log, heartbeatInterval: 0.2, activePollingInterval: 0.2, flushInterval: 0.2)
+        watcher.delegate = delegate
+        watcher.startWatching()
+        for n in 0..<10 {
+            appendLine("2026-10-03 00:00:00 - Starting sync batch-\(n)", to: log)  // transition line: immediate flush
+            watcher.pollNowForTesting()
+        }
+        _ = pumpMain(timeout: 3) { delegate.count(of: "batch-") >= 10 }
+        watcher.stopWatching()
+        let order = delegate.batches.joined().compactMap { l in l.components(separatedBy: "batch-").last.flatMap(Int.init) }
+        guard order == Array(0..<10), delegate.allOnMain else {
+            return report(id, slug, false, "(delivery order \(order), allOnMain \(delegate.allOnMain))")
+        }
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L63-2 — exit code 79 text (78 stays unmapped: secretUnavailableExitCode)
+
+    private static func testExitCodeErrorTextStalled() -> Bool {
+        let id = "AC-L63-2", slug = "exit-code-79-sync-stalled"
+        let text = SyncManager.exitCodeErrorText(79)
+        guard text == "Sync stalled", SyncWatchDaemon.stalledExitCode == 79,
+              SyncWatchDaemon.stalledExitCode != SyncWatchDaemon.secretUnavailableExitCode else {
+            return report(id, slug, false, "(79 mapped to \"\(text)\")")
+        }
+        guard SyncManager.exitCodeErrorText(78) == "Exit code 78", SyncManager.exitCodeErrorText(76) == "Delete limit reached",
+              SyncManager.exitCodeErrorText(1) == "Exit code 1" else {
+            return report(id, slug, false, "(neighbouring codes changed)")
+        }
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L63-3 — watchdog decision (pure)
+
+    private static func testWatchdogDecision() -> Bool {
+        let id = "AC-L63-3", slug = "watchdog-decision"
+        let t = SyncWatchDaemon.WatchdogTimings(stallThreshold: 1800, killGrace: 30, postKillWait: 60, checkInterval: 60)
+        let base = LogFileStat(size: 100, inode: 7)
+        func d(size: UInt64 = 100, inode: UInt64 = 7, last: TimeInterval = 0, now: TimeInterval,
+               sent: TimeInterval? = nil, killed: TimeInterval? = nil,
+               alive: Bool = true, reaped: Bool = false) -> (SyncWatchDaemon.WatchdogDecision, Bool) {
+            let r = SyncWatchDaemon.watchdogDecision(
+                lastProgress: base, lastProgressTime: last, current: LogFileStat(size: size, inode: inode), now: now,
+                sigtermSentAt: sent, sigkillSentAt: killed, groupAlive: alive, childReaped: reaped, timings: t)
+            return (r.decision, r.progressed)
+        }
+        typealias D = SyncWatchDaemon.WatchdogDecision
+        let cases: [(String, (D, Bool), (D, Bool))] = [
+            ("quiet below threshold", d(now: 1799), (.wait, false)),
+            ("quiet at threshold", d(now: 1800), (.terminate, false)),
+            ("grew", d(size: 101, now: 5000), (.wait, true)),
+            ("inode changed (rotation)", d(inode: 8, now: 5000), (.wait, true)),
+            // The times are monotonic uptime seconds. A Mac that slept for hours advances
+            // the wall clock but not uptime, so the elapsed time the function sees is small.
+            ("large wall-clock jump, no monotonic elapsed time", d(last: 100_000, now: 100_001), (.wait, false)),
+            ("bash exited on its own before the watchdog acted, though quiet", d(now: 5000, reaped: true), (.exited, false)),
+            ("bash exited on its own with the log growing", d(size: 200, now: 5, reaped: true), (.exited, true)),
+            ("sigterm sent, grace not elapsed", d(now: 1820, sent: 1800), (.wait, false)),
+            ("child reaped, group alive, grace elapsed", d(now: 1830, sent: 1800, reaped: true), (.kill, false)),
+            ("child not reaped, group alive, grace elapsed", d(now: 1830, sent: 1800), (.kill, false)),
+            ("child reaped, group alive, grace not elapsed", d(now: 1801, sent: 1800, reaped: true), (.wait, false)),
+            ("group gone, child reaped", d(now: 1801, sent: 1800, alive: false, reaped: true), (.done, false)),
+            ("group gone, child not yet reaped", d(now: 1801, sent: 1800, alive: false), (.wait, false)),
+            ("log grows after SIGTERM never cancels it", d(size: 500, now: 1801, sent: 1800, reaped: true), (.wait, true)),
+            ("after SIGKILL, post-kill wait not elapsed", d(now: 1859, sent: 1800, killed: 1830, reaped: true), (.kill, false)),
+            ("after SIGKILL, group still alive past the post-kill wait", d(now: 1890, sent: 1800, killed: 1830, reaped: true), (.giveUp, false)),
+            ("post-kill wait elapsed but bash not reaped yet", d(now: 1890, sent: 1800, killed: 1830), (.kill, false)),
+            ("group gone after SIGKILL", d(now: 1840, sent: 1800, killed: 1830, alive: false, reaped: true), (.done, false)),
+        ]
+        for (name, got, want) in cases where got != want {
+            return report(id, slug, false, "(\(name): got \(got), want \(want))")
+        }
+        // Production reads the sleep-pausing clock for every watchdog time value.
+        let a = SyncWatchDaemon.monotonicNow()
+        guard abs(a - ProcessInfo.processInfo.systemUptime) < 1 else {
+            return report(id, slug, false, "(monotonicNow is not the system uptime)")
+        }
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L63-4 — script log rotation, run for real in the isolated home
+
+    private static func testScriptLogRotation() -> Bool {
+        let id = "AC-L63-4", slug = "script-log-rotation"
+        let name = "ac-l63-4"
+        let root = "\(selfTestRoot)/\(name)"
+        let log = "\(root)/sync.log"
+        let stub = "exit 0\n"
+        guard let first = runScriptFixtureAppending(name: name, overrides: [:], stubBody: stub), first.status == 0 else {
+            return report(id, slug, false, "(first run failed)")
+        }
+        guard !FileManager.default.fileExists(atPath: "\(log).1") else {
+            return report(id, slug, false, "(a small log was rotated)")
+        }
+        // Over the 20 MB threshold: 20 MiB + 1 line.
+        let line = String(repeating: "x", count: 1023) + "\n"
+        let big = Data(String(repeating: line, count: 20 * 1024 + 1).utf8)
+        guard (try? big.write(to: URL(fileURLWithPath: log))) != nil else {
+            return report(id, slug, false, "(could not write the big log)")
+        }
+        let oldInode = inode(log)
+        guard let second = runScriptFixtureAppending(name: name, overrides: [:], stubBody: stub, reset: false),
+              second.status == 0 else {
+            return report(id, slug, false, "(rotating run failed)")
+        }
+        let rotatedSize = (try? FileManager.default.attributesOfItem(atPath: "\(log).1"))?[.size] as? UInt64
+        guard rotatedSize == UInt64(big.count), inode("\(log).1") == oldInode else {
+            return report(id, slug, false, "(.1 is not the old log: size \(String(describing: rotatedSize)))")
+        }
+        guard inode(log) != nil, inode(log) != oldInode, second.log.contains("Starting sync"),
+              second.log.utf8.count < 4096 else {
+            return report(id, slug, false, "(new log missing or not fresh: \(second.log.utf8.count) bytes)")
+        }
+        // A second rotation replaces .1 (one old generation only).
+        guard (try? big.write(to: URL(fileURLWithPath: log))) != nil,
+              let third = runScriptFixtureAppending(name: name, overrides: [:], stubBody: stub, reset: false),
+              third.status == 0,
+              ((try? FileManager.default.attributesOfItem(atPath: "\(log).1"))?[.size] as? UInt64) == UInt64(big.count),
+              !FileManager.default.fileExists(atPath: "\(log).2") else {
+            return report(id, slug, false, "(second rotation did not replace .1 / left a .2)")
+        }
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L63-5 — LogWatcher: rotation reopens at 0, delivered once; stop mid-read is safe
+
+    private static func testLogWatcherRotationAndStop() -> Bool {
+        let id = "AC-L63-5", slug = "logwatcher-rotation-from-zero-and-stop"
+        guard Thread.isMainThread else { return report(id, slug, false, "(self-test not on main)") }
+        let dir = "\(selfTestRoot)/ac-l63-5"
+        try? FileManager.default.removeItem(atPath: dir)
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let log = "\(dir)/w.log"
+        try? String(repeating: "old line\n", count: 50).write(toFile: log, atomically: true, encoding: .utf8)
+        let delegate = RecordingDelegate()
+        let watcher = LogWatcher(logPath: log, heartbeatInterval: 0.3, activePollingInterval: 0.3, flushInterval: 0.2)
+        watcher.delegate = delegate
+        watcher.startWatching()
+
+        // Rotate exactly as the script does, then the run's first line lands in the NEW file.
+        try? FileManager.default.moveItem(atPath: log, toPath: "\(log).1")
+        FileManager.default.createFile(atPath: log, contents: nil)
+        appendLine("2026-10-03 00:00:00 - Starting sync (local → remote)", to: log)
+        // Both the source event (already firing) and a forced poll race to reopen.
+        watcher.pollNowForTesting()
+        watcher.pollNowForTesting()
+        _ = pumpMain(timeout: 3) { delegate.count(of: "Starting sync") >= 1 }
+        _ = pumpMain(timeout: 1) { false }  // leave room for a duplicate to show up
+        guard delegate.count(of: "Starting sync") == 1 else {
+            watcher.stopWatching()
+            return report(id, slug, false, "(Starting sync delivered \(delegate.count(of: "Starting sync")) times)")
+        }
+        guard delegate.count(of: "old line") == 0 else {
+            watcher.stopWatching()
+            return report(id, slug, false, "(old content was replayed)")
+        }
+
+        // Stop while writes (and so reads) are in flight: no crash, no later delivery.
+        let writer = Thread {
+            for n in 0..<2000 { appendLine("2026-10-03 00:00:01 - line \(n)", to: log) }
+        }
+        writer.start()
+        Thread.sleep(forTimeInterval: 0.02)
+        watcher.stopWatching()
+        _ = pumpMain(timeout: 0.5) { false }
+        let delivered = delegate.batches.count
+        while !writer.isFinished { Thread.sleep(forTimeInterval: 0.01) }
+        _ = pumpMain(timeout: 0.8) { false }
+        guard delegate.batches.count == delivered else {
+            return report(id, slug, false, "(batches kept arriving after stopWatching)")
+        }
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L63-5b — a missing path is never created; the file is opened at 0 when it appears
+
+    private static func testLogWatcherMissingPathNeverCreated() -> Bool {
+        let id = "AC-L63-5b", slug = "logwatcher-missing-path-never-created"
+        guard Thread.isMainThread else { return report(id, slug, false, "(self-test not on main)") }
+        let dir = "\(selfTestRoot)/ac-l63-5b"
+        try? FileManager.default.removeItem(atPath: dir)
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let log = "\(dir)/never-created.log"
+        let interval: TimeInterval = 0.4
+        let delegate = RecordingDelegate()
+        let watcher = LogWatcher(logPath: log, heartbeatInterval: interval, activePollingInterval: interval, flushInterval: 0.2)
+        watcher.delegate = delegate
+        watcher.startWatching()
+        _ = pumpMain(timeout: interval * 2.5) { false }
+        guard !FileManager.default.fileExists(atPath: log) else {
+            watcher.stopWatching()
+            return report(id, slug, false, "(the watcher created the log)")
+        }
+        // The file appears with content already in it, as when tee/the script creates it.
+        let content = "2026-10-03 00:00:00 - Starting sync (local → remote)\n"
+        try? content.write(toFile: log, atomically: false, encoding: .utf8)
+        let ino = inode(log)
+        let appeared = Date()
+        let got = pumpMain(timeout: interval * 3) { delegate.count(of: "Starting sync") >= 1 }
+        let latency = Date().timeIntervalSince(appeared)
+        _ = pumpMain(timeout: interval * 2) { false }
+        watcher.stopWatching()
+        guard got, latency <= interval + 0.6, delegate.count(of: "Starting sync") == 1 else {
+            return report(id, slug, false, "(delivered \(delegate.count(of: "Starting sync"))x after \(latency)s, poll interval \(interval)s)")
+        }
+        guard inode(log) == ino, (try? String(contentsOfFile: log, encoding: .utf8)) == content else {
+            return report(id, slug, false, "(the watcher changed the file)")
+        }
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L63-6 — the purge's one-line stats are inert to LogParser; the script requests them
+
+    private static func testPurgeStatsLineIsInertAndFlagged() -> Bool {
+        let id = "AC-L63-6", slug = "purge-stats-line-inert-and-flagged"
+        // Captured 2026-10-03 from `rclone purge --disable Purge --tpslimit 20 --stats 5s
+        // --stats-one-line --stats-log-level NOTICE` (local backend, per-object deletes).
+        let captured = "2026/10/03 03:28:49 NOTICE:           0 B / 0 B, -, 0 B/s, ETA -"
+        if let event = LogParser().parse(line: captured) {
+            switch event.type {
+            case .unknown: break
+            default: return report(id, slug, false, "(parsed as \(event.type), expected nil or .unknown)")
+            }
+        }
+        // The script passes the flags to lsf and purge and keeps their stderr in the log.
+        let trashRoot = "\(selfTestRoot)/ac-l63-6-trash"
+        let formatter = DateFormatter(); formatter.dateFormat = "yyyy-MM-dd"
+        let older = formatter.string(from: Calendar.current.date(byAdding: .day, value: -20, to: Date())!)
+        let stubBody = """
+            if [ "$1" = "lsf" ]; then printf '%s/\\n' "\(older)"; exit 0; fi
+            if [ "$1" = "purge" ]; then echo "\(captured)" >&2; exit 0; fi
+            exit 0
+            """
+        guard let r = runScriptFixtureAppending(
+            name: "ac-l63-6", overrides: ["trashRoot": trashRoot, "trashDays": 14], stubBody: stubBody),
+              r.status == 0 else {
+            return report(id, slug, false, "(fixture failed)")
+        }
+        let flags = ["--stats", "1m", "--stats-one-line", "--stats-log-level", "NOTICE"]
+        for verb in ["lsf", "purge"] {
+            guard let inv = r.invocations.first(where: { $0.first == verb }),
+                  zip(inv, inv.dropFirst()).contains(where: { $0 == "--stats" && $1 == "1m" }),
+                  flags.allSatisfy(inv.contains) else {
+                return report(id, slug, false, "(\(verb) was not run with \(flags): \(r.invocations))")
+            }
+        }
+        guard r.log.contains(captured) else {
+            return report(id, slug, false, "(purge stderr did not reach the profile log)")
+        }
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L63-7 — startup never replays the log tail
+
+    private static func testStartupTailStaysIdle() -> Bool {
+        let id = "AC-L63-7", slug = "startup-tail-stays-idle"
+        let dir = "\(selfTestRoot)/ac-l63-7"
+        try? FileManager.default.removeItem(atPath: dir)
+        let store = ProfileStore(
+            profilesDirectory: "\(dir)/profiles",
+            defaults: UserDefaults(suiteName: "com.nanako.limpet.selftest.l63-7.\(UUID().uuidString)")!)
+        var started = sampleProfile(name: "L63 started")
+        var failed = sampleProfile(name: "L63 failed")
+        started.localSyncPath = "\(dir)/src-a"
+        failed.localSyncPath = "\(dir)/src-b"
+        for (p, tail) in [(started, "2026-10-03 00:00:00 - Starting sync (local → remote)"),
+                          (failed, "2026-10-03 00:00:00 - Sync failed with exit code 5")] {
+            try? FileManager.default.createDirectory(
+                atPath: (p.logPath as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
+            guard p.logPath.hasPrefix(LimpetPaths.home), !FileManager.default.fileExists(atPath: p.lockFilePath),
+                  (try? (tail + "\n").write(toFile: p.logPath, atomically: true, encoding: .utf8)) != nil else {
+                return report(id, slug, false, "(fixture setup failed or the lock path is occupied)")
+            }
+            store.add(p)
+        }
+        let manager = SyncManager(profileStore: store)
+        _ = pumpMain(timeout: 1.5) { false }  // anything replayed would have arrived by now
+        // No lock held: the tail must not make the first profile "syncing", and the
+        // failure tail must not reach processLogEvent (which would set .error and notify).
+        guard manager.profileStates[started.id] == .idle, manager.profileStates[failed.id] == .idle,
+              manager.profileErrors[started.id] == nil, manager.profileErrors[failed.id] == nil else {
+            return report(id, slug, false, "(states: \(String(describing: manager.profileStates[started.id])), \(String(describing: manager.profileStates[failed.id])))")
+        }
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L63-9 — a line split inside a multibyte character is delivered once, intact
+
+    private static func testLogWatcherSplitMultibyteLine() -> Bool {
+        let id = "AC-L63-9", slug = "logwatcher-split-multibyte-line"
+        guard Thread.isMainThread else { return report(id, slug, false, "(self-test not on main)") }
+        let dir = "\(selfTestRoot)/ac-l63-9"
+        try? FileManager.default.removeItem(atPath: dir)
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let log = "\(dir)/w.log"
+        FileManager.default.createFile(atPath: log, contents: nil)
+        let delegate = RecordingDelegate()
+        let watcher = LogWatcher(logPath: log, heartbeatInterval: 0.2, activePollingInterval: 0.2, flushInterval: 0.1)
+        watcher.delegate = delegate
+        watcher.startWatching()
+        defer { watcher.stopWatching() }
+
+        let text = #"{"level":"info","msg":"Copied (new)","object":"報告書.txt","objectType":"*local.Object","time":"2026-10-03T00:00:00.000000+08:00"}"#
+        let bytes = Array((text + "\n").utf8)
+        let mark = Array("報".utf8)
+        guard let start = (0..<bytes.count - 3).first(where: { Array(bytes[$0..<$0 + 3]) == mark }) else {
+            return report(id, slug, false, "(fixture: marker not found)")
+        }
+        let cut = start + 1  // inside the 3-byte character
+        func write(_ b: ArraySlice<UInt8>) {
+            guard let h = FileHandle(forWritingAtPath: log) else { return }
+            h.seekToEndOfFile(); h.write(Data(b)); try? h.close()
+        }
+        write(bytes[..<cut])
+        watcher.pollNowForTesting()
+        _ = pumpMain(timeout: 0.6) { false }
+        guard delegate.batches.isEmpty else {
+            return report(id, slug, false, "(a partial line was delivered: \(delegate.batches))")
+        }
+        write(bytes[cut...])
+        watcher.pollNowForTesting()
+        _ = pumpMain(timeout: 3) { delegate.count(of: "報告書") >= 1 }
+        _ = pumpMain(timeout: 0.6) { false }
+        let all = delegate.batches.joined()
+        guard all.count == 1, all.first == text else {
+            return report(id, slug, false, "(delivered \(all.count) lines, first: \(String(describing: all.first)))")
+        }
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L63-10 — the watchdog's stall line is a failure marker for the GUI's lock-vanished path
+
+    private static func testStalledLineIsAFailureMarker() -> Bool {
+        let id = "AC-L63-10", slug = "stalled-line-is-failure-marker"
+        let dir = "\(selfTestRoot)/ac-l63-10"
+        try? FileManager.default.removeItem(atPath: dir)
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let start = "2026-10-03 00:00:00 - Starting sync (local → remote)"
+        let stall = "2026-10-03 00:30:00 - Sync stalled: no log output for 30 min — stopping it"
+        func lastError(_ lines: [String]) -> String? {
+            let path = "\(dir)/\(UUID().uuidString).log"
+            try? (lines.joined(separator: "\n") + "\n").write(toFile: path, atomically: true, encoding: .utf8)
+            return SyncManager.readLastErrorFromLog(path)
+        }
+        // The race: lock gone, SIGTERM sent, the exit line not written yet.
+        guard lastError([start, stall]) == "Sync stalled" else {
+            return report(id, slug, false, "(Starting sync + stall line gave \(String(describing: lastError([start, stall]))))")
+        }
+        guard lastError([start, stall, "2026-10-03 00:30:02 - Sync failed with exit code 79"]) == "Sync stalled" else {
+            return report(id, slug, false, "(with the exit line it did not report the stall)")
+        }
+        guard lastError([start]) == nil,
+              lastError([start, stall, "2026-10-03 00:31:00 - Starting sync (local → remote)", "2026-10-03 00:31:05 - Sync completed successfully"]) == nil else {
+            return report(id, slug, false, "(a clean run, or a later success, reported an error)")
+        }
+        // An older run's stall line must not be read as the failure of a later,
+        // still-unfinished run (CodeRabbit on PR #11).
+        guard lastError([start, stall, "2026-10-03 00:30:02 - Sync failed with exit code 79", "2026-10-03 00:31:00 - Starting sync (local → remote)"]) == nil else {
+            return report(id, slug, false, "(an older run's stall line was reported for a later unfinished run)")
+        }
+        // LogParser stays consistent: the stall line is not a state event of its own.
+        for line in [stall, "2026-10-03 00:30:30 - Sync stalled: still running 30 s after SIGTERM — killing it"] {
+            if let e = LogParser().parse(line: line), case .unknown = e.type { continue }
+            else if LogParser().parse(line: line) == nil { continue }
+            return report(id, slug, false, "(LogParser gave a state event for: \(line))")
+        }
+        guard SyncLogPatterns.isSyncStalled(stall), !SyncLogPatterns.isSyncFailed(stall),
+              !SyncLogPatterns.isSyncCompleted(stall), !SyncLogPatterns.isSyncStarted(stall),
+              !SyncLogPatterns.isSyncAlreadyRunning(stall), !LogWatcher.isTransitionLine(stall) else {
+            return report(id, slug, false, "(pattern overlap with the stall line)")
+        }
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L63-8 — A5: the stalled-sync watchdog end to end (real runChildProcess)
+
+    /// Drives the REAL `SyncWatchDaemon.runChildProcess` (watchdog included)
+    /// on the generated sync script with a stub rclone that blocks silently,
+    /// SIGSTOPs that stub with /bin/kill -STOP, and records the ordered
+    /// evidence. It does NOT run `limpet watch` itself (its signal handlers,
+    /// scheduler, dispatchMain) — only the spawn/watchdog/escalation path.
+    private static func testStalledSyncWatchdogEndToEnd() -> Bool {
+        let id = "AC-L63-8", slug = "stalled-sync-watchdog-end-to-end"
+        let fm = FileManager.default
+        let root = "\(selfTestRoot)/ac-l63-8"
+        try? fm.removeItem(atPath: root)
+        let localPath = "\(root)/source", scriptPath = "\(root)/limpet-sync.sh", configPath = "\(root)/profile.json"
+        let log = "\(root)/sync.log", lock = "\(root)/sync.lock", stubPath = "\(root)/rclone-stub.sh"
+        let stubPidFile = "\(root)/stub.pid"
+        let config: [String: Any] = [
+            "remote": "selftest-fixture-remote:SelfTest", "localPath": localPath, "logPath": log, "lockFile": lock,
+            "drivePath": "", "additionalFlags": "", "filterPath": "\(root)/exclude.txt",
+            "syncDirection": "localToRemote", "remotePath": "SelfTest", "transfers": 4,
+        ]
+        func setupFailed(_ e: Error) -> Bool { report(id, slug, false, "(setup failed: \(e))") }
+        do {
+            try fm.createDirectory(atPath: localPath, withIntermediateDirectories: true)
+            try "".write(toFile: "\(root)/exclude.txt", atomically: true, encoding: .utf8)
+            try SyncSetupService.shared.generateSyncScript().write(toFile: scriptPath, atomically: true, encoding: .utf8)
+            try JSONSerialization.data(withJSONObject: config).write(to: URL(fileURLWithPath: configPath))
+            // Blocks silently; `exec` keeps the pid we SIGSTOP. It ignores TERM and HUP
+            // (ignored dispositions survive exec). Observed here: a STOP'd stub that did
+            // not ignore TERM died when the watchdog's SIGTERM took bash down, and one that
+            // ignored only TERM still died within the same moment — the likely cause is the
+            // POSIX orphaned-process-group rule (SIGHUP then SIGCONT to stopped members once
+            // the group leader is gone), not separately verified. With both ignored the
+            // stub survives as a hung rclone would, so SIGKILL escalation is what removes it.
+            try "#!/bin/sh\ntrap '' TERM HUP\necho $$ > \"\(stubPidFile)\"\nexec sleep 120\n".write(toFile: stubPath, atomically: true, encoding: .utf8)
+            try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: stubPath)
+        } catch { return setupFailed(error) }
+
+        var env = ProcessInfo.processInfo.environment
+        env["RCLONE_BIN"] = stubPath
+        let timings = SyncWatchDaemon.WatchdogTimings(stallThreshold: 3, killGrace: 2, checkInterval: 0.5, groupPollInterval: 0.2)
+        let t0 = Date()
+        func ts() -> String { String(format: "+%.2fs", Date().timeIntervalSince(t0)) }
+
+        var result: Int32?
+        let done = DispatchSemaphore(value: 0)
+        DispatchQueue.global().async {
+            result = SyncWatchDaemon.runChildProcess(
+                scriptPath: scriptPath, configPath: configPath, environment: env, logPath: log,
+                log: { message in
+                    let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd HH:mm:ss"
+                    appendLine("\(f.string(from: Date())) - \(message)", to: log)
+                },
+                timings: timings)
+            done.signal()
+        }
+
+        func pidFrom(_ path: String) -> pid_t? {
+            (try? String(contentsOfFile: path, encoding: .utf8)).flatMap { Int32($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
+        }
+        func logText() -> String { (try? String(contentsOfFile: log, encoding: .utf8)) ?? "" }
+        func alive(_ p: pid_t) -> Bool { kill(p, 0) == 0 }
+        func psState(_ p: pid_t) -> String { runTool("/bin/ps", ["-o", "stat=", "-p", "\(p)"]).1.trimmingCharacters(in: .whitespacesAndNewlines) }
+
+        var evidence: [String] = []
+        var failure: String?
+        var bashPid: pid_t = 0, stubPid: pid_t = 0
+        var stopped = false, sawStall = false, bashGoneAt: String?, sawKill = false
+        var stubAliveWhenBashGone = false, stubStateWhenBashGone = "", stubAliveEverySampleUntilKill = true
+        var lastAliveSample = "", killedAt: String?, stubDeadAfterKill = false
+        let deadline = Date().addingTimeInterval(30)
+        while done.wait(timeout: .now() + 0.05) == .timedOut && Date() < deadline {
+            if bashPid == 0, let p = pidFrom(lock) { bashPid = p }
+            if stubPid == 0, let p = pidFrom(stubPidFile) { stubPid = p }
+            if stubPid != 0 && !stopped {
+                let r = runTool("/bin/kill", ["-STOP", "\(stubPid)"])
+                stopped = r.0 == 0
+                evidence.append("\(ts()) kill -STOP \(stubPid) (the child's rclone) exit \(r.0)")
+            }
+            let stubAliveNow = stubPid != 0 && alive(stubPid)  // sampled BEFORE the log is read
+            let text = logText()
+            if !sawStall, text.contains("Sync stalled: no log output") {
+                sawStall = true
+                evidence.append("\(ts()) log: stall line present")
+            }
+            if sawStall, bashGoneAt == nil, bashPid != 0, !alive(bashPid) {
+                bashGoneAt = ts()
+                stubAliveWhenBashGone = stubPid != 0 && alive(stubPid)
+                stubStateWhenBashGone = psState(stubPid)
+                evidence.append("\(bashGoneAt!) bash \(bashPid) exited after SIGTERM; STOP'd rclone \(stubPid) alive=\(stubAliveWhenBashGone) state=\(stubStateWhenBashGone)")
+            }
+            if bashGoneAt != nil, !sawKill, stubPid != 0 {
+                // The SIGKILL goes out within ms of its log line, so "alive until the kill"
+                // is the last sample taken BEFORE that line was first seen.
+                if stubAliveNow { lastAliveSample = ts() } else if !text.contains("killing it") { stubAliveEverySampleUntilKill = false }
+            }
+            if !sawKill, text.contains("killing it") {
+                sawKill = true
+                killedAt = ts()
+                evidence.append("\(killedAt!) log: SIGKILL escalation line (grace 2s); rclone \(stubPid) was alive at every sample from bash exit until \(lastAliveSample) = \(stubAliveEverySampleUntilKill)")
+            }
+            if sawKill, !stubDeadAfterKill, stubPid != 0, !alive(stubPid) {
+                stubDeadAfterKill = true
+                evidence.append("\(ts()) rclone \(stubPid) gone after SIGKILL")
+            }
+        }
+        if result == nil { failure = "runChildProcess did not return in 30s"; _ = done.wait(timeout: .now() + 0.01) }
+        let finished = ts()
+        // Always leave nothing behind.
+        if bashPid != 0 { killpg(bashPid, SIGKILL) }
+        if stubPid != 0 { kill(stubPid, SIGKILL) }
+
+        let pg = bashPid != 0 ? runTool("/usr/bin/pgrep", ["-g", "\(bashPid)"]) : (1, "")
+        evidence.append("\(finished) runChildProcess returned \(String(describing: result)); `pgrep -g \(bashPid)` exit \(pg.0) output \"\(pg.1.trimmingCharacters(in: .whitespacesAndNewlines))\" (1 + empty = group gone)")
+
+        let text = logText()
+        let lines = text.split(separator: "\n").map(String.init)
+        func index(_ needle: String) -> Int? { lines.firstIndex { $0.contains(needle) } }
+        if failure == nil {
+            if !stopped { failure = "stub never started" }
+            else if !sawStall || bashGoneAt == nil || !sawKill { failure = "missing evidence stall=\(sawStall) bashGone=\(bashGoneAt != nil) kill=\(sawKill)" }
+            else if !(stubAliveWhenBashGone && stubAliveEverySampleUntilKill && stubDeadAfterKill) {
+                failure = "hung rclone: alive at bash exit \(stubAliveWhenBashGone), alive until kill \(stubAliveEverySampleUntilKill), gone after kill \(stubDeadAfterKill)"
+            }
+            else if !(pg.0 == 1 && pg.1.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty) { failure = "process group not gone" }
+            else if result != 79 { failure = "returned \(String(describing: result)), expected 79" }
+            else if let a = index("Sync stalled: no log output"), let b = index("killing it"), let c = index("Sync failed with exit code 79"),
+                    a < b, b < c, lines.last?.contains("exit code 79") == true {
+                // ordered
+            } else { failure = "log lines out of order or missing: \(lines)" }
+        }
+        if let f = failure {
+            for e in evidence { print("    A5 \(e)") }
+            return report(id, slug, false, "(\(f))")
+        }
+
+        guard SyncManager.readLastErrorFromLog(log) == "Sync stalled" else {
+            return report(id, slug, false, "(readLastErrorFromLog did not report the stalled run)")
+        }
+
+        // The next triggered run is not skipped by the lock: stale-PID path, then a real start.
+        let lockLeft = fm.fileExists(atPath: lock)
+        try? "#!/bin/sh\nexit 0\n".write(toFile: stubPath, atomically: true, encoding: .utf8)
+        let before = lines.count
+        let second = SyncWatchDaemon.runChildProcess(
+            scriptPath: scriptPath, configPath: configPath, environment: env, logPath: log, log: { _ in }, timings: timings)
+        let after = (try? String(contentsOfFile: log, encoding: .utf8))?.split(separator: "\n").map(String.init) ?? []
+        let next = Array(after.dropFirst(before))
+        evidence.append("\(ts()) next run: lock left behind=\(lockLeft), exit \(second), new log lines: \(next.filter { !$0.isEmpty })")
+        guard second == 0, next.contains(where: { $0.contains("Starting sync") }),
+              !next.contains(where: { $0.contains("already running") }) else {
+            for e in evidence { print("    A5 \(e)") }
+            return report(id, slug, false, "(the next run was skipped or failed)")
+        }
+
+        // A group `.giveUp` left alive blocks the next run until it is gone
+        // (CodeRabbit on PR #11): no spawn, 79, one log line; then a normal run.
+        let holder = Process()
+        holder.executableURL = URL(fileURLWithPath: "/bin/sleep")
+        holder.arguments = ["30"]
+        do { try holder.run() } catch {
+            return report(id, slug, false, "(could not start the holder process: \(error))")
+        }
+        SyncWatchDaemon.lingeringGroup = (holder.processIdentifier, false, SyncWatchDaemon.monotonicNow())
+        var refusals: [String] = []
+        let blockedLen = (try? String(contentsOfFile: log, encoding: .utf8))?.count ?? 0
+        let blocked1 = SyncWatchDaemon.runChildProcess(
+            scriptPath: scriptPath, configPath: configPath, environment: env, logPath: log, log: { refusals.append($0) }, timings: timings)
+        let blocked2 = SyncWatchDaemon.runChildProcess(
+            scriptPath: scriptPath, configPath: configPath, environment: env, logPath: log, log: { refusals.append($0) }, timings: timings)
+        let startedWhileBlocked = ((try? String(contentsOfFile: log, encoding: .utf8))?.count ?? 0) != blockedLen
+        holder.terminate()
+        holder.waitUntilExit()
+        let unblocked = SyncWatchDaemon.runChildProcess(
+            scriptPath: scriptPath, configPath: configPath, environment: env, logPath: log, log: { _ in }, timings: timings)
+        evidence.append("\(ts()) lingering group: blocked \(blocked1)/\(blocked2), refusal lines \(refusals.count), script ran while blocked \(startedWhileBlocked), after group gone exit \(unblocked)")
+        guard blocked1 == 79, blocked2 == 79, refusals.count == 1, !startedWhileBlocked,
+              unblocked == 0, SyncWatchDaemon.lingeringGroup.value == nil else {
+            for e in evidence { print("    A5 \(e)") }
+            return report(id, slug, false, "(a lingering stalled group did not block the next run, or never released it)")
+        }
+
+        // The 79 line parses to .syncFailed(79), whose text is "Sync stalled".
+        guard let line = lines.first(where: { $0.contains("Sync failed with exit code 79") }),
+              let event = LogParser().parse(line: line), case .syncFailed(let code, _) = event.type, code == 79,
+              SyncManager.exitCodeErrorText(code) == "Sync stalled" else {
+            return report(id, slug, false, "(LogParser/exitCodeErrorText did not map the 79 line)")
+        }
+        evidence.append("\(ts()) LogParser -> .syncFailed(exitCode: 79); exitCodeErrorText(79) == \"Sync stalled\"")
+        for e in evidence { print("    A5 \(e)") }
+        return report(id, slug, true)
+    }
+
 
 }
 

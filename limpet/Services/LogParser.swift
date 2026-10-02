@@ -29,6 +29,8 @@ final class LogParser {
     }()
 
     // Regex to strip ANSI escape codes
+    // Compiled once, not per line (the plain-text pattern ran for every non-JSON line).
+    private let plainTextRegex = try? NSRegularExpression(pattern: #"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) - (.+)$"#)
     private let ansiPattern = try? NSRegularExpression(pattern: #"\u001B\[[0-9;]*[A-Za-z]"#)
 
     func parse(line: String) -> ParsedLogEvent? {
@@ -125,8 +127,7 @@ final class LogParser {
 
     private func parsePlainTextLine(_ line: String) -> ParsedLogEvent? {
         // Parse timestamp: "2026-02-14 10:30:00 - Message"
-        let pattern = #"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) - (.+)$"#
-        guard let regex = try? NSRegularExpression(pattern: pattern),
+        guard let regex = plainTextRegex,
               let match = regex.firstMatch(in: line, range: NSRange(line.startIndex..., in: line)) else {
             return nil
         }

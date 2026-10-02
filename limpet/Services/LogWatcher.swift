@@ -1,321 +1,282 @@
 import Foundation
 
+/// Delivery contract (limpet-plan.md L6.3 R1): `didReceiveNewLines` is ALWAYS
+/// called on the main queue, via `DispatchQueue.main.async` posted from the
+/// watcher's single serial queue, so batches N and N+1 are applied in order.
 protocol LogWatcherDelegate: AnyObject {
     func logWatcher(_ watcher: LogWatcher, didReceiveNewLines lines: [String])
 }
 
+/// Size and inode of a log file. The one stat helper shared by `LogWatcher`
+/// and the stalled-sync watchdog (`SyncWatchDaemon`), so "did the log make
+/// progress" means the same thing in both (size changed or inode changed).
+struct LogFileStat: Equatable {
+    var size: UInt64
+    var inode: UInt64
+
+    /// nil when the path cannot be stat'ed (missing).
+    static func read(_ path: String) -> LogFileStat? {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: path) else { return nil }
+        return LogFileStat(size: attributes[.size] as? UInt64 ?? 0,
+                           inode: (attributes[.systemFileNumber] as? NSNumber)?.uint64Value ?? 0)
+    }
+}
+
+/// Tails one profile log.
+///
+/// Threading contract (limpet-plan.md L6.3 R1): `pollQueue` OWNS every stored
+/// property below except `delegate` (set once before `startWatching`) — the
+/// file handle, dispatch source, poll/flush timers, read offset, line buffer,
+/// inode and the pending batch. Public entry points hop onto the queue
+/// (`startWatching`/`stopWatching` with `sync`, so a caller on main returns
+/// only once setup/teardown is complete; `setActivelySyncing` with `async`). Reads and handle closes are serialized on that queue, so a
+/// stop can never close a handle mid-read. Nothing here runs on main except
+/// the delegate callback.
+///
+/// The watcher NEVER creates or truncates the log (R6): the script, the
+/// watcher daemon's `appendProfileLogLine` and `tee -a` create it. A path
+/// that does not exist keeps the poll timer running; when the file appears it
+/// is opened at offset 0.
 final class LogWatcher {
     private var logPath: String
     private var fileHandle: FileHandle?
     private var source: DispatchSourceFileSystemObject?
     private var lastReadPosition: UInt64 = 0
-    private var lineBuffer: String = ""  // Buffer for partial lines between reads
-    private var lastKnownInode: UInt64 = 0  // Track file inode to detect file replacement
+    /// Bytes read but not yet terminated by a newline. Kept as bytes, never decoded
+    /// before a newline is seen, so a read ending inside a multibyte character
+    /// cannot lose the line.
+    private var pendingBytes = Data()
+    private var lastKnownInode: UInt64 = 0  // 0 = never opened; survives a brief ENOENT
 
-    // Polling fallback for reliability
+    private var pendingLines: [String] = []
+    private var flushTimer: DispatchSourceTimer?
+    private var lastFlush = Date.distantPast
+
     private var pollTimer: DispatchSourceTimer?
     private var isActivelySyncing: Bool = false
     private let pollQueue = DispatchQueue(label: "com.limpet.logwatcher.poll", qos: .utility)
-    private static let heartbeatInterval: TimeInterval = 5.0
-    private static let activePollingInterval: TimeInterval = 2.5
+    private let queueKey = DispatchSpecificKey<Void>()
+    private let heartbeatInterval: TimeInterval
+    private let activePollingInterval: TimeInterval
+    private let flushInterval: TimeInterval
 
     weak var delegate: LogWatcherDelegate?
 
-    init(logPath: String) {
+    /// The intervals are injectable only for the self-test; production uses the defaults.
+    init(logPath: String, heartbeatInterval: TimeInterval = 5.0, activePollingInterval: TimeInterval = 2.5,
+         flushInterval: TimeInterval = 1.0) {
         self.logPath = logPath
+        self.heartbeatInterval = heartbeatInterval
+        self.activePollingInterval = activePollingInterval
+        self.flushInterval = flushInterval
+        pollQueue.setSpecific(key: queueKey, value: ())
     }
 
-    func updateLogPath(_ path: String) {
-        stopWatching()
-        self.logPath = path
-        startWatching()
-    }
+    // MARK: - Public entry points (hop onto pollQueue)
 
     func startWatching() {
-        stopWatching()
-        lineBuffer = ""  // Reset buffer on start
-        lastKnownInode = 0  // Reset inode tracking
-
-        // Create log file and directory if they don't exist
-        let fileManager = FileManager.default
-        if !fileManager.fileExists(atPath: logPath) {
-            let directory = (logPath as NSString).deletingLastPathComponent
-            try? fileManager.createDirectory(atPath: directory, withIntermediateDirectories: true)
-            fileManager.createFile(atPath: logPath, contents: nil)
-        }
-
-        guard let handle = FileHandle(forReadingAtPath: logPath) else {
-            print("Failed to open log file: \(logPath)")
-            return
-        }
-
-        fileHandle = handle
-
-        // Seek to end to only watch new content
-        handle.seekToEndOfFile()
-        lastReadPosition = handle.offsetInFile
-
-        // Store initial inode
-        if let attrs = try? FileManager.default.attributesOfItem(atPath: logPath) {
-            lastKnownInode = (attrs[.systemFileNumber] as? NSNumber)?.uint64Value ?? 0
-        }
-
-        let fd = handle.fileDescriptor
-        let source = DispatchSource.makeFileSystemObjectSource(
-            fileDescriptor: fd,
-            eventMask: [.extend, .write, .rename, .delete],
-            queue: .main
-        )
-
-        source.setEventHandler { [weak self] in
-            self?.handleFileChange()
-        }
-
-        source.setCancelHandler { [weak self] in
-            self?.fileHandle?.closeFile()
-            self?.fileHandle = nil
-        }
-
-        self.source = source
-        source.resume()
-
-        // Start polling fallback timer
-        startPollTimer()
-
-        // Read recent content for context (last 50 lines)
-        readRecentLines(count: 50)
+        pollQueue.sync { start() }
     }
 
     func stopWatching() {
-        pollTimer?.cancel()
-        pollTimer = nil
-        source?.cancel()
-        source = nil
-        fileHandle?.closeFile()
-        fileHandle = nil
-        lineBuffer = ""  // Clear buffer on stop
-    }
-
-    /// Reopen the log file after it has been replaced (e.g., by atomic write during truncation)
-    private func reopenFile() {
-        // Cancel current DispatchSource
-        source?.cancel()
-        source = nil
-
-        // Close current file handle
-        fileHandle?.closeFile()
-        fileHandle = nil
-
-        // Reset state
-        lineBuffer = ""
-        lastReadPosition = 0
-        lastKnownInode = 0
-
-        // Reopen file
-        guard let handle = FileHandle(forReadingAtPath: logPath) else {
-            LimpetSettings.debugLog("LogWatcher: Failed to reopen file: \(logPath)")
-            return
-        }
-        fileHandle = handle
-
-        // Seek to end (only want new content going forward)
-        handle.seekToEndOfFile()
-        lastReadPosition = handle.offsetInFile
-
-        // Store new inode
-        if let attrs = try? FileManager.default.attributesOfItem(atPath: logPath) {
-            lastKnownInode = (attrs[.systemFileNumber] as? NSNumber)?.uint64Value ?? 0
-        }
-
-        // Create new DispatchSource
-        let fd = handle.fileDescriptor
-        let newSource = DispatchSource.makeFileSystemObjectSource(
-            fileDescriptor: fd,
-            eventMask: [.extend, .write, .rename, .delete],
-            queue: .main
-        )
-
-        newSource.setEventHandler { [weak self] in
-            self?.handleFileChange()
-        }
-
-        newSource.setCancelHandler { [weak self] in
-            self?.fileHandle?.closeFile()
-            self?.fileHandle = nil
-        }
-
-        source = newSource
-        newSource.resume()
-
-        LimpetSettings.debugLog("LogWatcher: Successfully reopened file with new inode \(lastKnownInode)")
+        pollQueue.sync { stop() }
     }
 
     /// Adjust polling frequency based on sync activity
     func setActivelySyncing(_ active: Bool) {
-        guard isActivelySyncing != active else { return }
-        isActivelySyncing = active
-
-        // Restart poll timer with new interval
-        if pollTimer != nil {
-            startPollTimer()
+        pollQueue.async { [weak self] in
+            guard let self, self.isActivelySyncing != active else { return }
+            self.isActivelySyncing = active
+            if self.pollTimer != nil { self.startPollTimer() }
         }
     }
 
-    // MARK: - Polling Fallback
+    /// Test hook: run one poll tick now (the same routine the timer runs).
+    func pollNowForTesting() {
+        pollQueue.sync { pollForChanges() }
+    }
+
+    // MARK: - Everything below runs on pollQueue only
+
+    private func start() {
+        stop()
+        pendingBytes = Data()
+        lastKnownInode = 0
+        lastReadPosition = 0
+        // An existing file is tailed from its end (only new content matters;
+        // the initial state comes from SyncManager's lock check). A missing
+        // one is not created — the poll tick opens it at offset 0 when it appears.
+        if let stat = statLog() {
+            openFile(atOffset: stat.size, inode: stat.inode)
+        }
+        startPollTimer()
+    }
+
+    private func stop() {
+        pollTimer?.cancel()
+        pollTimer = nil
+        flushTimer?.cancel()
+        flushTimer = nil
+        pendingLines = []
+        closeFile()
+        pendingBytes = Data()
+    }
+
+    /// Cancel the source; its cancel handler (queued on pollQueue, so after any
+    /// in-flight read) closes the handle it captured.
+    private func closeFile() {
+        source?.cancel()
+        source = nil
+        fileHandle = nil
+    }
+
+    private func statLog() -> LogFileStat? { LogFileStat.read(logPath) }
+
+    private func openFile(atOffset offset: UInt64, inode: UInt64) {
+        closeFile()
+        guard let handle = FileHandle(forReadingAtPath: logPath) else {
+            LimpetSettings.debugLog("LogWatcher: Failed to open file: \(logPath)")
+            return
+        }
+        fileHandle = handle
+        pendingBytes = Data()
+        lastReadPosition = offset
+        lastKnownInode = inode
+        handle.seek(toFileOffset: offset)
+
+        let newSource = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: handle.fileDescriptor,
+            eventMask: [.extend, .write, .rename, .delete],
+            queue: pollQueue
+        )
+        newSource.setEventHandler { [weak self] in self?.handleFileChange() }
+        newSource.setCancelHandler { try? handle.close() }
+        source = newSource
+        newSource.resume()
+    }
+
+    /// Reopen the log after it was replaced (e.g. rotated). Idempotent: a
+    /// second request (poll AND source) finds the inode already current.
+    private func reopenFile() {
+        guard let stat = statLog(), stat.inode != lastKnownInode else { return }
+        LimpetSettings.debugLog("LogWatcher: reopening at offset 0, inode \(lastKnownInode) -> \(stat.inode)")
+        openFile(atOffset: 0, inode: stat.inode)
+        handleFileChange()
+    }
 
     private func startPollTimer() {
         pollTimer?.cancel()
-
         let timer = DispatchSource.makeTimerSource(queue: pollQueue)
-        let interval = isActivelySyncing ? Self.activePollingInterval : Self.heartbeatInterval
+        let interval = isActivelySyncing ? activePollingInterval : heartbeatInterval
         timer.schedule(deadline: .now() + interval, repeating: interval)
-
-        timer.setEventHandler { [weak self] in
-            self?.pollForChanges()
-        }
-
+        timer.setEventHandler { [weak self] in self?.pollForChanges() }
         pollTimer = timer
         timer.resume()
     }
 
+    /// The one shared tick: covers a path that never existed, was deleted, is
+    /// mid-rotation, or was replaced, as well as missed source events.
     private func pollForChanges() {
-        do {
-            let attributes = try FileManager.default.attributesOfItem(atPath: logPath)
-            let currentSize = attributes[.size] as? UInt64 ?? 0
-            let currentInode = (attributes[.systemFileNumber] as? NSNumber)?.uint64Value ?? 0
-
-            // Detect file replacement (inode changed) - atomic writes create new files
-            if lastKnownInode != 0 && currentInode != lastKnownInode {
-                LimpetSettings.debugLog("LogWatcher: Polling detected file replacement (inode changed from \(lastKnownInode) to \(currentInode))")
-                DispatchQueue.main.async { [weak self] in
-                    self?.reopenFile()
-                }
-                return
-            }
-
-            if currentSize > lastReadPosition {
-                // Missed content - read it
-                let missedBytes = currentSize - lastReadPosition
-                LimpetSettings.debugLog("LogWatcher: Polling detected \(missedBytes) missed bytes")
-                DispatchQueue.main.async { [weak self] in
-                    self?.handleFileChange()
-                }
-            }
-        } catch {
-            // File may have been deleted - trigger recovery
-            LimpetSettings.debugLog("LogWatcher: Polling error - \(error.localizedDescription)")
-            DispatchQueue.main.async { [weak self] in
-                self?.stopWatching()
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
-                    self?.startWatching()
-                }
-            }
+        guard let stat = statLog() else {
+            // Missing path: drop the handle, keep polling (never create it).
+            if fileHandle != nil { closeFile() }
+            return
+        }
+        if fileHandle == nil {
+            // Appeared (or reappeared). A different file starts at 0; the same
+            // inode resumes where it was (handleFileChange handles truncation).
+            let sameFile = lastKnownInode != 0 && stat.inode == lastKnownInode
+            openFile(atOffset: sameFile ? min(lastReadPosition, stat.size) : 0, inode: stat.inode)
+            handleFileChange()
+            return
+        }
+        if stat.inode != lastKnownInode {
+            reopenFile()
+        } else if stat.size != lastReadPosition {
+            handleFileChange()
         }
     }
 
     private func handleFileChange() {
         guard let handle = fileHandle else { return }
-
-        // Check if file was truncated, rotated, or replaced
-        do {
-            let attributes = try FileManager.default.attributesOfItem(atPath: logPath)
-            let fileSize = attributes[.size] as? UInt64 ?? 0
-            let currentInode = (attributes[.systemFileNumber] as? NSNumber)?.uint64Value ?? 0
-
-            // Detect file replacement (inode changed) - atomic writes create new files
-            if lastKnownInode != 0 && currentInode != lastKnownInode {
-                LimpetSettings.debugLog("LogWatcher: File replaced (inode changed from \(lastKnownInode) to \(currentInode)), reopening")
-                reopenFile()
-                return
-            }
-            lastKnownInode = currentInode
-
-            if fileSize < lastReadPosition {
-                // File was truncated, restart from beginning
-                handle.seek(toFileOffset: 0)
-                lastReadPosition = 0
-                lineBuffer = ""  // Clear buffer on truncation
-            }
-        } catch {
-            // File might have been deleted, try to reopen
-            stopWatching()
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
-                self?.startWatching()
-            }
+        guard let stat = statLog() else {
+            closeFile()  // path vanished; the poll tick reopens when it returns
             return
+        }
+        if stat.inode != lastKnownInode {
+            reopenFile()
+            return
+        }
+        if stat.size < lastReadPosition {
+            // Truncated: restart from the beginning
+            lastReadPosition = 0
+            pendingBytes = Data()
         }
 
         handle.seek(toFileOffset: lastReadPosition)
         let newData = handle.readDataToEndOfFile()
         lastReadPosition = handle.offsetInFile
 
-        guard !newData.isEmpty,
-              let content = String(data: newData, encoding: .utf8) else {
-            return
-        }
+        guard !newData.isEmpty else { return }
 
-        // Prepend any buffered partial line from previous read
-        let fullContent = lineBuffer + content
+        // Decode only up to the last newline; the rest (possibly a partial line, or a
+        // multibyte character cut by this read) is carried to the next read as bytes.
+        pendingBytes.append(newData)
+        guard let lastNewline = pendingBytes.lastIndex(of: 0x0A) else { return }
+        let complete = pendingBytes[pendingBytes.startIndex...lastNewline]
+        pendingBytes = Data(pendingBytes[(lastNewline + 1)...])
 
-        // Split into lines
-        var lines = fullContent.components(separatedBy: "\n")
-
-        // If content doesn't end with newline, last element is partial - buffer it
-        if !content.hasSuffix("\n") && !lines.isEmpty {
-            lineBuffer = lines.removeLast()
-        } else {
-            lineBuffer = ""
-        }
-
-        // Process complete lines only
-        let completeLines = lines
+        let completeLines = String(decoding: complete, as: UTF8.self)
+            .components(separatedBy: "\n")
             .map { $0.trimmingCharacters(in: .whitespaces) }
             .filter { !$0.isEmpty }
+        guard !completeLines.isEmpty else { return }
 
-        if !completeLines.isEmpty {
-            delegate?.logWatcher(self, didReceiveNewLines: completeLines)
+        pendingLines.append(contentsOf: completeLines)
+        if completeLines.contains(where: Self.isTransitionLine) {
+            flush()
+        } else {
+            scheduleFlush()
         }
     }
 
-    private func readRecentLines(count: Int) {
-        guard let handle = fileHandle else { return }
+    /// Lines whose state change must not wait for the coalescing interval.
+    static func isTransitionLine(_ line: String) -> Bool {
+        SyncLogPatterns.isSyncStarted(line) || SyncLogPatterns.isSyncCompleted(line)
+            || SyncLogPatterns.isSyncFailed(line) || SyncLogPatterns.isSyncAlreadyRunning(line)
+    }
 
-        // Only read the last 64KB max to avoid memory issues with large logs
-        let maxBytes: UInt64 = 64 * 1024
-        let fileSize = handle.seekToEndOfFile()
+    /// At most one delivery per `flushInterval` for ordinary lines.
+    private func scheduleFlush() {
+        guard flushTimer == nil else { return }
+        // Clamped to `flushInterval`: `lastFlush` is wall-clock time, and a clock
+        // stepped backwards must not push the next delivery out by the step.
+        let wait = min(flushInterval, max(0, lastFlush.addingTimeInterval(flushInterval).timeIntervalSinceNow))
+        let timer = DispatchSource.makeTimerSource(queue: pollQueue)
+        timer.schedule(deadline: .now() + wait)
+        timer.setEventHandler { [weak self] in self?.flush() }
+        flushTimer = timer
+        timer.resume()
+    }
 
-        if fileSize > maxBytes {
-            handle.seek(toFileOffset: fileSize - maxBytes)
-        } else {
-            handle.seek(toFileOffset: 0)
-        }
-
-        let data = handle.readDataToEndOfFile()
-        lastReadPosition = handle.offsetInFile
-        lineBuffer = ""  // Clear buffer when reading recent lines
-
-        guard let content = String(data: data, encoding: .utf8) else { return }
-
-        // For recent lines, we want complete lines only
-        // Split and take only lines that end with newline (all but potentially last)
-        var allLines = content.components(separatedBy: "\n")
-
-        // If content doesn't end with newline, last line is partial - discard it
-        if !content.hasSuffix("\n") && !allLines.isEmpty {
-            allLines.removeLast()
-        }
-
-        let cleanLines = allLines
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .filter { !$0.isEmpty }
-
-        let recentLines = Array(cleanLines.suffix(count))
-        if !recentLines.isEmpty {
-            delegate?.logWatcher(self, didReceiveNewLines: recentLines)
+    private func flush() {
+        flushTimer?.cancel()
+        flushTimer = nil
+        guard !pendingLines.isEmpty else { return }
+        let batch = pendingLines
+        pendingLines = []
+        lastFlush = Date()
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.delegate?.logWatcher(self, didReceiveNewLines: batch)
         }
     }
 
     deinit {
-        stopWatching()
+        if DispatchQueue.getSpecific(key: queueKey) != nil {
+            stop()
+        } else {
+            pollQueue.sync { stop() }
+        }
     }
 }
