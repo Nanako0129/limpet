@@ -454,7 +454,7 @@ is the single pure mapping from a `syncFailed` exit code to the text shown in
 `profileStates[id] = .error(...)` and, when no more specific error message is
 available, in the failure notification: 76 (the delete-limit trip, see
 **Delete limit** above) -> "Delete limit reached"; every other code keeps
-the prior generic "Exit code N"; 78 (the stalled-sync watchdog's code, see
+the prior generic "Exit code N"; 79 (the stalled-sync watchdog's code, see
 **GUI responsiveness, log rotation and the stalled-sync watchdog** below) ->
 "Sync stalled". A refusal (exit 64) is not mapped: the
 script exits before writing "Sync failed with exit code", so the GUI never
@@ -469,7 +469,7 @@ check is the user running the app for 3+ days, plan A1) and one watchdog.
 handle, dispatch source, poll and flush timers, read offset, partial-line
 buffer, inode and the pending batch. `startWatching`/`stopWatching` hop onto it
 with `sync` (a caller on main returns only after setup/teardown is complete);
-`updateLogPath`/`setActivelySyncing` use `async`; `deinit` tears down with
+`setActivelySyncing` uses `async`; `deinit` tears down with
 `pollQueue.sync` unless already on the queue (`DispatchSpecificKey`). Reads, the
 poll tick, `reopenFile` and the flush all run on that queue only, and the
 source's cancel handler (queued on the same queue) closes the handle it
@@ -483,7 +483,13 @@ called on the main queue. `SyncManager.processLogLinesForWatcher` parses the
 batch, `SyncManager.coalesceLogEvents` drops every `.stats` event except the
 last (each only overwrites `profileProgress`; the others keep their order), and
 `updateAggregateState` runs once per batch (`processLogEvent(updateAggregate:)`).
-The startup replay of the last 50 lines is gone (it was already inert: it ran
+Reads keep their unterminated tail as BYTES (`pendingBytes`) and decode only up
+to the last newline, so a read ending inside a multibyte character cannot drop
+the line (AC-L63-9). Before parsing, `SyncManager.dropSupersededStatsLines`
+discards every raw rclone JSON stats line but the last in the batch (a line
+starting `{` containing `"stats":{`, checked against captured rclone 1.75.1
+output); `LogParser` compiles its regexes once. The startup replay of the last
+50 lines is gone (it was already inert: it ran
 before `logWatchers[id]` was set); the initial state comes from the lock check
 in `startWatching(profile:)`. The watcher NEVER creates or truncates the log:
 a missing path keeps the poll timer running and keeps no handle; when the file
@@ -524,12 +530,31 @@ for 30 min - stopping it`, sends SIGTERM to the child's process group, and
 after a 30 s grace sends SIGKILL. Escalation is keyed on the process GROUP, not
 the bash child: after the SIGTERM `runChildProcess` polls `killpg(pgid, 0)`
 every second and returns only when the group is gone, and only then appends
-`Sync failed with exit code 78` and returns 78 (`SyncManager.exitCodeErrorText`
--> "Sync stalled", the menu turns red). It never touches `runningChild`'s
+`Sync failed with exit code 79` and returns 79 (`SyncManager.exitCodeErrorText`
+-> "Sync stalled", the menu turns red; not 78, which is already
+`secretUnavailableExitCode` and stays unmapped). It never touches `runningChild`'s
 termination state, so the watcher stays up and the scheduler carries on, and a
 SIGTERM to the watcher during the escalation still forwards to the group. The
-decision is the pure `SyncWatchDaemon.watchdogDecision` (`.wait`/`.terminate`/
-`.kill`/`.done`, AC-L63-3). The thresholds are injectable
+decision is the pure `SyncWatchDaemon.watchdogDecision` (`.wait`/`.exited`/
+`.terminate`/`.kill`/`.done`/`.giveUp`, AC-L63-3), and it also reports whether the
+log progressed, so that comparison lives in one place (`LogFileStat`, shared with
+`LogWatcher`). Every time value comes from one sleep-pausing clock
+(`monotonicNow()` = system uptime, like the `DispatchTime` waits); a wall clock
+would make a healthy run look stalled after the Mac sleeps. If bash exits on its
+own just as a check times out, the decision is `.exited`: its own status is
+returned and no stall is logged. If the group is still alive 60 s after SIGKILL
+(a process in uninterruptible sleep survives it) with bash reaped, one line says
+so and the run is finished as stalled (79) anyway. The stall line is written
+BEFORE the SIGTERM and the `exit code 79` line only after the group is gone, and
+the lock can vanish in between, so `SyncManager.readLastErrorFromLog` treats
+`Sync stalled:` as the failure of the current run (returns "Sync stalled");
+`LogParser` still yields `.unknown` for it.
+
+What the watchdog does NOT catch: its progress signal is log growth, and
+rclone's own `--stats` lines keep the log growing while rclone is stuck retrying
+a dead network. It catches only a SILENT stall (a frozen process tree, like the
+2026-09-29 case), not a network-stuck rclone. Known limit, not solved. The
+thresholds are injectable
 (`WatchdogTimings`) from the self-test only, never from a profile field. Limit:
 a frozen or suspended WATCHER process is not covered. Observed in the A5 run
 (AC-L63-8): bash's EXIT trap runs on SIGTERM and removes the lock, so the next

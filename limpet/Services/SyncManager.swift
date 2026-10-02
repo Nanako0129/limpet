@@ -686,7 +686,8 @@ final class SyncManager: ObservableObject {
     }
 
     /// Read the last error message from a log file
-    private func readLastErrorFromLog(_ logPath: String) -> String? {
+    /// Static so the self-test can drive it (it uses no instance state).
+    nonisolated static func readLastErrorFromLog(_ logPath: String) -> String? {
         guard FileManager.default.fileExists(atPath: logPath),
               let data = FileManager.default.contents(atPath: logPath),
               let content = String(data: data, encoding: .utf8) else {
@@ -708,6 +709,14 @@ final class SyncManager: ObservableObject {
             // If the most recent sync was successful, there's no error to show
             if SyncLogPatterns.isSyncCompleted(line) {
                 return nil
+            }
+
+            // The watchdog writes this BEFORE it SIGTERMs the group and appends the
+            // `Sync failed with exit code 79` line only after the group is gone, and
+            // the lock can vanish in between: this line alone is the failure of the
+            // current run (seen before any completion line in this reverse scan).
+            if SyncLogPatterns.isSyncStalled(line) {
+                return "Sync stalled"
             }
 
             // Mark that we found the failure point
@@ -818,7 +827,7 @@ final class SyncManager: ObservableObject {
 
         // Determine success/failure from log
         if let profile = profileStore.profile(for: profileId),
-           let error = readLastErrorFromLog(profile.logPath) {
+           let error = Self.readLastErrorFromLog(profile.logPath) {
             profileStates[profileId] = .error("Sync failed")
             profileErrors[profileId] = error
         } else {
@@ -1051,9 +1060,11 @@ final class SyncManager: ObservableObject {
         switch exitCode {
         case 76:
             return "Delete limit reached"
-        case 78:
+        case 79:
             // L6.3 watchdog: `SyncWatchDaemon` stopped a run with no log output
-            // for 30 min and wrote `Sync failed with exit code 78`.
+            // for 30 min and wrote `Sync failed with exit code 79`. (78 is
+            // `secretUnavailableExitCode`, which never reaches the log, so it
+            // stays unmapped.)
             return "Sync stalled"
         default:
             return "Exit code \(exitCode)"
@@ -1326,12 +1337,25 @@ extension SyncManager: LogWatcherDelegate {
         return events.enumerated().compactMap { i, e in (isStats(e) && i != lastStats) ? nil : e }
     }
 
+    /// Cheap pre-parse filter (L6.3): every rclone JSON stats line except the last
+    /// in the batch is dropped BEFORE JSON decoding, since `coalesceLogEvents`
+    /// would drop its event anyway. A stats line is a line starting with `{` that
+    /// contains `"stats":{` — checked against real rclone 1.75.1 `--use-json-log
+    /// --stats 1s` output (2026-10-03: the stats entry carries `"stats":{"bytes":`);
+    /// a file name containing that text appears escaped (`\"stats\":{`) in other
+    /// entries, so it cannot match. Order and every other line are unchanged.
+    nonisolated static func dropSupersededStatsLines(_ lines: [String]) -> [String] {
+        func isStats(_ l: String) -> Bool { l.hasPrefix("{") && l.contains("\"stats\":{") }
+        guard let last = lines.lastIndex(where: isStats) else { return lines }
+        return lines.enumerated().compactMap { i, l in (i != last && isStats(l)) ? nil : l }
+    }
+
     /// Process a batch for a watcher (must be called on main actor): parse,
     /// coalesce, apply in order, recompute the aggregate once.
     private func processLogLinesForWatcher(_ watcher: LogWatcher, lines: [String]) {
         guard let profileId = profileId(for: watcher) else { return }
 
-        let events = lines.compactMap { logParser.parse(line: $0) }
+        let events = Self.dropSupersededStatsLines(lines).compactMap { logParser.parse(line: $0) }
         for event in Self.coalesceLogEvents(events) {
             processLogEvent(event, profileId: profileId, updateAggregate: false)
         }

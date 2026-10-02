@@ -7,6 +7,21 @@ protocol LogWatcherDelegate: AnyObject {
     func logWatcher(_ watcher: LogWatcher, didReceiveNewLines lines: [String])
 }
 
+/// Size and inode of a log file. The one stat helper shared by `LogWatcher`
+/// and the stalled-sync watchdog (`SyncWatchDaemon`), so "did the log make
+/// progress" means the same thing in both (size changed or inode changed).
+struct LogFileStat: Equatable {
+    var size: UInt64
+    var inode: UInt64
+
+    /// nil when the path cannot be stat'ed (missing).
+    static func read(_ path: String) -> LogFileStat? {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: path) else { return nil }
+        return LogFileStat(size: attributes[.size] as? UInt64 ?? 0,
+                           inode: (attributes[.systemFileNumber] as? NSNumber)?.uint64Value ?? 0)
+    }
+}
+
 /// Tails one profile log.
 ///
 /// Threading contract (limpet-plan.md L6.3 R1): `pollQueue` OWNS every stored
@@ -14,8 +29,7 @@ protocol LogWatcherDelegate: AnyObject {
 /// file handle, dispatch source, poll/flush timers, read offset, line buffer,
 /// inode and the pending batch. Public entry points hop onto the queue
 /// (`startWatching`/`stopWatching` with `sync`, so a caller on main returns
-/// only once setup/teardown is complete; `updateLogPath`/`setActivelySyncing`
-/// with `async`). Reads and handle closes are serialized on that queue, so a
+/// only once setup/teardown is complete; `setActivelySyncing` with `async`). Reads and handle closes are serialized on that queue, so a
 /// stop can never close a handle mid-read. Nothing here runs on main except
 /// the delegate callback.
 ///
@@ -28,7 +42,10 @@ final class LogWatcher {
     private var fileHandle: FileHandle?
     private var source: DispatchSourceFileSystemObject?
     private var lastReadPosition: UInt64 = 0
-    private var lineBuffer: String = ""  // Buffer for partial lines between reads
+    /// Bytes read but not yet terminated by a newline. Kept as bytes, never decoded
+    /// before a newline is seen, so a read ending inside a multibyte character
+    /// cannot lose the line.
+    private var pendingBytes = Data()
     private var lastKnownInode: UInt64 = 0  // 0 = never opened; survives a brief ENOENT
 
     private var pendingLines: [String] = []
@@ -65,15 +82,6 @@ final class LogWatcher {
         pollQueue.sync { stop() }
     }
 
-    func updateLogPath(_ path: String) {
-        pollQueue.async { [weak self] in
-            guard let self else { return }
-            self.stop()
-            self.logPath = path
-            self.start()
-        }
-    }
-
     /// Adjust polling frequency based on sync activity
     func setActivelySyncing(_ active: Bool) {
         pollQueue.async { [weak self] in
@@ -88,16 +96,11 @@ final class LogWatcher {
         pollQueue.sync { pollForChanges() }
     }
 
-    /// Test hook: run `block` on the watcher's queue (e.g. to read its state).
-    func onQueueForTesting<T>(_ block: () -> T) -> T {
-        pollQueue.sync(execute: block)
-    }
-
     // MARK: - Everything below runs on pollQueue only
 
     private func start() {
         stop()
-        lineBuffer = ""
+        pendingBytes = Data()
         lastKnownInode = 0
         lastReadPosition = 0
         // An existing file is tailed from its end (only new content matters;
@@ -116,7 +119,7 @@ final class LogWatcher {
         flushTimer = nil
         pendingLines = []
         closeFile()
-        lineBuffer = ""
+        pendingBytes = Data()
     }
 
     /// Cancel the source; its cancel handler (queued on pollQueue, so after any
@@ -127,11 +130,7 @@ final class LogWatcher {
         fileHandle = nil
     }
 
-    private func statLog() -> (size: UInt64, inode: UInt64)? {
-        guard let attributes = try? FileManager.default.attributesOfItem(atPath: logPath) else { return nil }
-        return (attributes[.size] as? UInt64 ?? 0,
-                (attributes[.systemFileNumber] as? NSNumber)?.uint64Value ?? 0)
-    }
+    private func statLog() -> LogFileStat? { LogFileStat.read(logPath) }
 
     private func openFile(atOffset offset: UInt64, inode: UInt64) {
         closeFile()
@@ -140,7 +139,7 @@ final class LogWatcher {
             return
         }
         fileHandle = handle
-        lineBuffer = ""
+        pendingBytes = Data()
         lastReadPosition = offset
         lastKnownInode = inode
         handle.seek(toFileOffset: offset)
@@ -211,24 +210,24 @@ final class LogWatcher {
         if stat.size < lastReadPosition {
             // Truncated: restart from the beginning
             lastReadPosition = 0
-            lineBuffer = ""
+            pendingBytes = Data()
         }
 
         handle.seek(toFileOffset: lastReadPosition)
         let newData = handle.readDataToEndOfFile()
         lastReadPosition = handle.offsetInFile
 
-        guard !newData.isEmpty, let content = String(data: newData, encoding: .utf8) else { return }
+        guard !newData.isEmpty else { return }
 
-        var lines = (lineBuffer + content).components(separatedBy: "\n")
-        // If content doesn't end with newline, last element is partial - buffer it
-        if !content.hasSuffix("\n") && !lines.isEmpty {
-            lineBuffer = lines.removeLast()
-        } else {
-            lineBuffer = ""
-        }
+        // Decode only up to the last newline; the rest (possibly a partial line, or a
+        // multibyte character cut by this read) is carried to the next read as bytes.
+        pendingBytes.append(newData)
+        guard let lastNewline = pendingBytes.lastIndex(of: 0x0A) else { return }
+        let complete = pendingBytes[pendingBytes.startIndex...lastNewline]
+        pendingBytes = Data(pendingBytes[(lastNewline + 1)...])
 
-        let completeLines = lines
+        let completeLines = String(decoding: complete, as: UTF8.self)
+            .components(separatedBy: "\n")
             .map { $0.trimmingCharacters(in: .whitespaces) }
             .filter { !$0.isEmpty }
         guard !completeLines.isEmpty else { return }

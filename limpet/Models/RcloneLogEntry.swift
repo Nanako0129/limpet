@@ -153,10 +153,11 @@ extension RcloneLogEntry {
         return nil
     }
 
+    private static let ansiRegex = try? NSRegularExpression(pattern: #"\u{001B}\[[0-9;]*[A-Za-z]"#)
+
     private func stripANSICodes(_ text: String) -> String {
         // Remove ANSI escape codes like \u001b[36m, \u001b[0m, etc.
-        let pattern = #"\u{001B}\[[0-9;]*[A-Za-z]"#
-        guard let regex = try? NSRegularExpression(pattern: pattern) else { return text }
+        guard let regex = Self.ansiRegex else { return text }
         let range = NSRange(text.startIndex..., in: text)
         return regex.stringByReplacingMatches(in: text, range: range, withTemplate: "")
     }
