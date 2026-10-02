@@ -341,6 +341,13 @@ enum SyncWatchDaemon {
     /// maps it to "Sync stalled". Not 78: `secretUnavailableExitCode` already is.
     static let stalledExitCode: Int32 = 79
 
+    /// Whether any process in group `pgid` still exists. `killpg(_, 0)` fails
+    /// with EPERM when a member exists but cannot be signalled, which still
+    /// means the group is alive; only ESRCH means it is gone.
+    static func processGroupExists(_ pgid: pid_t) -> Bool {
+        killpg(pgid, 0) == 0 || errno == EPERM
+    }
+
     /// The process group a `.giveUp` left alive, and whether the refusal was
     /// logged. Only `runChildProcess` touches it, and the scheduler never runs
     /// two of those at once, so no lock.
@@ -415,7 +422,7 @@ enum SyncWatchDaemon {
         // (CodeRabbit on PR #11). Refuse until the group is gone; logged once
         // per lingering group.
         if let lingering = lingeringGroup.value {
-            if killpg(lingering, 0) == 0 {
+            if processGroupExists(lingering) {
                 if !lingeringGroup.logged {
                     log("Sync not started: process group \(lingering) from the stalled run is still alive")
                     lingeringGroup.logged = true
@@ -483,7 +490,7 @@ enum SyncWatchDaemon {
             let step = watchdogDecision(
                 lastProgress: progress, lastProgressTime: lastProgressTime, current: current, now: now,
                 sigtermSentAt: sigtermSentAt, sigkillSentAt: sigkillSentAt,
-                groupAlive: killpg(pgid, 0) == 0, childReaped: reaped, timings: timings)
+                groupAlive: processGroupExists(pgid), childReaped: reaped, timings: timings)
             if step.progressed {
                 progress = current
                 lastProgressTime = now
