@@ -69,7 +69,7 @@ limpet/
 | `SyncManager.swift` | Central orchestrator - manages all profile states, log watchers, directory watchers |
 | `ProfileStore.swift` | File-backed, file-authoritative profile persistence — reads/writes per-profile `{shortId}.profile.json` files (see "File-Backed Configuration" below); dual-writes the legacy `syncProfiles` UserDefaults blob write-only |
 | `SyncSetupService.swift` | Generates sync scripts, launchd plists, manages agent install/uninstall |
-| `LogWatcher.swift` | FSEvents + polling hybrid file watcher for rclone log files |
+| `LogWatcher.swift` | FSEvents + polling hybrid log tailer; every stored property is owned by its serial `pollQueue`, batches reach the main queue once per second (see "GUI responsiveness, log rotation and the stalled-sync watchdog") |
 | `LogParser.swift` | Parses plain text and JSON log lines into typed `ParsedLogEvent` |
 | `DirectoryWatcher.swift` | FSEvents-based directory monitoring with debouncing |
 | `ConfigFileWatcher.swift` | FSEvents watcher on `~/.config/limpet` for external profile/settings edits; self-write suppression via `ConfigSelfWriteRegistry` |
@@ -454,9 +454,89 @@ is the single pure mapping from a `syncFailed` exit code to the text shown in
 `profileStates[id] = .error(...)` and, when no more specific error message is
 available, in the failure notification: 76 (the delete-limit trip, see
 **Delete limit** above) -> "Delete limit reached"; every other code keeps
-the prior generic "Exit code N". A refusal (exit 64) is not mapped: the
+the prior generic "Exit code N"; 78 (the stalled-sync watchdog's code, see
+**GUI responsiveness, log rotation and the stalled-sync watchdog** below) ->
+"Sync stalled". A refusal (exit 64) is not mapped: the
 script exits before writing "Sync failed with exit code", so the GUI never
 sees that code — showing a refusal in the menu is open work.
+
+**GUI responsiveness, log rotation and the stalled-sync watchdog
+(limpet-plan.md L6.3, plan v1-v3).** Three defects found by reading the code
+(none is claimed to be THE cause of the multi-day menu freeze; the decisive
+check is the user running the app for 3+ days, plan A1) and one watchdog.
+
+*`LogWatcher` threading contract.* `pollQueue` OWNS every stored property: file
+handle, dispatch source, poll and flush timers, read offset, partial-line
+buffer, inode and the pending batch. `startWatching`/`stopWatching` hop onto it
+with `sync` (a caller on main returns only after setup/teardown is complete);
+`updateLogPath`/`setActivelySyncing` use `async`; `deinit` tears down with
+`pollQueue.sync` unless already on the queue (`DispatchSpecificKey`). Reads, the
+poll tick, `reopenFile` and the flush all run on that queue only, and the
+source's cancel handler (queued on the same queue) closes the handle it
+captured, so a stop never closes a handle mid-read. Lines are accumulated and
+delivered at most once per second (flush timer on `pollQueue`); a line that
+matches started, completed, failed or the lock-skip pattern
+(`LogWatcher.isTransitionLine`) flushes at once. Each batch is posted with
+`DispatchQueue.main.async` from `pollQueue` — one FIFO channel, never a `Task`
+per batch — so batches apply in order; `LogWatcherDelegate` is therefore always
+called on the main queue. `SyncManager.processLogLinesForWatcher` parses the
+batch, `SyncManager.coalesceLogEvents` drops every `.stats` event except the
+last (each only overwrites `profileProgress`; the others keep their order), and
+`updateAggregateState` runs once per batch (`processLogEvent(updateAggregate:)`).
+The startup replay of the last 50 lines is gone (it was already inert: it ran
+before `logWatchers[id]` was set); the initial state comes from the lock check
+in `startWatching(profile:)`. The watcher NEVER creates or truncates the log:
+a missing path keeps the poll timer running and keeps no handle; when the file
+appears it is opened at offset 0. An existing file at start is tailed from its
+end. `reopenFile` is idempotent (it re-reads the inode and returns when it is
+already `lastKnownInode`), so the poll tick and the source event cannot both
+reset the offset. `stopWatching` is the ONLY thing that cancels the poll timer.
+
+*Bounded per-run memory.* `SyncManager.currentSyncChanges` is a per-profile
+`Int` (its only reader was the count). `NotificationService` keeps at most the
+first 50 pending changes plus a true total (`pendingChangeCounts`, so "N files
+synced" stays right) and pushes the batch timer back at most once per second
+instead of once per change; the batch can therefore fire up to a second sooner
+than 2 s after the last change.
+
+*Log rotation (generated script).* After the lock is held and before the trash
+purge, a log over 20 MB (`stat -f %z`) is moved with `mv -f "$LOG_FILE"
+"$LOG_FILE.1" && : >> "$LOG_FILE"` (one old generation; the new file exists at
+once, so a watcher takes the inode-change path). Worst case on disk: 2 x 20 MB
+plus one run's output. `limpet logs` and `limpet status` read only the current
+file, so `status` right after a rotation reports `last=` from the new file.
+
+*Purge stats lines.* The trash purge now runs `rclone lsf` and `rclone purge`
+with `--stats 1m --stats-one-line --stats-log-level NOTICE` and appends their
+stderr to `$LOG_FILE`: a per-object purge of a large day folder can be silent
+for hours, and the watchdog reads silence as a stall. Measured 2026-10-03
+(local backend): with `--stats 5s` it writes one stderr line per interval, e.g.
+`2026/10/03 03:28:49 NOTICE:           0 B / 0 B, -, 0 B/s, ETA -`;
+`--stats-one-line` is required because the multi-line format also prints
+continuation lines such as `Deleted:  106 (files), 0 (dirs), 0 B (freed)`.
+`LogParser` returns nil for that line (no `YYYY-MM-DD HH:MM:SS - ` prefix), so
+it is never a stats, change or failure event (AC-L63-6).
+
+*Stalled-sync watchdog (`SyncWatchDaemon.runChildProcess`).* While the sync
+script runs, the profile log is checked every 60 s. Progress = the size grew or
+the inode changed. With none for 30 min it appends `Sync stalled: no log output
+for 30 min - stopping it`, sends SIGTERM to the child's process group, and
+after a 30 s grace sends SIGKILL. Escalation is keyed on the process GROUP, not
+the bash child: after the SIGTERM `runChildProcess` polls `killpg(pgid, 0)`
+every second and returns only when the group is gone, and only then appends
+`Sync failed with exit code 78` and returns 78 (`SyncManager.exitCodeErrorText`
+-> "Sync stalled", the menu turns red). It never touches `runningChild`'s
+termination state, so the watcher stays up and the scheduler carries on, and a
+SIGTERM to the watcher during the escalation still forwards to the group. The
+decision is the pure `SyncWatchDaemon.watchdogDecision` (`.wait`/`.terminate`/
+`.kill`/`.done`, AC-L63-3). The thresholds are injectable
+(`WatchdogTimings`) from the self-test only, never from a profile field. Limit:
+a frozen or suspended WATCHER process is not covered. Observed in the A5 run
+(AC-L63-8): bash's EXIT trap runs on SIGTERM and removes the lock, so the next
+run started without needing the stale-PID path. A SIGSTOP'd stub died once the
+group leader was gone unless it also ignored SIGHUP (likely the POSIX
+orphaned-group SIGHUP+SIGCONT rule, not separately verified), so the test stub
+ignores TERM and HUP.
 
 **Wizard remote creation (limpet-plan.md L5.1 finding 1).**
 `SetupWizardView.advanceToNextStep` returns early while `createRemote`'s
@@ -741,9 +821,9 @@ Background work (process execution, file I/O) happens on dispatch queues with re
 
 LogWatcher uses FSEvents as primary mechanism with polling fallback:
 
-1. **FSEvents**: Low-latency file change detection via `DispatchSource.makeFileSystemObjectSource`
-2. **Polling fallback**: Timer-based check every 2.5-5 seconds catches missed events
-3. **Inode tracking**: Detects file replacement (atomic writes) and reopens file handle
+1. **FSEvents**: Low-latency file change detection via `DispatchSource.makeFileSystemObjectSource`, on the watcher's own serial queue (not `.main`)
+2. **Polling fallback**: Timer-based check every 2.5-5 seconds catches missed events; the same tick also handles a log path that is missing, deleted or being rotated
+3. **Inode tracking**: Detects file replacement (rotation) and reopens the new file at offset 0
 
 ### Centralized Log Pattern Matching
 
