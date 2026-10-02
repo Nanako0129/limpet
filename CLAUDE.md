@@ -496,7 +496,9 @@ a missing path keeps the poll timer running and keeps no handle; when the file
 appears it is opened at offset 0. An existing file at start is tailed from its
 end. `reopenFile` is idempotent (it re-reads the inode and returns when it is
 already `lastKnownInode`), so the poll tick and the source event cannot both
-reset the offset. `stopWatching` is the ONLY thing that cancels the poll timer.
+reset the offset. Only `stopWatching` (and `start()`, which begins with a stop)
+stops polling outright; `setActivelySyncing` replaces the poll timer with one
+of the other interval, so a missing path keeps being polled until a stop.
 
 *Bounded per-run memory.* `SyncManager.currentSyncChanges` is a per-profile
 `Int` (its only reader was the count). `NotificationService` keeps at most the
@@ -538,8 +540,9 @@ SIGTERM to the watcher during the escalation still forwards to the group. The
 decision is the pure `SyncWatchDaemon.watchdogDecision` (`.wait`/`.exited`/
 `.terminate`/`.kill`/`.done`/`.giveUp`, AC-L63-3), and it also reports whether the
 log progressed, so that comparison lives in one place (`LogFileStat`, shared with
-`LogWatcher`). Every time value comes from one sleep-pausing clock
-(`monotonicNow()` = system uptime, like the `DispatchTime` waits); a wall clock
+`LogWatcher`). Every time value comes from one clock, system uptime (`monotonicNow()`,
+the same family as the `DispatchTime` waits; documented by Apple not to advance
+during sleep, not measured here); a wall clock
 would make a healthy run look stalled after the Mac sleeps. If bash exits on its
 own just as a check times out, the decision is `.exited`: its own status is
 returned and no stall is logged. If the group is still alive 60 s after SIGKILL
@@ -548,7 +551,11 @@ so and the run is finished as stalled (79) anyway; that group is remembered
 (`SyncWatchDaemon.lingeringGroup`) and every later `runChildProcess` refuses
 to start a script while `killpg(group, 0)` still finds it (one `Sync not
 started: …` line, returns 79), so a woken-up old rclone can never run beside a
-new one; the first run after the group is gone proceeds normally. The stall line is written
+new one; the first run after the group is gone proceeds normally. The block lasts at most
+1 h (`lingeringGroupMaxAge`): a dead group's pgid can be reused by an unrelated
+process, so after that one `Sync resuming: …` line is logged and runs resume.
+Not covered: the record lives only in the watcher process, so a watcher restart
+forgets it. The stall line is written
 BEFORE the SIGTERM and the `exit code 79` line only after the group is gone, and
 the lock can vanish in between, so `SyncManager.readLastErrorFromLog` treats
 `Sync stalled:` as the failure of the current run (returns "Sync stalled");
@@ -724,7 +731,7 @@ isn't limpet's own.
 | `limpet status [name\|shortId]` | One tab-separated line per profile (or a single one): `enabled=`, `agent=loaded\|unloaded\|n/a`, `running=` (lock present), `last=started\|completed\|failed\|none` (from the log tail via the shared `SyncLogPatterns`). |
 | `limpet profiles` | List every profile: name, shortId, mode, `enabled=`, `remote=` — no secrets. (`profile list` is an alias.) |
 | `limpet profile show <name\|shortId>` | Print one profile's FULL config as pretty, sorted-key JSON — the same shape as its `.profile.json`, so an agent can `show` → edit → `profile create`/`profile set` round-trip. No secrets (credentials live in `rclone.conf` or the login keychain). |
-| `limpet logs <name\|shortId> [--follow]` | Print (or `tail -f`) that profile's sync log. |
+| `limpet logs <name\|shortId> [--follow]` | Print (or `tail -F`, which follows the name across rotation) that profile's sync log. |
 | `limpet test-remote <name\|shortId>` | Probe one profile's remote with `rclone lsd` under a hard timeout; prints `reachable: <remote>` or the real rclone stderr. |
 | `limpet listremotes` | `rclone listremotes`, passthrough. |
 

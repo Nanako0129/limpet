@@ -655,12 +655,13 @@ enum LimpetCLI {
         }
 
         if follow {
-            // Spawns a real, non-terminating `tail -f` — not fake-injectable via
+            // Spawns a real, non-terminating `tail -F` (follows the NAME, so it
+            // survives the script rotating the log to `.1`) — not fake-injectable via
             // `CLIEnvironment`, so the self-test only exercises resolve +
             // exists-check above for this command.
             let proc = Process()
             proc.executableURL = URL(fileURLWithPath: "/usr/bin/tail")
-            proc.arguments = ["-f", profile.logPath]
+            proc.arguments = ["-F", profile.logPath]
             try? proc.run()
             proc.waitUntilExit()
             return 0

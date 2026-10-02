@@ -351,12 +351,15 @@ enum SyncWatchDaemon {
     /// The process group a `.giveUp` left alive, and whether the refusal was
     /// logged. Only `runChildProcess` touches it, and the scheduler never runs
     /// two of those at once, so no lock.
-    nonisolated(unsafe) static var lingeringGroup: (value: pid_t?, logged: Bool) = (nil, false)
+    nonisolated(unsafe) static var lingeringGroup: (value: pid_t?, logged: Bool, since: TimeInterval) = (nil, false, 0)
+    static let lingeringGroupMaxAge: TimeInterval = 3600
 
     /// Every time value the watchdog uses comes from this ONE clock: the
-    /// system uptime, which stops while the Mac sleeps, like the `DispatchTime`
-    /// the waits use. A wall clock (`Date`) jumps across a sleep and would make a
-    /// healthy run look stalled on wake.
+    /// system uptime, the same clock family as the `DispatchTime` waits. Apple
+    /// documents `systemUptime` as the time the system has been awake since
+    /// restart, i.e. it does not advance during sleep; that was NOT measured
+    /// here (no sleep/wake test). A wall clock (`Date`) jumps across a sleep and
+    /// would make a healthy run look stalled on wake.
     static func monotonicNow() -> TimeInterval { ProcessInfo.processInfo.systemUptime }
 
     /// Pure watchdog decision (all times in `monotonicNow()` seconds). Progress =
@@ -422,14 +425,20 @@ enum SyncWatchDaemon {
         // (CodeRabbit on PR #11). Refuse until the group is gone; logged once
         // per lingering group.
         if let lingering = lingeringGroup.value {
-            if processGroupExists(lingering) {
+            // Bounded: once the stuck group really dies its pgid can be reused
+            // by an unrelated process group, which would otherwise block syncing
+            // indefinitely. After `lingeringGroupMaxAge` the block is dropped.
+            if monotonicNow() - lingeringGroup.since > lingeringGroupMaxAge {
+                log("Sync resuming: stopped waiting for process group \(lingering) from the stalled run after \(describe(lingeringGroupMaxAge))")
+                lingeringGroup = (nil, false, 0)
+            } else if processGroupExists(lingering) {
                 if !lingeringGroup.logged {
                     log("Sync not started: process group \(lingering) from the stalled run is still alive")
                     lingeringGroup.logged = true
                 }
                 return stalledExitCode
             }
-            lingeringGroup = (nil, false)
+            else { lingeringGroup = (nil, false, 0) }
         }
         let process = Process()
         let exited = DispatchSemaphore(value: 0)
@@ -513,7 +522,7 @@ enum SyncWatchDaemon {
                 killpg(pgid, SIGKILL)
             case .giveUp:
                 log("Sync stalled: process group \(pgid) still alive \(describe(timings.postKillWait)) after SIGKILL (uninterruptible state?) — giving up waiting for it")
-                lingeringGroup = (pgid, false)
+                lingeringGroup = (pgid, false, monotonicNow())
                 runningChild.cleared()
                 log("Sync failed with exit code \(stalledExitCode)")
                 return stalledExitCode

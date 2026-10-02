@@ -6542,7 +6542,7 @@ enum ConfigSelfTest {
         do { try holder.run() } catch {
             return report(id, slug, false, "(could not start the holder process: \(error))")
         }
-        SyncWatchDaemon.lingeringGroup = (holder.processIdentifier, false)
+        SyncWatchDaemon.lingeringGroup = (holder.processIdentifier, false, SyncWatchDaemon.monotonicNow())
         var refusals: [String] = []
         let blockedLen = (try? String(contentsOfFile: log, encoding: .utf8))?.count ?? 0
         let blocked1 = SyncWatchDaemon.runChildProcess(

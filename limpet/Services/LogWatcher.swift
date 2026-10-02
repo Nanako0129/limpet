@@ -249,7 +249,9 @@ final class LogWatcher {
     /// At most one delivery per `flushInterval` for ordinary lines.
     private func scheduleFlush() {
         guard flushTimer == nil else { return }
-        let wait = max(0, lastFlush.addingTimeInterval(flushInterval).timeIntervalSinceNow)
+        // Clamped to `flushInterval`: `lastFlush` is wall-clock time, and a clock
+        // stepped backwards must not push the next delivery out by the step.
+        let wait = min(flushInterval, max(0, lastFlush.addingTimeInterval(flushInterval).timeIntervalSinceNow))
         let timer = DispatchSource.makeTimerSource(queue: pollQueue)
         timer.schedule(deadline: .now() + wait)
         timer.setEventHandler { [weak self] in self?.flush() }
