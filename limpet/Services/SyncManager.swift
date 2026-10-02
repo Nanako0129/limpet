@@ -51,7 +51,9 @@ final class SyncManager: ObservableObject {
     private let setupService = SyncSetupService.shared
 
     private var workspaceObserver: NSObjectProtocol?
-    private var currentSyncChanges: [UUID: [FileChange]] = [:]
+    /// Per-run count of reported file changes (its only reader is the count at
+    /// completion — L6.3 change 2 replaced the unbounded array that held them).
+    private var currentSyncChanges: [UUID: Int] = [:]
     private var cancellables = Set<AnyCancellable>()
 
     /// Track the last error message per profile (for correlating with syncFailed events)
@@ -1049,6 +1051,10 @@ final class SyncManager: ObservableObject {
         switch exitCode {
         case 76:
             return "Delete limit reached"
+        case 78:
+            // L6.3 watchdog: `SyncWatchDaemon` stopped a run with no log output
+            // for 30 min and wrote `Sync failed with exit code 78`.
+            return "Sync stalled"
         default:
             return "Exit code \(exitCode)"
         }
@@ -1106,7 +1112,9 @@ final class SyncManager: ObservableObject {
         return SyncSetupService.trashRoot(for: profile, remoteSection: remoteSection) != nil
     }
 
-    private func processLogEvent(_ event: ParsedLogEvent, profileId: UUID) {
+    /// `updateAggregate: false` lets a batch caller apply many events and call
+    /// `updateAggregateState` once afterwards (L6.3 change 1).
+    private func processLogEvent(_ event: ParsedLogEvent, profileId: UUID, updateAggregate: Bool = true) {
         let profile = profileStore.profile(for: profileId)
         let profileName = profile?.name ?? "Unknown"
         let syncDirectoryPath = profile?.localSyncPath ?? ""
@@ -1117,7 +1125,7 @@ final class SyncManager: ObservableObject {
             profileErrors[profileId] = nil  // Clear previous error on new sync
             lastSeenErrorMessage[profileId] = nil  // Clear last seen error
             profileProgress[profileId] = nil  // Reset progress for new sync
-            currentSyncChanges[profileId] = []
+            currentSyncChanges[profileId] = 0
             logWatchers[profileId]?.setActivelySyncing(true)  // Increase polling frequency
             // Don't send notification - the menu bar icon updates to show syncing state
             notificationService.clearPendingChanges(for: profileId)
@@ -1129,7 +1137,7 @@ final class SyncManager: ObservableObject {
             profileProgress[profileId] = nil  // Clear progress when sync completes
             logWatchers[profileId]?.setActivelySyncing(false)  // Reduce polling frequency
             lastSyncTime = event.timestamp
-            let changesCount = currentSyncChanges[profileId]?.count ?? 0
+            let changesCount = currentSyncChanges[profileId] ?? 0
             if !isNotificationsMuted(for: profileId) {
                 notificationService.notifySyncCompleted(
                     changesCount: changesCount,
@@ -1244,10 +1252,7 @@ final class SyncManager: ObservableObject {
                 break
             }
             change.profileName = profileName
-            if currentSyncChanges[profileId] == nil {
-                currentSyncChanges[profileId] = []
-            }
-            currentSyncChanges[profileId]?.append(change)
+            currentSyncChanges[profileId, default: 0] += 1
             addRecentChange(change)
             // Only send notification if not muted
             if !isNotificationsMuted(for: profileId) {
@@ -1279,7 +1284,7 @@ final class SyncManager: ObservableObject {
             break
         }
 
-        updateAggregateState()
+        if updateAggregate { updateAggregateState() }
     }
 
     private func addRecentChange(_ change: FileChange) {
@@ -1304,28 +1309,32 @@ final class SyncManager: ObservableObject {
 // MARK: - LogWatcherDelegate
 
 extension SyncManager: LogWatcherDelegate {
+    /// `LogWatcher` always calls this on the main queue (one FIFO
+    /// `DispatchQueue.main.async` per batch), so batches apply in order.
     nonisolated func logWatcher(_ watcher: LogWatcher, didReceiveNewLines lines: [String]) {
-        // Process synchronously when already on main thread for immediate state updates
-        // This fixes the race condition where UI renders before state is updated
-        if Thread.isMainThread {
-            MainActor.assumeIsolated {
-                processLogLinesForWatcher(watcher, lines: lines)
-            }
-        } else {
-            Task { @MainActor in
-                self.processLogLinesForWatcher(watcher, lines: lines)
-            }
+        MainActor.assumeIsolated {
+            processLogLinesForWatcher(watcher, lines: lines)
         }
     }
 
-    /// Process log lines for a watcher (must be called on main actor)
+    /// Pure batch reducer (AC-L63-1): every `.stats` event except the LAST one
+    /// in the batch is dropped (each only overwrites `profileProgress`); all
+    /// other events keep their order, and the kept stats event keeps its slot.
+    nonisolated static func coalesceLogEvents(_ events: [ParsedLogEvent]) -> [ParsedLogEvent] {
+        func isStats(_ e: ParsedLogEvent) -> Bool { if case .stats = e.type { return true }; return false }
+        let lastStats = events.lastIndex(where: isStats)
+        return events.enumerated().compactMap { i, e in (isStats(e) && i != lastStats) ? nil : e }
+    }
+
+    /// Process a batch for a watcher (must be called on main actor): parse,
+    /// coalesce, apply in order, recompute the aggregate once.
     private func processLogLinesForWatcher(_ watcher: LogWatcher, lines: [String]) {
         guard let profileId = profileId(for: watcher) else { return }
 
-        for line in lines {
-            if let event = logParser.parse(line: line) {
-                processLogEvent(event, profileId: profileId)
-            }
+        let events = lines.compactMap { logParser.parse(line: $0) }
+        for event in Self.coalesceLogEvents(events) {
+            processLogEvent(event, profileId: profileId, updateAggregate: false)
         }
+        updateAggregateState()
     }
 }

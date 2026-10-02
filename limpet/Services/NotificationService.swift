@@ -4,8 +4,17 @@ import UserNotifications
 final class NotificationService {
     static let shared = NotificationService()
 
-    /// Per-profile pending file changes (keyed by profile ID)
+    /// Per-profile pending file changes (keyed by profile ID). Bounded: only the
+    /// first `maxPendingChanges` are kept (the body lists at most 3 names and the
+    /// "Open Directory" action uses the first); `pendingChangeCounts` carries the
+    /// true total so "N files synced" stays right (L6.3 change 2).
     private var pendingFileChanges: [UUID: [FileChange]] = [:]
+    private var pendingChangeCounts: [UUID: Int] = [:]
+    private let maxPendingChanges = 50
+    /// When each profile's batch timer was last (re)scheduled: it is pushed back
+    /// at most once per `timerRescheduleInterval`, not once per change.
+    private var lastTimerSchedule: [UUID: Date] = [:]
+    private let timerRescheduleInterval: TimeInterval = 1.0
     /// Per-profile batch timers (keyed by profile ID)
     private var batchTimers: [UUID: Timer] = [:]
     private let batchDelay: TimeInterval = 2.0
@@ -50,6 +59,8 @@ final class NotificationService {
     /// Clear pending file changes for a profile (called when sync starts)
     func clearPendingChanges(for profileId: UUID) {
         pendingFileChanges[profileId] = nil
+        pendingChangeCounts[profileId] = nil
+        lastTimerSchedule[profileId] = nil
         batchTimers[profileId]?.invalidate()
         batchTimers[profileId] = nil
     }
@@ -62,9 +73,18 @@ final class NotificationService {
         if pendingFileChanges[profileId] == nil {
             pendingFileChanges[profileId] = []
         }
-        pendingFileChanges[profileId]?.append(change)
+        if pendingFileChanges[profileId]!.count < maxPendingChanges {
+            pendingFileChanges[profileId]!.append(change)
+        }
+        pendingChangeCounts[profileId, default: 0] += 1
 
-        // Invalidate and create a new timer for this profile
+        // Push the timer back at most once per interval (a burst of changes used
+        // to invalidate and create a Timer per change on the main run loop).
+        if batchTimers[profileId] != nil,
+           let last = lastTimerSchedule[profileId], Date().timeIntervalSince(last) < timerRescheduleInterval {
+            return
+        }
+        lastTimerSchedule[profileId] = Date()
         batchTimers[profileId]?.invalidate()
         batchTimers[profileId] = Timer.scheduledTimer(withTimeInterval: batchDelay, repeats: false) { [weak self, profileId] _ in
             self?.sendBatchedFileNotification(for: profileId)
@@ -87,25 +107,32 @@ final class NotificationService {
 
         // Clean up this profile's state
         pendingFileChanges[profileId] = nil
+        pendingChangeCounts[profileId] = nil
+        lastTimerSchedule[profileId] = nil
         syncDirectoryPaths[profileId] = nil
     }
 
     private func sendBatchedFileNotification(for profileId: UUID, profileName: String? = nil) {
         guard let changes = pendingFileChanges[profileId], !changes.isEmpty else { return }
 
+        let total = max(pendingChangeCounts[profileId] ?? 0, changes.count)
+
         // Clear this profile's pending changes
         pendingFileChanges[profileId] = nil
+        pendingChangeCounts[profileId] = nil
+        lastTimerSchedule[profileId] = nil
+        batchTimers[profileId] = nil
 
         let title = profileName != nil ? "limpet: \(profileName!)" : "limpet"
         let body: String
 
-        if changes.count <= 3 {
+        if total <= 3 {
             let fileNames = changes.map { change in
                 "\(change.operation.rawValue): \(change.fileName)"
             }
             body = fileNames.joined(separator: "\n")
         } else {
-            body = "\(changes.count) files synced"
+            body = "\(total) files synced"
         }
 
         // Get directory from first change for "Open Directory" action
