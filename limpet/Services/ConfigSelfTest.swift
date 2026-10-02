@@ -6361,6 +6361,11 @@ enum ConfigSelfTest {
               lastError([start, stall, "2026-10-03 00:31:00 - Starting sync (local → remote)", "2026-10-03 00:31:05 - Sync completed successfully"]) == nil else {
             return report(id, slug, false, "(a clean run, or a later success, reported an error)")
         }
+        // An older run's stall line must not be read as the failure of a later,
+        // still-unfinished run (CodeRabbit on PR #11).
+        guard lastError([start, stall, "2026-10-03 00:30:02 - Sync failed with exit code 79", "2026-10-03 00:31:00 - Starting sync (local → remote)"]) == nil else {
+            return report(id, slug, false, "(an older run's stall line was reported for a later unfinished run)")
+        }
         // LogParser stays consistent: the stall line is not a state event of its own.
         for line in [stall, "2026-10-03 00:30:30 - Sync stalled: still running 30 s after SIGTERM — killing it"] {
             if let e = LogParser().parse(line: line), case .unknown = e.type { continue }

@@ -699,11 +699,13 @@ final class SyncManager: ObservableObject {
         var errorMessages: [String] = []
         var criticalErrors: [String] = []  // Track critical/actionable errors separately
         var foundFailedMarker = false
+        var passedRunStart = false
 
         for line in lines {
             // Stop when we hit a sync start marker (previous run)
-            if SyncLogPatterns.isSyncStarted(line) && foundFailedMarker {
-                break
+            if SyncLogPatterns.isSyncStarted(line) {
+                if foundFailedMarker { break }
+                passedRunStart = true
             }
 
             // If the most recent sync was successful, there's no error to show
@@ -715,7 +717,9 @@ final class SyncManager: ObservableObject {
             // `Sync failed with exit code 79` line only after the group is gone, and
             // the lock can vanish in between: this line alone is the failure of the
             // current run (seen before any completion line in this reverse scan).
-            if SyncLogPatterns.isSyncStalled(line) {
+            // Only before the scan passes a `Starting sync`: past it, the line
+            // belongs to an older run that a still-unfinished later run follows.
+            if !passedRunStart, SyncLogPatterns.isSyncStalled(line) {
                 return "Sync stalled"
             }
 
