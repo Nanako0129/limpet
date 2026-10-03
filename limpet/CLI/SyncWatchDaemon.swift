@@ -73,14 +73,6 @@ final class RunningChildState {
         return .exitNow
     }
 
-    /// Whether a child is running or being spawned.
-    var isIdle: Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        if case .idle = state { return true }
-        return false
-    }
-
     /// Call after the child has exited normally (`waitUntilExit()` returned).
     func cleared() {
         lock.lock()
@@ -143,11 +135,13 @@ enum SyncWatchDaemon {
 
     enum RestartDecision: Equatable { case spawn, exit }
 
-    /// Pure self-restart decision (limpet-plan.md L7 S3). Exit only when no
-    /// child is running AND both versions are known AND differ by string
-    /// equality; a missing/unreadable plist (either side nil) spawns.
-    static func restartDecision(startVersion: String?, onDiskVersion: String?, childRunning: Bool) -> RestartDecision {
-        guard !childRunning, let start = startVersion, let disk = onDiskVersion, start != disk else { return .spawn }
+    /// Pure self-restart decision (limpet-plan.md L7 S3). The scheduler only asks
+    /// when no child of ITS OWN is running; `busy` covers what it cannot see, a
+    /// stalled group still alive (`lingeringGroup`). Exit only when not busy AND
+    /// both versions are known AND differ by string equality; a missing or
+    /// unreadable plist (nil) spawns.
+    static func restartDecision(startVersion: String?, onDiskVersion: String?, busy: Bool) -> RestartDecision {
+        guard !busy, let start = startVersion, let disk = onDiskVersion, start != disk else { return .spawn }
         return .exit
     }
 
@@ -175,7 +169,10 @@ enum SyncWatchDaemon {
     /// keeps that queue alive and this function never returns.
     static func run(profile: SyncProfile) -> Never {
         let executablePath = Bundle.main.executablePath ?? CommandLine.arguments[0]
+        // Fall back to the version this process actually loaded, so a failed disk
+        // read at start never disables self-restart for the life of the process.
         let startVersion = bundleVersionOnDisk(executablePath: executablePath)
+            ?? Bundle.main.infoDictionary?["CFBundleVersion"] as? String
         let scheduler = SyncWatchScheduler(runner: productionRunner(for: profile, executablePath: executablePath, startVersion: startVersion))
 
         // SIGUSR1 = "sync now". The default action for SIGUSR1 terminates the
@@ -306,15 +303,11 @@ enum SyncWatchDaemon {
                     atPath: profile.deleteLimitMarkerPath,
                     contents: Data("rclone stopped at --max-delete; remove this file (or run 'limpet profile clear-delete-limit \(profile.shortId)') to sync again\n".utf8))
             },
-            shouldRestartForUpdate: {
-                restartDecision(
-                    startVersion: startVersion,
-                    onDiskVersion: bundleVersionOnDisk(executablePath: executablePath),
-                    childRunning: !runningChild.isIdle) == .exit
-            },
             restartForUpdate: {
-                let new = bundleVersionOnDisk(executablePath: executablePath) ?? "?"
-                appendProfileLogLine("Watcher restarting for the updated app (\(startVersion ?? "?") -> \(new))", profile: profile)
+                let disk = bundleVersionOnDisk(executablePath: executablePath)
+                let busy = lingeringGroup.value.map(processGroupExists) ?? false
+                guard restartDecision(startVersion: startVersion, onDiskVersion: disk, busy: busy) == .exit else { return false }
+                appendProfileLogLine("Watcher restarting for the updated app (\(startVersion ?? "?") -> \(disk ?? "?"))", profile: profile)
                 exit(0)
             }
         )

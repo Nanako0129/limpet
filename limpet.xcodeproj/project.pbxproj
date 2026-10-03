@@ -343,10 +343,11 @@
 			outputFileListPaths = (
 			);
 			outputPaths = (
+				"$(TARGET_BUILD_DIR)/$(FRAMEWORKS_FOLDER_PATH)/Sparkle.framework/Versions/B/XPCServices",
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "# limpet is not sandboxed, so Sparkle's XPC services are unused. Xcode embeds and signs Sparkle.framework\n# BEFORE this phase, so deleting XPCServices breaks that signature; when an identity is set, re-seal the\n# framework (outer bundle only: the nested Autoupdate/Updater.app signatures are unaffected).\nFW=\"$TARGET_BUILD_DIR/$FRAMEWORKS_FOLDER_PATH/Sparkle.framework\"\nrm -rf \"$FW/Versions/B/XPCServices\" \"$FW/XPCServices\"\nif [ -n \"$EXPANDED_CODE_SIGN_IDENTITY\" ]; then\n  /usr/bin/codesign --force --sign \"$EXPANDED_CODE_SIGN_IDENTITY\" --preserve-metadata=identifier,flags \"$FW\"\nfi\n";
+			shellScript = "set -e\n# limpet is not sandboxed, so Sparkle's XPC services are unused. Xcode embeds and signs Sparkle.framework\n# BEFORE this phase, so deleting XPCServices breaks that signature; when an identity is set, re-seal the\n# framework (outer bundle only: the nested Autoupdate/Updater.app signatures are unaffected).\nFW=\"$TARGET_BUILD_DIR/$FRAMEWORKS_FOLDER_PATH/Sparkle.framework\"\nrm -rf \"$FW/Versions/B/XPCServices\" \"$FW/XPCServices\"\nif [ -e \"$FW/Versions/B/XPCServices\" ]; then echo \"error: Sparkle XPCServices still present\" >&2; exit 1; fi\nif [ -n \"$EXPANDED_CODE_SIGN_IDENTITY\" ]; then\n  /usr/bin/codesign --force --sign \"$EXPANDED_CODE_SIGN_IDENTITY\" --preserve-metadata=identifier,flags \"$FW\"\nfi\n";
 		};
 /* End PBXShellScriptBuildPhase section */
 

@@ -683,7 +683,8 @@ is the separate, fail-closed schema-drift gate.
   "Embed Frameworks" phase with a `productRef` failed here (`Sparkle-product ... no such file`), so there is none. If a
   future Xcode stops embedding it, the app crashes at launch: check `Contents/Frameworks/Sparkle.framework` in the bundle.
 - The Run Script phase `Remove Sparkle XPC Services` runs after that and deletes `Sparkle.framework/Versions/B/XPCServices`
-  (limpet is not sandboxed). Because Xcode already signed the framework, the script re-seals the outer framework with
+  (limpet is not sandboxed; the script runs `set -e`, declares that path as its output, and fails the build if it still
+  exists; checked on the unsigned Release build). Because Xcode already signed the framework, the script re-seals the outer framework with
   `$EXPANDED_CODE_SIGN_IDENTITY` when one is set (verified with an ad-hoc identity: `codesign --verify --deep --strict` passes);
   unsigned CI builds skip it and L7.2 re-signs everything inside out.
 - Info.plist: `SUFeedURL` = the `appcast.xml` RELEASE ASSET of the latest release (not a file on main),
@@ -696,15 +697,20 @@ is the separate, fail-closed schema-drift gate.
   `SPUStandardUpdaterController` from `AppDelegate.applicationDidFinishLaunching`, i.e. after `LimpetCLI.dispatch` and the
   `--self-test` check in `LimpetApp.init` have returned. Never put it in a stored property of `LimpetApp`: those run before
   `init`, so every CLI call and every `limpet watch` agent would start Sparkle. The menu item "Check for Updates..."
-  (`MenuBarView`) is disabled while `canCheckForUpdates` is false. AC-L71-3 only asserts that a CLI dispatch adds no `SU*`
-  defaults; it cannot catch a misplaced controller (the self-test never builds one), so placement is guarded by this rule.
+  (`MenuBarView`) is disabled while `canCheckForUpdates` is false. There is no self-test for this (the self-test never
+  builds an updater), so placement is guarded by this rule. `start()` is compiled out of Debug builds (`#if !DEBUG`), so a
+  dev build never polls the release feed and its menu item stays disabled. The controller gets a minimal user-driver
+  delegate (`GentleReminders`, `supportsGentleScheduledUpdateReminders = true`), no custom UI.
 
-**Watcher self-restart.** Before a spawn, with no child running, `SyncWatchScheduler` asks
-`SchedulerRunner.shouldRestartForUpdate`; production wires it to `SyncWatchDaemon.restartDecision`
-(pure; AC-L71-1) fed with `CFBundleVersion` read fresh from disk by `bundleVersionOnDisk` (the Info.plist next to the
-executable's `Contents/MacOS`, never cached `Bundle.main.infoDictionary`) against the value read at startup, by string
-equality. Different -> `restartForUpdate` appends `Watcher restarting for the updated app (<old> -> <new>)` to the profile
-log and `exit(0)`s without spawning (launchd KeepAlive starts the new binary); missing plist, or a running child ->
+**Watcher self-restart.** At the top of every run attempt (before the delete-limit, refusal and source-missing gates:
+with no child running, restarting is always safe), `SyncWatchScheduler` calls `SchedulerRunner.restartForUpdate`.
+Production reads `CFBundleVersion` from disk ONCE (`bundleVersionOnDisk`: the Info.plist next to the executable's
+`Contents/MacOS`, never cached `Bundle.main.infoDictionary`) and passes it to the pure `SyncWatchDaemon.restartDecision`
+(AC-L71-1) with the startup version, by string equality; `busy` is a stalled group still alive (`lingeringGroup` +
+`processGroupExists`), which the scheduler cannot see. The startup version falls back to the loaded
+`Bundle.main.infoDictionary` value if the disk read fails, so self-restart is never disabled for the process life.
+Different and not busy -> append `Watcher restarting for the updated app (<old> -> <new>)` to the profile
+log and `exit(0)` without spawning (launchd KeepAlive starts the new binary); missing plist, or busy ->
 spawn. The exit path writes no other file. At startup `SyncWatchDaemon.startUp` calls
 `refreshSharedScriptIfChanged()` BEFORE the catch-up run, so the new watcher always runs the matching `limpet-sync.sh`
 (AC-L71-2); an old watcher writes nothing, so it can never put an old template back.

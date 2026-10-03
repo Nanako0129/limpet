@@ -185,7 +185,6 @@ enum ConfigSelfTest {
             testStalledSyncWatchdogEndToEnd,
             testWatcherSelfRestartDecision,
             testWatcherStartupRefreshesStaleScript,
-            testCLIDispatchCreatesNoSparkleDefaults,
         ]
 
         for check in checks {
@@ -3142,12 +3141,12 @@ enum ConfigSelfTest {
     private static func testWatcherSelfRestartDecision() -> Bool {
         let id = "AC-L71-1", slug = "watcher-self-restart-decision"
         typealias D = SyncWatchDaemon
-        guard D.restartDecision(startVersion: "5", onDiskVersion: "5", childRunning: false) == .spawn,
-              D.restartDecision(startVersion: "5", onDiskVersion: "6", childRunning: false) == .exit,
-              D.restartDecision(startVersion: "5", onDiskVersion: nil, childRunning: false) == .spawn,
-              D.restartDecision(startVersion: nil, onDiskVersion: "6", childRunning: false) == .spawn,
-              D.restartDecision(startVersion: "5", onDiskVersion: "6", childRunning: true) == .spawn,
-              D.restartDecision(startVersion: "5", onDiskVersion: "05", childRunning: false) == .exit else {
+        guard D.restartDecision(startVersion: "5", onDiskVersion: "5", busy: false) == .spawn,
+              D.restartDecision(startVersion: "5", onDiskVersion: "6", busy: false) == .exit,
+              D.restartDecision(startVersion: "5", onDiskVersion: nil, busy: false) == .spawn,
+              D.restartDecision(startVersion: nil, onDiskVersion: "6", busy: false) == .spawn,
+              D.restartDecision(startVersion: "5", onDiskVersion: "6", busy: true) == .spawn,  // lingering stalled group
+              D.restartDecision(startVersion: "5", onDiskVersion: "05", busy: false) == .exit else {
             return report(id, slug, false, "(pure decision table wrong)")
         }
         // Fresh read from disk: a fake `.app/Contents/{MacOS,Info.plist}` rewritten between reads.
@@ -3167,7 +3166,7 @@ enum ConfigSelfTest {
             return report(id, slug, false, "(version not re-read from disk: \(String(describing: first)))")
         }
         // Through the scheduler: differs + idle -> restart hook, no spawn; same -> spawn.
-        func drive(disk: String?) -> (runs: Int, restarts: Int) {
+        func drive(disk: String?, deleteLimit: Bool = false) -> (runs: Int, restarts: Int) {
             var runs = 0, restarts = 0
             let clock = VirtualClock()
             let sch = SyncWatchScheduler(runner: SchedulerRunner(
@@ -3178,16 +3177,20 @@ enum ConfigSelfTest {
                 logSourceMissing: {},
                 refusalReason: { nil },
                 logRefusal: { _ in },
-                deleteLimitReached: { false },
+                deleteLimitReached: { deleteLimit },
                 recordDeleteLimit: { true },
-                shouldRestartForUpdate: { D.restartDecision(startVersion: "7", onDiskVersion: disk, childRunning: false) == .exit },
-                restartForUpdate: { restarts += 1 }))
+                restartForUpdate: {
+                    guard D.restartDecision(startVersion: "7", onDiskVersion: disk, busy: false) == .exit else { return false }
+                    restarts += 1
+                    return true
+                }))
             sch.trigger()
             return (runs, restarts)
         }
         let same = drive(disk: "7"), diff = drive(disk: "8"), missing = drive(disk: nil)
-        guard same == (1, 0), diff == (0, 1), missing == (1, 0) else {
-            return report(id, slug, false, "(scheduler wiring: same=\(same) diff=\(diff) missing=\(missing))")
+        let gated = drive(disk: "8", deleteLimit: true)  // restart wins over the delete-limit gate
+        guard same == (1, 0), diff == (0, 1), missing == (1, 0), gated == (0, 1) else {
+            return report(id, slug, false, "(scheduler wiring: same=\(same) diff=\(diff) missing=\(missing) gated=\(gated))")
         }
         return report(id, slug, true)
     }
@@ -3198,10 +3201,10 @@ enum ConfigSelfTest {
         let id = "AC-L71-2", slug = "watcher-start-refreshes-stale-script"
         let fm = FileManager.default
         let path = SyncProfile.sharedScriptPath
-        try? fm.createDirectory(atPath: (path as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
         guard path.hasPrefix(LimpetPaths.home) else {
             return report(id, slug, false, "(script path \(path) is outside the isolated home)")
         }
+        try? fm.createDirectory(atPath: (path as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
         try? "#!/bin/bash\n# stale template\n".write(toFile: path, atomically: true, encoding: .utf8)
         let current = SyncSetupService.shared.generateSyncScript()
         var seenAtFirstRun: String?
@@ -3226,25 +3229,6 @@ enum ConfigSelfTest {
             return report(id, slug, false, "(runs=\(runs); script at first run \(seenAtFirstRun == current ? "current" : "STALE"))")
         }
         return report(id, slug, true)
-    }
-
-    // MARK: - AC-L71-3 — the CLI path creates no Sparkle defaults (limpet-plan.md L7 S2)
-
-    /// Observable here: no `SU*` key appears in the app's defaults domain across a real
-    /// `LimpetCLI.dispatch(["limpet","doctor"])`. Weak by nature: the self-test never constructs
-    /// an updater either, so this cannot catch a misplaced controller. That guarantee rests on code
-    /// placement: `UpdaterState.start()` is called only from `AppDelegate.applicationDidFinishLaunching`.
-    private static func testCLIDispatchCreatesNoSparkleDefaults() -> Bool {
-        let id = "AC-L71-3", slug = "cli-dispatch-creates-no-sparkle-defaults"
-        let domain = Bundle.main.bundleIdentifier ?? "com.nanako.limpet"
-        func sparkleKeys() -> Set<String> {
-            Set((UserDefaults.standard.persistentDomain(forName: domain) ?? [:]).keys.filter { $0.hasPrefix("SU") })
-        }
-        let before = sparkleKeys()
-        _ = LimpetCLI.dispatch(arguments: ["limpet", "doctor"])
-        let after = sparkleKeys()
-        return report(id, slug, before == after && !after.contains("SULastCheckTime") && !after.contains("SUHasLaunchedBefore"),
-                      "(before \(before), after \(after))")
     }
 
     // MARK: - AC-L4-14 — limpet profile clear-delete-limit
