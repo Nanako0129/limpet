@@ -133,12 +133,47 @@ enum SyncWatchDaemon {
         }
     }
 
+    enum RestartDecision: Equatable { case spawn, exit }
+
+    /// Pure self-restart decision (limpet-plan.md L7 S3). The scheduler only asks
+    /// when no child of ITS OWN is running; `busy` covers what it cannot see, a
+    /// stalled group still alive (`lingeringGroup`). Exit only when not busy AND
+    /// both versions are known AND differ by string equality; a missing or
+    /// unreadable plist (nil) spawns.
+    static func restartDecision(startVersion: String?, onDiskVersion: String?, busy: Bool) -> RestartDecision {
+        guard !busy, let start = startVersion, let disk = onDiskVersion, start != disk else { return .spawn }
+        return .exit
+    }
+
+    /// `CFBundleVersion` read fresh from `<bundle>/Contents/Info.plist` of the
+    /// bundle containing `executablePath` (`.app/Contents/MacOS/<exe>`). Never
+    /// `Bundle.main.infoDictionary`, which is cached for the process lifetime.
+    static func bundleVersionOnDisk(executablePath: String) -> String? {
+        let contents = ((executablePath as NSString).deletingLastPathComponent as NSString).deletingLastPathComponent
+        let plist = NSDictionary(contentsOfFile: (contents as NSString).appendingPathComponent("Info.plist"))
+        return plist?["CFBundleVersion"] as? String
+    }
+
+    /// Startup sequence: refresh the shared script FIRST so the first spawned
+    /// run uses the template matching this binary, then the catch-up run.
+    /// (An old watcher exits without writing anything, so it can never put an
+    /// old template back.) Not private so a self-test drives the real order.
+    static func startUp(scheduler: SyncWatchScheduler, refreshScript: () -> Void) {
+        refreshScript()
+        scheduler.trigger()
+    }
+
     /// Runs forever. Everything here dispatches onto the main queue (matching
     /// `DirectoryWatcher`'s own `DispatchQueue.main.async` callback), so the
     /// scheduler's state is only ever mutated from one thread; `dispatchMain()`
     /// keeps that queue alive and this function never returns.
     static func run(profile: SyncProfile) -> Never {
-        let scheduler = SyncWatchScheduler(runner: productionRunner(for: profile))
+        let executablePath = Bundle.main.executablePath ?? CommandLine.arguments[0]
+        // Fall back to the version this process actually loaded, so a failed disk
+        // read at start never disables self-restart for the life of the process.
+        let startVersion = bundleVersionOnDisk(executablePath: executablePath)
+            ?? Bundle.main.infoDictionary?["CFBundleVersion"] as? String
+        let scheduler = SyncWatchScheduler(runner: productionRunner(for: profile, executablePath: executablePath, startVersion: startVersion))
 
         // SIGUSR1 = "sync now". The default action for SIGUSR1 terminates the
         // process outright — under launchd's KeepAlive=true that would just
@@ -225,15 +260,15 @@ enum SyncWatchDaemon {
         }
         recheckTimer.resume()
 
-        // Catch-up sync at start.
-        scheduler.trigger()
+        // Refresh limpet-sync.sh, then the catch-up sync at start.
+        startUp(scheduler: scheduler, refreshScript: { SyncSetupService.shared.refreshSharedScriptIfChanged() })
 
         dispatchMain()
     }
 
     /// Wires `SchedulerRunner`'s closures to real process/filesystem/clock
     /// primitives for `profile`.
-    private static func productionRunner(for profile: SyncProfile) -> SchedulerRunner {
+    private static func productionRunner(for profile: SyncProfile, executablePath: String, startVersion: String?) -> SchedulerRunner {
         SchedulerRunner(
             sourceExists: { FileManager.default.fileExists(atPath: profile.localSyncPath) },
             runChild: { mayLog, completion in
@@ -267,6 +302,13 @@ enum SyncWatchDaemon {
                 FileManager.default.createFile(
                     atPath: profile.deleteLimitMarkerPath,
                     contents: Data("rclone stopped at --max-delete; remove this file (or run 'limpet profile clear-delete-limit \(profile.shortId)') to sync again\n".utf8))
+            },
+            restartForUpdate: {
+                let disk = bundleVersionOnDisk(executablePath: executablePath)
+                let busy = lingeringGroup.value.map(processGroupExists) ?? false
+                guard restartDecision(startVersion: startVersion, onDiskVersion: disk, busy: busy) == .exit else { return false }
+                appendProfileLogLine("Watcher restarting for the updated app (\(startVersion ?? "?") -> \(disk ?? "?"))", profile: profile)
+                exit(0)
             }
         )
     }

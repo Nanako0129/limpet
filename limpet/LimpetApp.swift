@@ -1,4 +1,6 @@
+import Combine
 import SwiftUI
+import Sparkle
 import UserNotifications
 
 @main
@@ -130,6 +132,39 @@ struct CircularProgressIcon: View {
     }
 }
 
+/// Holds the Sparkle controller for the menu. The controller is attached ONLY
+/// from `AppDelegate.applicationDidFinishLaunching` (after `LimpetCLI.dispatch`
+/// and the `--self-test` check in `LimpetApp.init` have returned), so a CLI call
+/// or a `limpet watch` agent never constructs an updater (limpet-plan.md L7 S2).
+/// A menu-bar (LSUIElement) app has no Dock icon for Sparkle's scheduled-update
+/// alert to surface from; opting in lets Sparkle use its gentle reminder path.
+final class GentleReminders: NSObject, SPUStandardUserDriverDelegate {
+    var supportsGentleScheduledUpdateReminders: Bool { true }
+}
+
+final class UpdaterState: ObservableObject {
+    static let shared = UpdaterState()
+    @Published private(set) var canCheckForUpdates = false
+    private var controller: SPUStandardUpdaterController?
+    /// Held strongly here: Sparkle keeps its user-driver delegate WEAKLY
+    /// (SPUStandardUpdaterController.h), so a temporary passed to the init is
+    /// released at once and no delegate is ever seen (verifier probe 2026-10-03).
+    private let gentleReminders = GentleReminders()
+
+    /// Never in Debug builds: a dev build must not poll the release feed or offer to
+    /// replace itself (the menu item then stays disabled).
+    func start() {
+        #if !DEBUG
+        guard controller == nil else { return }
+        let c = SPUStandardUpdaterController(startingUpdater: true, updaterDelegate: nil, userDriverDelegate: gentleReminders)
+        controller = c
+        c.updater.publisher(for: \.canCheckForUpdates).assign(to: &$canCheckForUpdates)
+        #endif
+    }
+
+    func checkForUpdates() { controller?.checkForUpdates(nil) }
+}
+
 class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUserNotificationCenterDelegate {
     /// Shared instance for easy access
     static var shared: AppDelegate?
@@ -167,6 +202,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUserNoti
 
         UNUserNotificationCenter.current().delegate = self
         requestNotificationPermissions()
+
+        // Sparkle: GUI launches only (see UpdaterState).
+        UpdaterState.shared.start()
 
         // Install/refresh the `limpet` CLI shim (~/.local/bin/limpet) so the
         // headless CLI is reachable by name. Best-effort, off the main thread —

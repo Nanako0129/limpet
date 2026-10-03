@@ -183,6 +183,8 @@ enum ConfigSelfTest {
             testLogWatcherSplitMultibyteLine,
             testStalledLineIsAFailureMarker,
             testStalledSyncWatchdogEndToEnd,
+            testWatcherSelfRestartDecision,
+            testWatcherStartupRefreshesStaleScript,
         ]
 
         for check in checks {
@@ -3130,6 +3132,101 @@ enum ConfigSelfTest {
         for _ in 0..<5 { unwritten.trigger() }
         guard unwrittenRuns == 1 else {
             return report(id, slug, false, "(ran \(unwrittenRuns) time(s) after a 76 whose marker could not be written)")
+        }
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L71-1 — watcher self-restart decision (limpet-plan.md L7 S3, finding 12)
+
+    private static func testWatcherSelfRestartDecision() -> Bool {
+        let id = "AC-L71-1", slug = "watcher-self-restart-decision"
+        typealias D = SyncWatchDaemon
+        guard D.restartDecision(startVersion: "5", onDiskVersion: "5", busy: false) == .spawn,
+              D.restartDecision(startVersion: "5", onDiskVersion: "6", busy: false) == .exit,
+              D.restartDecision(startVersion: "5", onDiskVersion: nil, busy: false) == .spawn,
+              D.restartDecision(startVersion: nil, onDiskVersion: "6", busy: false) == .spawn,
+              D.restartDecision(startVersion: "5", onDiskVersion: "6", busy: true) == .spawn,  // lingering stalled group
+              D.restartDecision(startVersion: "5", onDiskVersion: "05", busy: false) == .exit else {
+            return report(id, slug, false, "(pure decision table wrong)")
+        }
+        // Fresh read from disk: a fake `.app/Contents/{MacOS,Info.plist}` rewritten between reads.
+        let contents = "\(selfTestRoot)/restart-fake.app/Contents"
+        let exe = "\(contents)/MacOS/limpet"
+        try? FileManager.default.createDirectory(atPath: "\(contents)/MacOS", withIntermediateDirectories: true)
+        func writePlist(_ v: String) {
+            (["CFBundleVersion": v] as NSDictionary).write(toFile: "\(contents)/Info.plist", atomically: true)
+        }
+        guard D.bundleVersionOnDisk(executablePath: exe) == nil else {
+            return report(id, slug, false, "(missing plist did not read as nil)")
+        }
+        writePlist("7")
+        let first = D.bundleVersionOnDisk(executablePath: exe)
+        writePlist("8")
+        guard first == "7", D.bundleVersionOnDisk(executablePath: exe) == "8" else {
+            return report(id, slug, false, "(version not re-read from disk: \(String(describing: first)))")
+        }
+        // Through the scheduler: differs + idle -> restart hook, no spawn; same -> spawn.
+        func drive(disk: String?, deleteLimit: Bool = false) -> (runs: Int, restarts: Int) {
+            var runs = 0, restarts = 0
+            let clock = VirtualClock()
+            let sch = SyncWatchScheduler(runner: SchedulerRunner(
+                sourceExists: { true },
+                runChild: { _, completion in runs += 1; completion(0) },
+                now: { clock.now },
+                scheduleAfter: { s, a in clock.scheduleAfter(s, a) },
+                logSourceMissing: {},
+                refusalReason: { nil },
+                logRefusal: { _ in },
+                deleteLimitReached: { deleteLimit },
+                recordDeleteLimit: { true },
+                restartForUpdate: {
+                    guard D.restartDecision(startVersion: "7", onDiskVersion: disk, busy: false) == .exit else { return false }
+                    restarts += 1
+                    return true
+                }))
+            sch.trigger()
+            return (runs, restarts)
+        }
+        let same = drive(disk: "7"), diff = drive(disk: "8"), missing = drive(disk: nil)
+        let gated = drive(disk: "8", deleteLimit: true)  // restart wins over the delete-limit gate
+        guard same == (1, 0), diff == (0, 1), missing == (1, 0), gated == (0, 1) else {
+            return report(id, slug, false, "(scheduler wiring: same=\(same) diff=\(diff) missing=\(missing) gated=\(gated))")
+        }
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L71-2 — watcher start replaces a stale limpet-sync.sh before the first run
+
+    private static func testWatcherStartupRefreshesStaleScript() -> Bool {
+        let id = "AC-L71-2", slug = "watcher-start-refreshes-stale-script"
+        let fm = FileManager.default
+        let path = SyncProfile.sharedScriptPath
+        guard path.hasPrefix(LimpetPaths.home) else {
+            return report(id, slug, false, "(script path \(path) is outside the isolated home)")
+        }
+        try? fm.createDirectory(atPath: (path as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
+        try? "#!/bin/bash\n# stale template\n".write(toFile: path, atomically: true, encoding: .utf8)
+        let current = SyncSetupService.shared.generateSyncScript()
+        var seenAtFirstRun: String?
+        var runs = 0
+        let clock = VirtualClock()
+        let sch = SyncWatchScheduler(runner: SchedulerRunner(
+            sourceExists: { true },
+            runChild: { _, completion in
+                runs += 1
+                if seenAtFirstRun == nil { seenAtFirstRun = try? String(contentsOfFile: path, encoding: .utf8) }
+                completion(0)
+            },
+            now: { clock.now },
+            scheduleAfter: { s, a in clock.scheduleAfter(s, a) },
+            logSourceMissing: {},
+            refusalReason: { nil },
+            logRefusal: { _ in },
+            deleteLimitReached: { false },
+            recordDeleteLimit: { true }))
+        SyncWatchDaemon.startUp(scheduler: sch, refreshScript: { SyncSetupService.shared.refreshSharedScriptIfChanged() })
+        guard runs == 1, seenAtFirstRun == current else {
+            return report(id, slug, false, "(runs=\(runs); script at first run \(seenAtFirstRun == current ? "current" : "STALE"))")
         }
         return report(id, slug, true)
     }

@@ -671,6 +671,55 @@ changes). `ConfigSelfTest.swift` (`#if DEBUG`) runs as `limpet --self-test`
 and exits non-zero on any failed assertion; `scripts/check-schema-in-sync.sh`
 is the separate, fail-closed schema-drift gate.
 
+### Versioning, Sparkle updates and the watcher self-restart (limpet-plan.md L7.1)
+
+**Version wiring.** `Info.plist` carries `CFBundleShortVersionString = $(MARKETING_VERSION)` and
+`CFBundleVersion = $(CURRENT_PROJECT_VERSION)`. `project.pbxproj` sets `MARKETING_VERSION = 1.0.0`
+(Debug and Release) and leaves `CURRENT_PROJECT_VERSION = 1` locally; CI overrides it in L7.2 (commit count).
+
+**Sparkle (SwiftPM, `upToNextMajor` from 2.9.0, pinned in the committed
+`limpet.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved`; `.gitignore` carves that one path out).**
+- Xcode 27 embeds `Sparkle.framework` into `Contents/Frameworks` by itself from the linked package product. An explicit
+  "Embed Frameworks" phase with a `productRef` failed here (`Sparkle-product ... no such file`), so there is none. If a
+  future Xcode stops embedding it, the app crashes at launch: check `Contents/Frameworks/Sparkle.framework` in the bundle.
+- The Run Script phase `Remove Sparkle XPC Services` runs after that and deletes `Sparkle.framework/Versions/B/XPCServices`
+  (limpet is not sandboxed; the script runs `set -e`, declares that path as its output, and fails the build if it still
+  exists; checked on the unsigned Release build). The target sets `ENABLE_USER_SCRIPT_SANDBOXING = NO`: CI's
+  Xcode 26.6 runs user scripts in a sandbox that denied the `rm` (`Sandbox: rm deny file-write-unlink …/XPCServices`,
+  PR #14 CI 2026-10-03), while local Xcode 27 allowed it; the `set -e` check is what turned that into a failed build. Because Xcode already signed the framework, the script re-seals the outer framework with
+  `$EXPANDED_CODE_SIGN_IDENTITY` when one is set (verified with an ad-hoc identity: `codesign --verify --deep --strict` passes);
+  unsigned CI builds skip it and L7.2 re-signs everything inside out.
+- Info.plist: `SUFeedURL` = the `appcast.xml` RELEASE ASSET of the latest release (not a file on main),
+  `SURequireSignedFeed` and `SUVerifyUpdateBeforeExtraction` YES, `SUEnableInstallerLauncherService` NO,
+  `SUPublicEDKey = $(SPARKLE_PUBLIC_ED_KEY)`, `SUEnableJavaScript` unset (default). The build setting
+  `SPARKLE_PUBLIC_ED_KEY` holds limpet's own public key (`NFj325uc…`); its private half lives in the login keychain under
+  account `limpet` (`generate_keys --account limpet`; the default account is Syrtis's key) and in Environment `release` as
+  `SPARKLE_PRIVATE_KEY`.
+- **The updater exists only in the GUI.** `UpdaterState.shared.start()` (`LimpetApp.swift`) creates the
+  `SPUStandardUpdaterController` from `AppDelegate.applicationDidFinishLaunching`, i.e. after `LimpetCLI.dispatch` and the
+  `--self-test` check in `LimpetApp.init` have returned. Never put it in a stored property of `LimpetApp`: those run before
+  `init`, so every CLI call and every `limpet watch` agent would start Sparkle. The menu item "Check for Updates..."
+  (`MenuBarView`) is disabled while `canCheckForUpdates` is false. There is no self-test for this (the self-test never
+  builds an updater), so placement is guarded by this rule. `start()` is compiled out of Debug builds (`#if !DEBUG`), so a
+  dev build never polls the release feed and its menu item stays disabled. The controller gets a minimal user-driver
+  delegate (`GentleReminders`, `supportsGentleScheduledUpdateReminders = true`), no custom UI.
+
+**Watcher self-restart.** At the top of every run attempt (before the delete-limit, refusal and source-missing gates:
+with no child running, restarting is always safe), `SyncWatchScheduler` calls `SchedulerRunner.restartForUpdate`.
+Production reads `CFBundleVersion` from disk ONCE (`bundleVersionOnDisk`: the Info.plist next to the executable's
+`Contents/MacOS`, never cached `Bundle.main.infoDictionary`) and passes it to the pure `SyncWatchDaemon.restartDecision`
+(AC-L71-1) with the startup version, by string equality; `busy` is a stalled group still alive (`lingeringGroup` +
+`processGroupExists`), which the scheduler cannot see. The startup version falls back to the loaded
+`Bundle.main.infoDictionary` value if the disk read fails, so self-restart is never disabled for the process life.
+Different and not busy -> append `Watcher restarting for the updated app (<old> -> <new>)` to the profile
+log and `exit(0)` without spawning (launchd KeepAlive starts the new binary); missing plist, or busy ->
+spawn. The exit path writes no other file. At startup `SyncWatchDaemon.startUp` calls
+`refreshSharedScriptIfChanged()` BEFORE the catch-up run, so the new watcher always runs the matching `limpet-sync.sh`
+(AC-L71-2); an old watcher writes nothing, so it can never put an old template back.
+
+**Entitlements.** `limpet.entitlements` and `CODE_SIGN_ENTITLEMENTS` are gone (the file was dead); hardened runtime stays on.
+Never add `disable-library-validation` or `allow-dyld-environment-variables`.
+
 ### Views/
 
 | File | Purpose |

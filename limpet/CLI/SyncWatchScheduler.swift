@@ -42,6 +42,13 @@ struct SchedulerRunner {
     var deleteLimitReached: () -> Bool
     /// Write that marker after a run exited 76. Returns whether it was written.
     var recordDeleteLimit: () -> Bool
+    /// Restart for an updated app (limpet-plan.md L7 S3): production reads the
+    /// on-disk version once, and if it differs and nothing is busy, logs one
+    /// line and `exit(0)`s (KeepAlive starts the new binary), never returning.
+    /// Returning true (test spies) means "restarted, do not spawn". Asked
+    /// FIRST in every run attempt: with no child running, restarting is always
+    /// safe, whatever the other gates would say. Default: never.
+    var restartForUpdate: () -> Bool = { false }
 }
 
 /// Pure idle/running/(running+pending) scheduler for one profile's realtime
@@ -117,6 +124,10 @@ final class SyncWatchScheduler {
     /// pending rerun that hits a missing source used to leave it stuck in
     /// `.running`, swallowing every later trigger).
     private func attemptRun(pending: Bool) {
+        if runner.restartForUpdate() {
+            state = .idle  // production never returns from the call above
+            return
+        }
         if deleteLimitUnrecorded || runner.deleteLimitReached() {
             if throttle(&lastRefusalLogAt) {
                 runner.logRefusal("delete limit reached (rclone --max-delete); clear it with "
