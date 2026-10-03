@@ -243,6 +243,20 @@ final class ConfigFileWatcher {
         }
     }
 
+    /// The prefixes an FSEvents path may carry for `directory`: the path as
+    /// given, plus its `realpath(3)` when that differs. FSEvents reports
+    /// resolved paths, so a watched directory reached through a symlink
+    /// (`/var` -> `/private/var` for the temp dir, measured 2026-10-03; or a
+    /// `~/.config` that is a dotfiles symlink) would otherwise match no event
+    /// at all and every edit would be dropped silently. Not
+    /// `NSString.resolvingSymlinksInPath`, which strips `/private` again.
+    static func scopeRoots(for directory: String) -> [String] {
+        guard let resolved = realpath(directory, nil) else { return [directory] }
+        defer { free(resolved) }
+        let real = String(cString: resolved)
+        return real == directory ? [directory] : [directory, real]
+    }
+
     /// Forwards to the shared self-write registry. Kept as an instance method
     /// so callers holding a `ConfigFileWatcher` reference (rather than the
     /// registry singleton) have a natural place to note a write.
@@ -251,8 +265,9 @@ final class ConfigFileWatcher {
     }
 
     fileprivate func handleEvents(_ eventPaths: [String]) {
-        let inScope = eventPaths.filter {
-            $0 == watchedDirectory || $0.hasPrefix(watchedDirectory + "/")
+        let roots = Self.scopeRoots(for: watchedDirectory)
+        let inScope = eventPaths.filter { path in
+            roots.contains { path == $0 || path.hasPrefix($0 + "/") }
         }
         guard !inScope.isEmpty else { return }
 
