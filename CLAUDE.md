@@ -1051,15 +1051,15 @@ open ~/Library/Developer/Xcode/DerivedData/limpet-*/Build/Products/Debug/limpet.
 
 A tag `v*` runs `.github/workflows/release.yml`: a Developer ID signed, notarized `Limpet-<ver>.dmg`, `limpet.app.tar.gz`
 (the Homebrew cask's input), `sha256.txt`, and a signed Sparkle feed `appcast.xml`, published as GitHub Release
-assets. The scripts are in `scripts/release/` (adapted from Syrtis; each header credits it).
+assets. The scripts are in `scripts/release/`: the signing, notarization, DMG, verification and appcast scripts are adapted from Syrtis (each header credits it); `bump_cask.sh` is limpet's own.
 
 | Job | Runs | Secrets | Does |
 |-----|------|---------|------|
-| `gate` | tags only, ubuntu | none | tag == `v` + `MARKETING_VERSION` (`project_version.sh`), `release-notes/<tag>.md` non-empty, `$GITHUB_SHA` is an ancestor of `origin/main`, and a green push run of `ci.yml` on that SHA (`check_ci_gate.sh`, waits up to 30 min) |
+| `gate` | tags only, ubuntu | none | `MARKETING_VERSION` is X.Y.Z or X.Y.Z-prerelease, tag == `v` + `MARKETING_VERSION` (`project_version.sh`), `release-notes/<tag>.md` non-empty, `$GITHUB_SHA` is an ancestor of `origin/main`, and a green push run of `ci.yml` on that SHA (`check_ci_gate.sh`, waits up to 30 min) |
 | `build` | tag or dry run, `macos-26` + Xcode 26.6 | none, `contents: read` | `xcodebuild` Release with `CODE_SIGNING_ALLOWED=NO`, `CURRENT_PROJECT_VERSION=$(git rev-list --count HEAD)` (`MARKETING_VERSION` stays the project's; `gate` already required the tag to match); asserts `CFBundleVersion`, `CFBundleShortVersionString` and Sparkle present (no-`XPCServices` is checked by `verify_signed_app.sh`); uploads a tar of the unsigned app |
 | `sign` | tag or dry run, Environment `release` | all of them | resolves Sparkle itself (`xcodebuild -resolvePackageDependencies`, never executes anything from the build artifact), signs/notarizes/staples the app, DMG, `verify_signed_*`, generates and verifies `appcast.xml` |
 | `publish` | tags only, Environment `release`, `contents: write` | none used | `gh release create` with the four assets and `release-notes/<tag>.md`; pushes nothing to the repository |
-| `tap` | stable tags only (no `-`), Environment `release`, `contents: read` | `HOMEBREW_TAP_LIMPET_DEPLOY_KEY` | checks `sha256.txt` against the published `limpet.app.tar.gz`, clones `Nanako0129/homebrew-tap` over SSH (GitHub's ed25519 host key pinned, `StrictHostKeyChecking=yes`), runs `scripts/release/bump_cask.sh` on `Casks/limpet.rb`, requires the diff to be exactly 2 lines of that file, commits `limpet <ver>` and pushes to the tap's `main` (3 attempts, rebasing on rejection). Idempotent: a cask already at this version and sha exits 0, so re-run just this job after a failed push |
+| `tap` | stable tags only (no `-`), Environment `release`, `contents: read` | `HOMEBREW_TAP_LIMPET_DEPLOY_KEY` | downloads `sha256.txt` and `limpet.app.tar.gz` from the PUBLISHED release (not the 1-day artifact, so a late re-run works) and requires them to match, clones `Nanako0129/homebrew-tap` over SSH (GitHub's ed25519 host key pinned, `StrictHostKeyChecking=yes`), runs `scripts/release/bump_cask.sh` on `Casks/limpet.rb` (validates X.Y.Z and the sha, refuses to downgrade, keeps the file mode), requires `Casks/limpet.rb` to be the only changed file, commits `limpet <ver>` and pushes to the tap's `main`; a rejected push starts over from a fresh clone (3 attempts). Idempotent: a cask already at this version and sha exits 0, so re-run just this job after a failed push |
 
 **One run at a time.** The workflow has a single `concurrency` group, so a second tag's `sign` starts only
 after the first run finished; the feed is seeded from the latest release, so overlapping runs would drop each other's item. GitHub keeps one pending run per group: a third run arriving cancels the waiting one, so re-run it by hand.
@@ -1067,7 +1067,7 @@ after the first run finished; the feed is seeded from the latest release, so ove
 **Secrets and variables.** Environment `release` only (never repository secrets): secrets `DEVELOPER_ID_P12` (base64),
 `DEVELOPER_ID_P12_PASSWORD`, `NOTARY_KEY_P8` (raw PEM), `SPARKLE_PRIVATE_KEY`, `HOMEBREW_TAP_LIMPET_DEPLOY_KEY` (write deploy key of the tap; it can rewrite every cask there, Syrtis's too, an accepted risk); variables `APPLE_TEAM_ID`, `NOTARY_KEY_ID`,
 `NOTARY_ISSUER_ID`. The Environment's deployment policy admits `main` and tags `v*`; `sign` also refuses any other ref
-in-job. `sign` fails on an empty value for any of the seven.
+in-job. `sign` fails on an empty value for any of its seven (the four signing secrets and three variables); the `tap` job checks its own deploy key.
 
 **The feed is a release asset.** `SUFeedURL` is `https://github.com/Nanako0129/limpet/releases/latest/download/appcast.xml`.
 Each release generates the feed from the previous release's `appcast.xml` (kept items stay verbatim, at most five

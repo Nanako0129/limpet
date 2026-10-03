@@ -10,8 +10,9 @@
 #
 # Exit codes: 0 = rewritten, or already at this version and sha (idempotent,
 # prints "already up to date", so re-running the job is safe); 1 = bad input,
-# or the cask lacks exactly one `version` / `sha256` line, or the rewrite did
-# not produce the expected lines.
+# the cask lacks exactly one `version` / `sha256` line, the requested version
+# is OLDER than the cask's (never downgrade the shared tap; the same version
+# with a new sha is allowed), or the rewrite did not produce the expected lines.
 set -euo pipefail
 
 CASK=${1:?usage: bump_cask.sh <cask.rb> <version> <sha256>}
@@ -27,6 +28,13 @@ SHA_RE='^  sha256 "[^"]*"$'
 [ "$(grep -cE "$VERSION_RE" "$CASK")" = 1 ] || { echo "error: $CASK must have exactly one '  version \"...\"' line" >&2; exit 1; }
 [ "$(grep -cE "$SHA_RE" "$CASK")" = 1 ] || { echo "error: $CASK must have exactly one '  sha256 \"...\"' line" >&2; exit 1; }
 
+CURRENT=$(sed -nE 's/^  version "([^"]*)"$/\1/p' "$CASK")
+if [[ "$CURRENT" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && [ "$CURRENT" != "$VERSION" ] \
+   && [ "$(printf '%s\n%s\n' "$CURRENT" "$VERSION" | sort -t. -k1,1n -k2,2n -k3,3n | tail -1)" = "$CURRENT" ]; then
+  echo "error: $CASK is at $CURRENT, newer than $VERSION; refusing to downgrade" >&2
+  exit 1
+fi
+
 WANT_VERSION="  version \"$VERSION\""
 WANT_SHA="  sha256 \"$SHA\""
 if grep -qxF "$WANT_VERSION" "$CASK" && grep -qxF "$WANT_SHA" "$CASK"; then
@@ -40,6 +48,7 @@ trap 'rm -f "$TMP"' EXIT
 sed -E -e "s/${VERSION_RE}/${WANT_VERSION}/" -e "s/${SHA_RE}/${WANT_SHA}/" "$CASK" > "$TMP"
 grep -qxF "$WANT_VERSION" "$TMP" && grep -qxF "$WANT_SHA" "$TMP" \
   || { echo "error: rewrite did not produce the expected version/sha256 lines" >&2; exit 1; }
-mv "$TMP" "$CASK"
-trap - EXIT
+# Write back into the existing file so its mode and ownership are kept
+# (mktemp's file is 0600).
+cat "$TMP" > "$CASK"
 echo "bumped $CASK to $VERSION"
