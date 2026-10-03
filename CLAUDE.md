@@ -1050,23 +1050,24 @@ open ~/Library/Developer/Xcode/DerivedData/limpet-*/Build/Products/Debug/limpet.
 ## Releasing
 
 A tag `v*` runs `.github/workflows/release.yml`: a Developer ID signed, notarized `Limpet-<ver>.dmg`, `limpet.app.tar.gz`
-(the future Homebrew cask's input), `sha256.txt`, and a signed Sparkle feed `appcast.xml`, published as GitHub Release
-assets. The scripts are in `scripts/release/` (adapted from Syrtis; each header credits it).
+(the Homebrew cask's input), `sha256.txt`, and a signed Sparkle feed `appcast.xml`, published as GitHub Release
+assets. The scripts are in `scripts/release/`: the signing, notarization, DMG, verification and appcast scripts are adapted from Syrtis (each header credits it); `bump_cask.sh` is limpet's own.
 
 | Job | Runs | Secrets | Does |
 |-----|------|---------|------|
-| `gate` | tags only, ubuntu | none | tag == `v` + `MARKETING_VERSION` (`project_version.sh`), `release-notes/<tag>.md` non-empty, `$GITHUB_SHA` is an ancestor of `origin/main`, and a green push run of `ci.yml` on that SHA (`check_ci_gate.sh`, waits up to 30 min) |
+| `gate` | tags only, ubuntu | none | `MARKETING_VERSION` is plain X.Y.Z without leading zeros (no prereleases: there is no beta channel) and strictly newer than the latest release (so the feed at `releases/latest` never moves back), tag == `v` + `MARKETING_VERSION` (`project_version.sh`), `release-notes/<tag>.md` non-empty, `$GITHUB_SHA` is an ancestor of `origin/main`, and a green push run of `ci.yml` on that SHA (`check_ci_gate.sh`, waits up to 30 min) |
 | `build` | tag or dry run, `macos-26` + Xcode 26.6 | none, `contents: read` | `xcodebuild` Release with `CODE_SIGNING_ALLOWED=NO`, `CURRENT_PROJECT_VERSION=$(git rev-list --count HEAD)` (`MARKETING_VERSION` stays the project's; `gate` already required the tag to match); asserts `CFBundleVersion`, `CFBundleShortVersionString` and Sparkle present (no-`XPCServices` is checked by `verify_signed_app.sh`); uploads a tar of the unsigned app |
 | `sign` | tag or dry run, Environment `release` | all of them | resolves Sparkle itself (`xcodebuild -resolvePackageDependencies`, never executes anything from the build artifact), signs/notarizes/staples the app, DMG, `verify_signed_*`, generates and verifies `appcast.xml` |
 | `publish` | tags only, Environment `release`, `contents: write` | none used | `gh release create` with the four assets and `release-notes/<tag>.md`; pushes nothing to the repository |
+| `tap` | tags only, Environment `release`, `contents: read` | `HOMEBREW_TAP_LIMPET_DEPLOY_KEY` | hashes `limpet.app.tar.gz` downloaded from the PUBLISHED release (what Homebrew fetches; not the 1-day artifact, so a late re-run works), clones `Nanako0129/homebrew-tap` over SSH (GitHub's ed25519 host key pinned, `StrictHostKeyChecking=yes`), runs `scripts/release/bump_cask.sh` on `Casks/limpet.rb` (validates X.Y.Z without leading zeros and the sha; an older version than the cask's is a no-op, never a downgrade; keeps the file mode), requires `Casks/limpet.rb` to be the only changed file, commits `limpet <ver>` and pushes to the tap's `main`; a failed clone, or a push rejected because the tap moved (Syrtis pushed in between), starts over from a fresh clone after 30/45 s (3 attempts); any other push error (key, permission, host key) fails at once with git's message. This classification is by git's output text and is unverified until a real tap push (the first stable release after L8.2). Idempotent: a cask already at this version and sha exits 0, so re-run just this job after a failed push |
 
 **One run at a time.** The workflow has a single `concurrency` group, so a second tag's `sign` starts only
-after the first run finished; the feed is seeded from the latest release, so overlapping runs would drop each other's item. GitHub keeps one pending run per group: a third run arriving cancels the waiting one, so re-run it by hand.
+after the first run finished; the feed is seeded from the latest release, so overlapping runs would drop each other's item. GitHub keeps one pending run per group: a third run arriving cancels the waiting one. Re-run a cancelled tag only if no newer version has been released since; otherwise the gate refuses it (not newer than Latest) and that version is simply skipped.
 
 **Secrets and variables.** Environment `release` only (never repository secrets): secrets `DEVELOPER_ID_P12` (base64),
-`DEVELOPER_ID_P12_PASSWORD`, `NOTARY_KEY_P8`, `SPARKLE_PRIVATE_KEY`; variables `APPLE_TEAM_ID`, `NOTARY_KEY_ID`,
+`DEVELOPER_ID_P12_PASSWORD`, `NOTARY_KEY_P8` (raw PEM), `SPARKLE_PRIVATE_KEY`, `HOMEBREW_TAP_LIMPET_DEPLOY_KEY` (write deploy key of the tap; it can rewrite every cask there, Syrtis's too, an accepted risk); variables `APPLE_TEAM_ID`, `NOTARY_KEY_ID`,
 `NOTARY_ISSUER_ID`. The Environment's deployment policy admits `main` and tags `v*`; `sign` also refuses any other ref
-in-job. `sign` fails on an empty value for any of the seven.
+in-job. `sign` fails on an empty value for any of its seven (the four signing secrets and three variables); the `tap` job checks its own deploy key.
 
 **The feed is a release asset.** `SUFeedURL` is `https://github.com/Nanako0129/limpet/releases/latest/download/appcast.xml`.
 Each release generates the feed from the previous release's `appcast.xml` (kept items stay verbatim, at most five
@@ -1079,7 +1080,8 @@ unless the feed carries Sparkle's feed signature (`SURequireSignedFeed=YES` in t
 1. Set `MARKETING_VERSION` to `X.Y.Z` in both configurations of `limpet.xcodeproj/project.pbxproj`.
 2. Add `release-notes/vX.Y.Z.md` (becomes the GitHub Release body and the Sparkle item's notes).
 3. Merge through a PR and wait for CI on the merge commit.
-4. Tag the merge commit `vX.Y.Z` and push the tag, then approve the `release` Environment twice (`sign`, `publish`).
+4. Tag the merge commit `vX.Y.Z` and push the tag, then approve the `release` Environment for `sign`, `publish` and `tap`. The run holds the workflow's single concurrency group until all three are given, so approve promptly: a third tag would cancel a second one waiting behind it.
+5. Homebrew users get it with `brew install --cask nanako0129/tap/limpet`; installed copies update through Sparkle (`auto_updates true`).
 
 **Dry run.** Actions, Release, Run workflow on `main`: builds, signs, notarizes, verifies and generates the appcast, then
 uploads artifact `signed` (1 day) and publishes nothing. Check the DMG with

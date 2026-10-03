@@ -29,9 +29,9 @@ concurrency:
 # Signing material lives only in the `release` Environment (required
 # reviewer: the maintainer), never in repository secrets:
 #   secrets    DEVELOPER_ID_P12, DEVELOPER_ID_P12_PASSWORD, NOTARY_KEY_P8,
-#              SPARKLE_PRIVATE_KEY
+#              SPARKLE_PRIVATE_KEY, HOMEBREW_TAP_LIMPET_DEPLOY_KEY (tap job only)
 #   variables  APPLE_TEAM_ID, NOTARY_KEY_ID, NOTARY_ISSUER_ID
-# Only `sign` and `publish` enter it. `build` runs third-party toolchains and
+# Only `sign`, `publish` and `tap` enter it. `build` runs third-party toolchains and
 # holds no secret and cannot write to the repository.
 #
 # The Sparkle key alone can push an update (Sparkle checks the EdDSA
@@ -68,9 +68,27 @@ jobs:
           fetch-depth: 0
 
       - name: Tag, notes and branch
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           VERSION=$(scripts/release/project_version.sh)
+          # Plain X.Y.Z only (no prereleases: limpet ships no beta channel), and
+          # strictly newer than the latest release, so the Sparkle feed at
+          # releases/latest never moves back. Fails before anything is published.
+          if ! [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "error: MARKETING_VERSION $VERSION is not X.Y.Z (no leading zeros)" >&2
+            exit 1
+          fi
+          # Empty only when no release exists; any API error fails the step
+          # (set -e) instead of skipping this check.
+          LATEST=$(gh release list --repo "$GITHUB_REPOSITORY" --exclude-drafts --exclude-pre-releases \
+            --limit 1 --json tagName --jq '.[0].tagName // empty')
+          LATEST=${LATEST#v}
+          if [ -n "$LATEST" ] && { [ "$LATEST" = "$VERSION" ] || [ "$(printf '%s\n%s\n' "$LATEST" "$VERSION" | sort -t. -k1,1n -k2,2n -k3,3n | tail -1)" != "$VERSION" ]; }; then
+            echo "error: $VERSION is not newer than the latest release $LATEST" >&2
+            exit 1
+          fi
           if [ "$GITHUB_REF_NAME" != "v$VERSION" ]; then
             echo "error: tag $GITHUB_REF_NAME does not equal v$VERSION (MARKETING_VERSION in project.pbxproj)" >&2
             exit 1
@@ -394,3 +412,79 @@ jobs:
             --verify-tag \
             --title "limpet $VERSION" \
             --notes-file "$GITHUB_WORKSPACE/$NOTES"
+
+  # Bumps Casks/limpet.rb in the shared tap Nanako0129/homebrew-tap
+  # (limpet-plan.md L8.2 + its security review). Its own job so a failed push
+  # can be retried without re-running `gh release create`; bump_cask.sh is
+  # idempotent. The deploy key can write the whole tap, Syrtis's cask included:
+  # a risk the owner accepted on 2026-10-04. Its approval is the third one, and
+  # the run holds the workflow's concurrency group until it is given.
+  tap:
+    needs: [build, publish]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: release
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ needs.build.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts/release
+
+      - name: Bump the cask in the tap
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HOMEBREW_TAP_LIMPET_DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_LIMPET_DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+          umask 077
+          [ -n "$HOMEBREW_TAP_LIMPET_DEPLOY_KEY" ] || { echo "error: HOMEBREW_TAP_LIMPET_DEPLOY_KEY is empty" >&2; exit 1; }
+          # The cask's sha256 is the hash of the PUBLISHED asset, i.e. exactly what
+          # Homebrew downloads. Reading it from the release, not the 1-day
+          # artifact, keeps a late re-run of this job working.
+          ASSETS="$RUNNER_TEMP/assets"
+          gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+            --pattern limpet.app.tar.gz --dir "$ASSETS"
+          SHA=$(sha256sum "$ASSETS/limpet.app.tar.gz" | awk '{print $1}')
+
+          KEY="$RUNNER_TEMP/tap_deploy_key"
+          KNOWN="$RUNNER_TEMP/known_hosts"
+          trap 'rm -f "$KEY"' EXIT
+          printf '%s\n' "$HOMEBREW_TAP_LIMPET_DEPLOY_KEY" > "$KEY"
+          # GitHub's published ed25519 host key (api.github.com/meta, 2026-10-04):
+          # pinned instead of trusting on first use.
+          echo 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' > "$KNOWN"
+          export GIT_SSH_COMMAND="ssh -i $KEY -o IdentitiesOnly=yes -o ConnectTimeout=30 -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$KNOWN"
+
+          # On a rejected push (Syrtis's job pushed in between) start over from a
+          # fresh clone: bump_cask.sh is idempotent, and rebasing a shallow clone
+          # conflicts.
+          for attempt in 1 2 3; do
+            [ "$attempt" = 1 ] || sleep $((attempt * 15))
+            TAP="$RUNNER_TEMP/tap-$attempt"
+            if ! git clone -q --depth 1 git@github.com:Nanako0129/homebrew-tap.git "$TAP"; then
+              echo "clone failed (attempt $attempt)" >&2
+              continue
+            fi
+            git -C "$TAP" config user.name "github-actions[bot]"
+            git -C "$TAP" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            OUT=$("$GITHUB_WORKSPACE/scripts/release/bump_cask.sh" "$TAP/Casks/limpet.rb" "$VERSION" "$SHA")
+            echo "$OUT"
+            case "$OUT" in already\ up\ to\ date*|already\ at\ newer*) exit 0 ;; esac
+            # Guard against mistakes (not a hostile run): Casks/limpet.rb only.
+            CHANGED=$(git -C "$TAP" diff --name-only)
+            [ "$CHANGED" = "Casks/limpet.rb" ] || { echo "error: unexpected tap changes: $CHANGED" >&2; exit 1; }
+            git -C "$TAP" commit -q -am "limpet $VERSION"
+            if PUSH=$(git -C "$TAP" push origin HEAD:main 2>&1); then echo "$PUSH"; exit 0; fi
+            echo "$PUSH" >&2
+            # Only a lost race (Syrtis pushed in between) is worth retrying; a
+            # key, permission or host-key error fails at once.
+            case "$PUSH" in *"[rejected]"*|*"[remote rejected]"*|*"fetch first"*|*"non-fast-forward"*|*"cannot lock ref"*|*"failed to update ref"*) ;; *) exit 1 ;; esac
+            echo "push rejected (attempt $attempt); retrying from a fresh clone" >&2
+          done
+          echo "error: could not push the cask bump" >&2
+          exit 1

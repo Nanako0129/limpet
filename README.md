@@ -41,9 +41,19 @@ the sync engine. Any remote rclone supports can be the destination.
 limpet auto-detects rclone from Homebrew, `/usr/local/bin`, `/usr/bin`, and
 common nix install locations.
 
-## Building from source
+## Install
 
-There is no signed release and no Homebrew cask yet, so build it yourself:
+```bash
+brew install --cask nanako0129/tap/limpet
+```
+
+Or download `Limpet-<version>.dmg` from [Releases](https://github.com/Nanako0129/limpet/releases)
+and drag `limpet.app` to `/Applications`. Builds are signed with a Developer ID and
+notarized by Apple, and limpet updates itself from the menu ("Check for Updates…").
+The cask requires Apple Silicon and macOS 13 or later, and installs the `rclone`
+formula; with the DMG, install rclone yourself (see Requirements).
+
+## Building from source
 
 ```bash
 git clone https://github.com/Nanako0129/limpet.git
@@ -53,7 +63,7 @@ xcodebuild -project limpet.xcodeproj -scheme limpet \
 open build/Build/Products/Debug/limpet.app
 ```
 
-The built app is unsigned.
+A build from source is unsigned.
 
 ## The `limpet` CLI
 
