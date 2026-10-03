@@ -1,0 +1,31 @@
+# Dependabot: one grouped PR per ecosystem per week, minor and patch only.
+# Major versions are ignored here and upgraded deliberately, one at a time.
+# Ported from Syrtis (Nanako0129/TokenBar-Native).
+#
+# The Sparkle pin is the one that matters most: it ships inside the app and
+# its generate_appcast signs the feed. Review that PR by hand.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      github-actions:
+        patterns: ["*"]
+        update-types: [minor, patch]
+    ignore:
+      - dependency-name: "*"
+        update-types: [version-update:semver-major]
+
+  - package-ecosystem: swift
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      swift:
+        patterns: ["*"]
+        update-types: [minor, patch]
+    ignore:
+      - dependency-name: "*"
+        update-types: [version-update:semver-major]
