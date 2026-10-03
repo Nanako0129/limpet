@@ -50,10 +50,10 @@ brew install --cask nanako0129/tap/limpet
 Or download `Limpet-<version>.dmg` from [Releases](https://github.com/Nanako0129/limpet/releases)
 and drag `limpet.app` to `/Applications`. Builds are signed with a Developer ID and
 notarized by Apple, and limpet updates itself from the menu ("Check for Updates…").
-The cask depends on the `rclone` formula.
+The cask requires Apple Silicon and macOS 13 or later, and installs the `rclone`
+formula; with the DMG, install rclone yourself (see Requirements).
 
 ## Building from source
-
 
 ```bash
 git clone https://github.com/Nanako0129/limpet.git

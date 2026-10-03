@@ -26,10 +26,9 @@ limpet 會自動偵測 Homebrew、`/usr/local/bin`、`/usr/bin` 以及常見的 
 brew install --cask nanako0129/tap/limpet
 ```
 
-或是從 [Releases](https://github.com/Nanako0129/limpet/releases) 下載 `Limpet-<版本>.dmg`，把 `limpet.app` 拖進「應用程式」。發行版都有 Developer ID 簽名並經過 Apple 公證，之後可以從選單的「Check for Updates…」自動更新。cask 會一併安裝 `rclone`。
+或是從 [Releases](https://github.com/Nanako0129/limpet/releases) 下載 `Limpet-<版本>.dmg`，把 `limpet.app` 拖進「應用程式」。發行版都有 Developer ID 簽名並經過 Apple 公證，之後可以從選單的「Check for Updates…」自動更新。cask 只支援 Apple Silicon 與 macOS 13 以上，並會一併安裝 `rclone`；用 DMG 安裝的話，rclone 要自己裝（見「需求」）。
 
 ## 從原始碼建置
-
 
 ```bash
 git clone https://github.com/Nanako0129/limpet.git

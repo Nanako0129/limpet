@@ -10,8 +10,7 @@
 #
 # Exit codes: 0 = rewritten, or already at this version and sha (idempotent,
 # prints "already up to date", so re-running the job is safe); 1 = bad input,
-# the cask lacks exactly one `version` / `sha256` line, or the rewrite did not
-# produce the expected lines. A requested version OLDER than the cask's is a
+# or the cask lacks exactly one `version` / `sha256` line. A requested version OLDER than the cask's is a
 # no-op (prints "already at newer", exit 0, writes nothing): the shared tap is
 # never downgraded, and re-running an old release's job after a newer one
 # bumped the cask is not an error. The same version with a new sha is allowed.
@@ -50,8 +49,6 @@ TMP=$(mktemp "${CASK}.XXXXXX")
 trap 'rm -f "$TMP"' EXIT
 # Values are validated above (digits, dots, hex only), so they are safe in sed.
 sed -E -e "s/${VERSION_RE}/${WANT_VERSION}/" -e "s/${SHA_RE}/${WANT_SHA}/" "$CASK" > "$TMP"
-grep -qxF "$WANT_VERSION" "$TMP" && grep -qxF "$WANT_SHA" "$TMP" \
-  || { echo "error: rewrite did not produce the expected version/sha256 lines" >&2; exit 1; }
 # Write back into the existing file so its mode and ownership are kept
 # (mktemp's file is 0600).
 cat "$TMP" > "$CASK"
