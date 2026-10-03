@@ -1047,6 +1047,45 @@ xcodebuild -scheme limpet -destination 'platform=macOS' build 2>&1 | xcbeautify
 open ~/Library/Developer/Xcode/DerivedData/limpet-*/Build/Products/Debug/limpet.app
 ```
 
+## Releasing
+
+A tag `v*` runs `.github/workflows/release.yml`: a Developer ID signed, notarized `Limpet-<ver>.dmg`, `limpet.app.tar.gz`
+(the future Homebrew cask's input), `sha256.txt`, and a signed Sparkle feed `appcast.xml`, published as GitHub Release
+assets. The scripts are in `scripts/release/` (adapted from Syrtis; each header credits it).
+
+| Job | Runs | Secrets | Does |
+|-----|------|---------|------|
+| `gate` | tags only, ubuntu | none | tag == `v` + `MARKETING_VERSION` (`project_version.sh`), `release-notes/<tag>.md` non-empty, `$GITHUB_SHA` is an ancestor of `origin/main`, and a green push run of `ci.yml` on that SHA (`check_ci_gate.sh`, waits up to 30 min) |
+| `build` | tag or dry run, `macos-26` + Xcode 26.6 | none, `contents: read` | `xcodebuild` Release with `CODE_SIGNING_ALLOWED=NO`, `CURRENT_PROJECT_VERSION=$(git rev-list --count HEAD)`, `MARKETING_VERSION` from the tag; asserts `CFBundleVersion`, Sparkle present, no `XPCServices`; uploads a tar of the unsigned app |
+| `sign` | tag or dry run, Environment `release` | all of them | resolves Sparkle itself (`xcodebuild -resolvePackageDependencies`, never executes anything from the build artifact), signs/notarizes/staples the app, DMG, `verify_signed_*`, generates and verifies `appcast.xml` |
+| `publish` | tags only, Environment `release`, `contents: write` | none used | `gh release create` with the four assets and `release-notes/<tag>.md`; pushes nothing to the repository |
+
+**Secrets and variables.** Environment `release` only (never repository secrets): secrets `DEVELOPER_ID_P12` (base64),
+`DEVELOPER_ID_P12_PASSWORD`, `NOTARY_KEY_P8`, `SPARKLE_PRIVATE_KEY`; variables `APPLE_TEAM_ID`, `NOTARY_KEY_ID`,
+`NOTARY_ISSUER_ID`. The Environment's deployment policy admits `main` and tags `v*`; `sign` also refuses any other ref
+in-job. `sign` fails on an empty value for any of the seven.
+
+**The feed is a release asset.** `SUFeedURL` is `https://github.com/Nanako0129/limpet/releases/latest/download/appcast.xml`.
+Each release generates the feed from the previous release's `appcast.xml` (kept items stay verbatim, at most five
+versions), so nothing is committed to `main`. `make_appcast.sh` takes the Sparkle `bin` directory as an argument and fails
+unless the feed carries Sparkle's feed signature (`SURequireSignedFeed=YES` in the app).
+`verify_appcast.sh` checks `sparkle:version == CFBundleVersion` and that the item's signature verifies with the app's own
+`SUPublicEDKey` (OpenSSL 3), because `generate_appcast` only warns on a key mismatch.
+
+**Cut a release.**
+1. Set `MARKETING_VERSION` to `X.Y.Z` in both configurations of `limpet.xcodeproj/project.pbxproj`.
+2. Add `release-notes/vX.Y.Z.md` (becomes the GitHub Release body and the Sparkle item's notes).
+3. Merge through a PR and wait for CI on the merge commit.
+4. Tag the merge commit `vX.Y.Z` and push the tag, then approve the `release` Environment twice (`sign`, `publish`).
+
+**Dry run.** Actions, Release, Run workflow on `main`: builds, signs, notarizes, verifies and generates the appcast, then
+uploads artifact `signed` (1 day) and publishes nothing. Check the DMG with
+`spctl -a -vv -t open --context context:primary-signature <dmg>` and `xcrun stapler validate <dmg>`.
+
+**Runner.** `ci.yml` and `release.yml` both use `macos-26` with `DEVELOPER_DIR=/Applications/Xcode_26.6.app/Contents/Developer`;
+change them together. Actions are pinned by SHA (Dependabot, weekly, minor and patch only, covers actions and the Swift
+package); never add `actions/cache` or a self-hosted runner to the release workflow.
+
 ## Key Files Reference
 
 | File | Purpose |

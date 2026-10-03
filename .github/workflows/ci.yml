@@ -16,9 +16,13 @@ concurrency:
 
 jobs:
   test:
-    runs-on: macos-latest
+    # Same runner image and Xcode as release.yml, so CI and a release build
+    # with one toolchain. Keep the two in step.
+    runs-on: macos-26
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Check schema in sync
         run: bash scripts/check-schema-in-sync.sh
