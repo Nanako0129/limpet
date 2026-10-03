@@ -689,7 +689,9 @@ is the separate, fail-closed schema-drift gate.
 - Info.plist: `SUFeedURL` = the `appcast.xml` RELEASE ASSET of the latest release (not a file on main),
   `SURequireSignedFeed` and `SUVerifyUpdateBeforeExtraction` YES, `SUEnableInstallerLauncherService` NO,
   `SUPublicEDKey = $(SPARKLE_PUBLIC_ED_KEY)`, `SUEnableJavaScript` unset (default). The build setting
-  `SPARKLE_PUBLIC_ED_KEY` is the literal placeholder `REPLACE_WITH_SPARKLE_PUBLIC_KEY` until the real key is inserted.
+  `SPARKLE_PUBLIC_ED_KEY` holds limpet's own public key (`NFj325uc…`); its private half lives in the login keychain under
+  account `limpet` (`generate_keys --account limpet`; the default account is Syrtis's key) and in Environment `release` as
+  `SPARKLE_PRIVATE_KEY`.
 - **The updater exists only in the GUI.** `UpdaterState.shared.start()` (`LimpetApp.swift`) creates the
   `SPUStandardUpdaterController` from `AppDelegate.applicationDidFinishLaunching`, i.e. after `LimpetCLI.dispatch` and the
   `--self-test` check in `LimpetApp.init` have returned. Never put it in a stored property of `LimpetApp`: those run before
