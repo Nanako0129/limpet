@@ -183,6 +183,9 @@ enum ConfigSelfTest {
             testLogWatcherSplitMultibyteLine,
             testStalledLineIsAFailureMarker,
             testStalledSyncWatchdogEndToEnd,
+            testWatcherSelfRestartDecision,
+            testWatcherStartupRefreshesStaleScript,
+            testCLIDispatchCreatesNoSparkleDefaults,
         ]
 
         for check in checks {
@@ -3132,6 +3135,116 @@ enum ConfigSelfTest {
             return report(id, slug, false, "(ran \(unwrittenRuns) time(s) after a 76 whose marker could not be written)")
         }
         return report(id, slug, true)
+    }
+
+    // MARK: - AC-L71-1 — watcher self-restart decision (limpet-plan.md L7 S3, finding 12)
+
+    private static func testWatcherSelfRestartDecision() -> Bool {
+        let id = "AC-L71-1", slug = "watcher-self-restart-decision"
+        typealias D = SyncWatchDaemon
+        guard D.restartDecision(startVersion: "5", onDiskVersion: "5", childRunning: false) == .spawn,
+              D.restartDecision(startVersion: "5", onDiskVersion: "6", childRunning: false) == .exit,
+              D.restartDecision(startVersion: "5", onDiskVersion: nil, childRunning: false) == .spawn,
+              D.restartDecision(startVersion: nil, onDiskVersion: "6", childRunning: false) == .spawn,
+              D.restartDecision(startVersion: "5", onDiskVersion: "6", childRunning: true) == .spawn,
+              D.restartDecision(startVersion: "5", onDiskVersion: "05", childRunning: false) == .exit else {
+            return report(id, slug, false, "(pure decision table wrong)")
+        }
+        // Fresh read from disk: a fake `.app/Contents/{MacOS,Info.plist}` rewritten between reads.
+        let contents = "\(selfTestRoot)/restart-fake.app/Contents"
+        let exe = "\(contents)/MacOS/limpet"
+        try? FileManager.default.createDirectory(atPath: "\(contents)/MacOS", withIntermediateDirectories: true)
+        func writePlist(_ v: String) {
+            (["CFBundleVersion": v] as NSDictionary).write(toFile: "\(contents)/Info.plist", atomically: true)
+        }
+        guard D.bundleVersionOnDisk(executablePath: exe) == nil else {
+            return report(id, slug, false, "(missing plist did not read as nil)")
+        }
+        writePlist("7")
+        let first = D.bundleVersionOnDisk(executablePath: exe)
+        writePlist("8")
+        guard first == "7", D.bundleVersionOnDisk(executablePath: exe) == "8" else {
+            return report(id, slug, false, "(version not re-read from disk: \(String(describing: first)))")
+        }
+        // Through the scheduler: differs + idle -> restart hook, no spawn; same -> spawn.
+        func drive(disk: String?) -> (runs: Int, restarts: Int) {
+            var runs = 0, restarts = 0
+            let clock = VirtualClock()
+            let sch = SyncWatchScheduler(runner: SchedulerRunner(
+                sourceExists: { true },
+                runChild: { _, completion in runs += 1; completion(0) },
+                now: { clock.now },
+                scheduleAfter: { s, a in clock.scheduleAfter(s, a) },
+                logSourceMissing: {},
+                refusalReason: { nil },
+                logRefusal: { _ in },
+                deleteLimitReached: { false },
+                recordDeleteLimit: { true },
+                shouldRestartForUpdate: { D.restartDecision(startVersion: "7", onDiskVersion: disk, childRunning: false) == .exit },
+                restartForUpdate: { restarts += 1 }))
+            sch.trigger()
+            return (runs, restarts)
+        }
+        let same = drive(disk: "7"), diff = drive(disk: "8"), missing = drive(disk: nil)
+        guard same == (1, 0), diff == (0, 1), missing == (1, 0) else {
+            return report(id, slug, false, "(scheduler wiring: same=\(same) diff=\(diff) missing=\(missing))")
+        }
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L71-2 — watcher start replaces a stale limpet-sync.sh before the first run
+
+    private static func testWatcherStartupRefreshesStaleScript() -> Bool {
+        let id = "AC-L71-2", slug = "watcher-start-refreshes-stale-script"
+        let fm = FileManager.default
+        let path = SyncProfile.sharedScriptPath
+        try? fm.createDirectory(atPath: (path as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
+        guard path.hasPrefix(LimpetPaths.home) else {
+            return report(id, slug, false, "(script path \(path) is outside the isolated home)")
+        }
+        try? "#!/bin/bash\n# stale template\n".write(toFile: path, atomically: true, encoding: .utf8)
+        let current = SyncSetupService.shared.generateSyncScript()
+        var seenAtFirstRun: String?
+        var runs = 0
+        let clock = VirtualClock()
+        let sch = SyncWatchScheduler(runner: SchedulerRunner(
+            sourceExists: { true },
+            runChild: { _, completion in
+                runs += 1
+                if seenAtFirstRun == nil { seenAtFirstRun = try? String(contentsOfFile: path, encoding: .utf8) }
+                completion(0)
+            },
+            now: { clock.now },
+            scheduleAfter: { s, a in clock.scheduleAfter(s, a) },
+            logSourceMissing: {},
+            refusalReason: { nil },
+            logRefusal: { _ in },
+            deleteLimitReached: { false },
+            recordDeleteLimit: { true }))
+        SyncWatchDaemon.startUp(scheduler: sch, refreshScript: { SyncSetupService.shared.refreshSharedScriptIfChanged() })
+        guard runs == 1, seenAtFirstRun == current else {
+            return report(id, slug, false, "(runs=\(runs); script at first run \(seenAtFirstRun == current ? "current" : "STALE"))")
+        }
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L71-3 — the CLI path creates no Sparkle defaults (limpet-plan.md L7 S2)
+
+    /// Observable here: no `SU*` key appears in the app's defaults domain across a real
+    /// `LimpetCLI.dispatch(["limpet","doctor"])`. Weak by nature: the self-test never constructs
+    /// an updater either, so this cannot catch a misplaced controller. That guarantee rests on code
+    /// placement: `UpdaterState.start()` is called only from `AppDelegate.applicationDidFinishLaunching`.
+    private static func testCLIDispatchCreatesNoSparkleDefaults() -> Bool {
+        let id = "AC-L71-3", slug = "cli-dispatch-creates-no-sparkle-defaults"
+        let domain = Bundle.main.bundleIdentifier ?? "com.nanako.limpet"
+        func sparkleKeys() -> Set<String> {
+            Set((UserDefaults.standard.persistentDomain(forName: domain) ?? [:]).keys.filter { $0.hasPrefix("SU") })
+        }
+        let before = sparkleKeys()
+        _ = LimpetCLI.dispatch(arguments: ["limpet", "doctor"])
+        let after = sparkleKeys()
+        return report(id, slug, before == after && !after.contains("SULastCheckTime") && !after.contains("SUHasLaunchedBefore"),
+                      "(before \(before), after \(after))")
     }
 
     // MARK: - AC-L4-14 — limpet profile clear-delete-limit

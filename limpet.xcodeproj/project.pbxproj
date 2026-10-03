@@ -49,6 +49,7 @@
 		646C48499514A2F19CAA7F85 /* SyncWatchDaemon.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7409E6588DEAD56B2E5D6744 /* SyncWatchDaemon.swift */; };
 		FC42AD91FD4C3FCBE784DE4F /* AppSettingsFileStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 48C81844C44AA7C559B6730B /* AppSettingsFileStore.swift */; };
 		FC6298CE8767141C78EB8D75 /* ConfigSelfTest.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7F52EB2FA3D07D3E970F226D /* ConfigSelfTest.swift */; };
+		A2000000000000000000000A /* Sparkle in Frameworks */ = {isa = PBXBuildFile; productRef = A2000000000000000000000C /* Sparkle */; };
 /* End PBXBuildFile section */
 
 
@@ -79,7 +80,6 @@
 		A1000000000000000000000A /* RecentChangesView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecentChangesView.swift; sourceTree = "<group>"; };
 		A1000000000000000000000B /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		A1000000000000000000000C /* limpet.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = limpet.app; sourceTree = BUILT_PRODUCTS_DIR; };
-		A1000000000000000000000D /* limpet.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = limpet.entitlements; sourceTree = "<group>"; };
 		A1000000000000000000000E /* Settings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Settings.swift; sourceTree = "<group>"; };
 		A1000000000000000000000F /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
 		A10000000000000000000010 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
@@ -107,6 +107,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				A2000000000000000000000A /* Sparkle in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -158,7 +159,6 @@
 			children = (
 				A10000000000000000000001 /* LimpetApp.swift */,
 				A1000000000000000000000B /* Info.plist */,
-				A1000000000000000000000D /* limpet.entitlements */,
 				A10000000000000000000010 /* Assets.xcassets */,
 				A13000000000000000000003 /* Models */,
 				A13000000000000000000004 /* Services */,
@@ -265,12 +265,16 @@
 				A15000000000000000000001 /* Sources */,
 				A12000000000000000000001 /* Frameworks */,
 				A19000000000000000000001 /* Resources */,
+				A20000000000000000000002 /* Remove Sparkle XPC Services */,
 			);
 			buildRules = (
 			);
 			dependencies = (
 			);
 			name = limpet;
+			packageProductDependencies = (
+				A2000000000000000000000C /* Sparkle */,
+			);
 			productName = limpet;
 			productReference = A1000000000000000000000C /* limpet.app */;
 			productType = "com.apple.product-type.application";
@@ -299,6 +303,9 @@
 				Base,
 			);
 			mainGroup = A13000000000000000000001;
+			packageReferences = (
+				A2000000000000000000000D /* XCRemoteSwiftPackageReference "Sparkle" */,
+			);
 			productRefGroup = A13000000000000000000006 /* Products */;
 			projectDirPath = "";
 			projectRoot = "";
@@ -320,6 +327,28 @@
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXResourcesBuildPhase section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		A20000000000000000000002 /* Remove Sparkle XPC Services */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Remove Sparkle XPC Services";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "# limpet is not sandboxed, so Sparkle's XPC services are unused. Xcode embeds and signs Sparkle.framework\n# BEFORE this phase, so deleting XPCServices breaks that signature; when an identity is set, re-seal the\n# framework (outer bundle only: the nested Autoupdate/Updater.app signatures are unaffected).\nFW=\"$TARGET_BUILD_DIR/$FRAMEWORKS_FOLDER_PATH/Sparkle.framework\"\nrm -rf \"$FW/Versions/B/XPCServices\" \"$FW/XPCServices\"\nif [ -n \"$EXPANDED_CODE_SIGN_IDENTITY\" ]; then\n  /usr/bin/codesign --force --sign \"$EXPANDED_CODE_SIGN_IDENTITY\" --preserve-metadata=identifier,flags \"$FW\"\nfi\n";
+		};
+/* End PBXShellScriptBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
 		A15000000000000000000001 /* Sources */ = {
@@ -496,7 +525,6 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
-				CODE_SIGN_ENTITLEMENTS = limpet/limpet.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
@@ -509,7 +537,8 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 1.0;
+				MARKETING_VERSION = 1.0.0;
+				SPARKLE_PUBLIC_ED_KEY = REPLACE_WITH_SPARKLE_PUBLIC_KEY;
 				PRODUCT_BUNDLE_IDENTIFIER = "com.nanako.limpet$(BUNDLE_ID_SUFFIX)";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = YES;
@@ -523,7 +552,6 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
-				CODE_SIGN_ENTITLEMENTS = limpet/limpet.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
@@ -536,7 +564,8 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 1.0;
+				MARKETING_VERSION = 1.0.0;
+				SPARKLE_PUBLIC_ED_KEY = REPLACE_WITH_SPARKLE_PUBLIC_KEY;
 				PRODUCT_BUNDLE_IDENTIFIER = "com.nanako.limpet$(BUNDLE_ID_SUFFIX)";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = YES;
@@ -566,6 +595,25 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		A2000000000000000000000D /* XCRemoteSwiftPackageReference "Sparkle" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/sparkle-project/Sparkle";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 2.9.0;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		A2000000000000000000000C /* Sparkle */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = A2000000000000000000000D /* XCRemoteSwiftPackageReference "Sparkle" */;
+			productName = Sparkle;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = A17000000000000000000001 /* Project object */;
 }

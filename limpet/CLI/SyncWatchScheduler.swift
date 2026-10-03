@@ -42,6 +42,14 @@ struct SchedulerRunner {
     var deleteLimitReached: () -> Bool
     /// Write that marker after a run exited 76. Returns whether it was written.
     var recordDeleteLimit: () -> Bool
+    /// Whether the app on disk is a different version than this process
+    /// started with, and no child is running (limpet-plan.md L7 S3). Asked
+    /// right before a spawn, after every other gate. Default: never.
+    var shouldRestartForUpdate: () -> Bool = { false }
+    /// Called instead of spawning when `shouldRestartForUpdate` is true;
+    /// production logs one line and `exit(0)`s (launchd KeepAlive restarts the
+    /// new binary). Must write no other file.
+    var restartForUpdate: () -> Void = {}
 }
 
 /// Pure idle/running/(running+pending) scheduler for one profile's realtime
@@ -133,6 +141,11 @@ final class SyncWatchScheduler {
         guard runner.sourceExists() else {
             if throttle(&lastMissingSourceLogAt) { runner.logSourceMissing() }
             state = .idle  // no run, per limpet-plan.md L3(a).
+            return
+        }
+        if runner.shouldRestartForUpdate() {
+            runner.restartForUpdate()
+            state = .idle  // production never returns from the line above
             return
         }
         state = .running(pending: pending)

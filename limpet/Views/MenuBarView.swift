@@ -2,6 +2,7 @@ import SwiftUI
 
 struct MenuBarView: View {
     @EnvironmentObject var syncManager: SyncManager
+    @ObservedObject private var updater = UpdaterState.shared
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -270,6 +271,21 @@ struct MenuBarView: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 6)
+
+            // Check for Updates (Sparkle)
+            Button(action: { updater.checkForUpdates() }) {
+                HStack {
+                    Image(systemName: "arrow.triangle.2.circlepath")
+                    Text("Check for Updates…")
+                    Spacer()
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .disabled(!updater.canCheckForUpdates)
             .padding(.horizontal, 8)
             .padding(.vertical, 6)
 
