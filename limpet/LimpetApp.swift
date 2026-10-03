@@ -146,13 +146,17 @@ final class UpdaterState: ObservableObject {
     static let shared = UpdaterState()
     @Published private(set) var canCheckForUpdates = false
     private var controller: SPUStandardUpdaterController?
+    /// Held strongly here: Sparkle keeps its user-driver delegate WEAKLY
+    /// (SPUStandardUpdaterController.h), so a temporary passed to the init is
+    /// released at once and no delegate is ever seen (verifier probe 2026-10-03).
+    private let gentleReminders = GentleReminders()
 
     /// Never in Debug builds: a dev build must not poll the release feed or offer to
     /// replace itself (the menu item then stays disabled).
     func start() {
         #if !DEBUG
         guard controller == nil else { return }
-        let c = SPUStandardUpdaterController(startingUpdater: true, updaterDelegate: nil, userDriverDelegate: GentleReminders())
+        let c = SPUStandardUpdaterController(startingUpdater: true, updaterDelegate: nil, userDriverDelegate: gentleReminders)
         controller = c
         c.updater.publisher(for: \.canCheckForUpdates).assign(to: &$canCheckForUpdates)
         #endif
