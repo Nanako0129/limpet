@@ -149,6 +149,10 @@ jobs:
           [ "$GOT" = "$BUILD" ] || { echo "error: CFBundleVersion is $GOT, expected the commit count $BUILD" >&2; exit 1; }
           GOT=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$PLIST")
           [ "$GOT" = "$VERSION" ] || { echo "error: CFBundleShortVersionString is $GOT, expected $VERSION" >&2; exit 1; }
+          # Gatekeeper rejects a bundle without these as "does not seem to be an app"
+          # (first dry run 2026-10-04: signed and notarized, then spctl refused it).
+          [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundlePackageType' "$PLIST" 2>/dev/null)" = APPL ] || { echo "error: CFBundlePackageType is not APPL" >&2; exit 1; }
+          [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$PLIST" 2>/dev/null)" = limpet ] || { echo "error: CFBundleExecutable is not limpet" >&2; exit 1; }
           echo "CFBundleVersion=$BUILD CFBundleShortVersionString=$VERSION"
           SPARKLE="$APP/Contents/Frameworks/Sparkle.framework"
           [ -d "$SPARKLE" ] || { echo "error: $SPARKLE is missing" >&2; exit 1; }
