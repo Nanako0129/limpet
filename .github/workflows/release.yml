@@ -73,8 +73,8 @@ jobs:
           VERSION=$(scripts/release/project_version.sh)
           # X.Y.Z, optionally -prerelease: stable versions must be X.Y.Z for the
           # tap job's bump_cask.sh, and this fails before anything is published.
-          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
-            echo "error: MARKETING_VERSION $VERSION is not X.Y.Z or X.Y.Z-prerelease" >&2
+          if ! [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "error: MARKETING_VERSION $VERSION is not X.Y.Z or X.Y.Z-prerelease (no leading zeros)" >&2
             exit 1
           fi
           if [ "$GITHUB_REF_NAME" != "v$VERSION" ]; then
@@ -394,7 +394,12 @@ jobs:
           NOTES="release-notes/$GITHUB_REF_NAME.md"
           [ -s "$NOTES" ] || { echo "error: $NOTES is missing or empty" >&2; exit 1; }
           cd "$RUNNER_TEMP/signed"
-          gh release create "$GITHUB_REF_NAME" \
+          # A prerelease (version with `-`) must never become "Latest": SUFeedURL
+          # is releases/latest/download/appcast.xml, so it would reach every
+          # installed stable copy.
+          PRE=()
+          case "$VERSION" in *-*) PRE=(--prerelease) ;; esac
+          gh release create "$GITHUB_REF_NAME" "${PRE[@]}" \
             "Limpet-$VERSION.dmg" limpet.app.tar.gz sha256.txt appcast.xml \
             --repo "$GITHUB_REPOSITORY" \
             --verify-tag \
@@ -429,15 +434,13 @@ jobs:
           set -euo pipefail
           umask 077
           [ -n "$HOMEBREW_TAP_LIMPET_DEPLOY_KEY" ] || { echo "error: HOMEBREW_TAP_LIMPET_DEPLOY_KEY is empty" >&2; exit 1; }
-          # Hash the PUBLISHED release asset (what Homebrew downloads) and require
-          # it to equal the release's sha256.txt. Reading from the release, not the
-          # 1-day artifact, keeps a late re-run of this job working.
+          # The cask's sha256 is the hash of the PUBLISHED asset, i.e. exactly what
+          # Homebrew downloads. Reading it from the release, not the 1-day
+          # artifact, keeps a late re-run of this job working.
           ASSETS="$RUNNER_TEMP/assets"
           gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
-            --pattern sha256.txt --pattern limpet.app.tar.gz --dir "$ASSETS"
-          SHA=$(awk '{print $1}' "$ASSETS/sha256.txt")
-          GOT=$(sha256sum "$ASSETS/limpet.app.tar.gz" | awk '{print $1}')
-          [ "$SHA" = "$GOT" ] || { echo "error: sha256.txt ($SHA) does not match the published limpet.app.tar.gz ($GOT)" >&2; exit 1; }
+            --pattern limpet.app.tar.gz --dir "$ASSETS"
+          SHA=$(sha256sum "$ASSETS/limpet.app.tar.gz" | awk '{print $1}')
 
           KEY="$RUNNER_TEMP/tap_deploy_key"
           KNOWN="$RUNNER_TEMP/known_hosts"
@@ -452,19 +455,23 @@ jobs:
           # fresh clone: bump_cask.sh is idempotent, and rebasing a shallow clone
           # conflicts.
           for attempt in 1 2 3; do
+            [ "$attempt" = 1 ] || sleep $((attempt * 15))
             TAP="$RUNNER_TEMP/tap-$attempt"
-            git clone -q --depth 1 git@github.com:Nanako0129/homebrew-tap.git "$TAP"
+            if ! git clone -q --depth 1 git@github.com:Nanako0129/homebrew-tap.git "$TAP"; then
+              echo "clone failed (attempt $attempt)" >&2
+              continue
+            fi
             git -C "$TAP" config user.name "github-actions[bot]"
             git -C "$TAP" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             OUT=$("$GITHUB_WORKSPACE/scripts/release/bump_cask.sh" "$TAP/Casks/limpet.rb" "$VERSION" "$SHA")
             echo "$OUT"
-            case "$OUT" in already\ up\ to\ date*) exit 0 ;; esac
+            case "$OUT" in already\ up\ to\ date*|already\ at\ newer*) exit 0 ;; esac
             # Guard against mistakes (not a hostile run): Casks/limpet.rb only.
             CHANGED=$(git -C "$TAP" diff --name-only)
             [ "$CHANGED" = "Casks/limpet.rb" ] || { echo "error: unexpected tap changes: $CHANGED" >&2; exit 1; }
             git -C "$TAP" commit -q -am "limpet $VERSION"
-            git -C "$TAP" push -q origin HEAD:main && exit 0
-            echo "push rejected (attempt $attempt); retrying from a fresh clone" >&2
+            git -C "$TAP" push origin HEAD:main && exit 0
+            echo "push failed (attempt $attempt, error above); retrying from a fresh clone" >&2
           done
           echo "error: could not push the cask bump" >&2
           exit 1

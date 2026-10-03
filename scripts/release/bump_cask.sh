@@ -10,16 +10,19 @@
 #
 # Exit codes: 0 = rewritten, or already at this version and sha (idempotent,
 # prints "already up to date", so re-running the job is safe); 1 = bad input,
-# the cask lacks exactly one `version` / `sha256` line, the requested version
-# is OLDER than the cask's (never downgrade the shared tap; the same version
-# with a new sha is allowed), or the rewrite did not produce the expected lines.
+# the cask lacks exactly one `version` / `sha256` line, or the rewrite did not
+# produce the expected lines. A requested version OLDER than the cask's is a
+# no-op (prints "already at newer", exit 0, writes nothing): the shared tap is
+# never downgraded, and re-running an old release's job after a newer one
+# bumped the cask is not an error. The same version with a new sha is allowed.
 set -euo pipefail
 
 CASK=${1:?usage: bump_cask.sh <cask.rb> <version> <sha256>}
 VERSION=${2:?usage: bump_cask.sh <cask.rb> <version> <sha256>}
 SHA=${3:?usage: bump_cask.sh <cask.rb> <version> <sha256>}
 
-[[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "error: version '$VERSION' is not X.Y.Z" >&2; exit 1; }
+XYZ='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+[[ "$VERSION" =~ $XYZ ]] || { echo "error: version '$VERSION' is not X.Y.Z (no leading zeros)" >&2; exit 1; }
 [[ "$SHA" =~ ^[0-9a-f]{64}$ ]] || { echo "error: sha256 '$SHA' is not 64 lowercase hex chars" >&2; exit 1; }
 [ -f "$CASK" ] || { echo "error: $CASK not found" >&2; exit 1; }
 
@@ -29,10 +32,11 @@ SHA_RE='^  sha256 "[^"]*"$'
 [ "$(grep -cE "$SHA_RE" "$CASK")" = 1 ] || { echo "error: $CASK must have exactly one '  sha256 \"...\"' line" >&2; exit 1; }
 
 CURRENT=$(sed -nE 's/^  version "([^"]*)"$/\1/p' "$CASK")
-if [[ "$CURRENT" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && [ "$CURRENT" != "$VERSION" ] \
+[[ "$CURRENT" =~ $XYZ ]] || { echo "error: $CASK version '$CURRENT' is not X.Y.Z" >&2; exit 1; }
+if [ "$CURRENT" != "$VERSION" ] \
    && [ "$(printf '%s\n%s\n' "$CURRENT" "$VERSION" | sort -t. -k1,1n -k2,2n -k3,3n | tail -1)" = "$CURRENT" ]; then
-  echo "error: $CASK is at $CURRENT, newer than $VERSION; refusing to downgrade" >&2
-  exit 1
+  echo "already at newer $CURRENT: not moving $CASK back to $VERSION"
+  exit 0
 fi
 
 WANT_VERSION="  version \"$VERSION\""
