@@ -2,8 +2,9 @@
 # Major versions are ignored here and upgraded deliberately, one at a time.
 # Ported from Syrtis (Nanako0129/TokenBar-Native).
 #
-# The Sparkle pin is the one that matters most: it ships inside the app and
-# its generate_appcast signs the feed. Review that PR by hand.
+# Not covered: the Sparkle package. The Xcode project has no root Package.swift,
+# so Dependabot's swift ecosystem has nothing to read; Sparkle is upgraded by
+# hand (see CLAUDE.md, Releasing).
 version: 2
 updates:
   - package-ecosystem: github-actions
@@ -12,18 +13,6 @@ updates:
       interval: weekly
     groups:
       github-actions:
-        patterns: ["*"]
-        update-types: [minor, patch]
-    ignore:
-      - dependency-name: "*"
-        update-types: [version-update:semver-major]
-
-  - package-ecosystem: swift
-    directory: /
-    schedule:
-      interval: weekly
-    groups:
-      swift:
         patterns: ["*"]
         update-types: [minor, patch]
     ignore:

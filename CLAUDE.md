@@ -1056,9 +1056,12 @@ assets. The scripts are in `scripts/release/` (adapted from Syrtis; each header 
 | Job | Runs | Secrets | Does |
 |-----|------|---------|------|
 | `gate` | tags only, ubuntu | none | tag == `v` + `MARKETING_VERSION` (`project_version.sh`), `release-notes/<tag>.md` non-empty, `$GITHUB_SHA` is an ancestor of `origin/main`, and a green push run of `ci.yml` on that SHA (`check_ci_gate.sh`, waits up to 30 min) |
-| `build` | tag or dry run, `macos-26` + Xcode 26.6 | none, `contents: read` | `xcodebuild` Release with `CODE_SIGNING_ALLOWED=NO`, `CURRENT_PROJECT_VERSION=$(git rev-list --count HEAD)`, `MARKETING_VERSION` from the tag; asserts `CFBundleVersion`, Sparkle present, no `XPCServices`; uploads a tar of the unsigned app |
+| `build` | tag or dry run, `macos-26` + Xcode 26.6 | none, `contents: read` | `xcodebuild` Release with `CODE_SIGNING_ALLOWED=NO`, `CURRENT_PROJECT_VERSION=$(git rev-list --count HEAD)` (`MARKETING_VERSION` stays the project's; `gate` already required the tag to match); asserts `CFBundleVersion`, `CFBundleShortVersionString` and Sparkle present (no-`XPCServices` is checked by `verify_signed_app.sh`); uploads a tar of the unsigned app |
 | `sign` | tag or dry run, Environment `release` | all of them | resolves Sparkle itself (`xcodebuild -resolvePackageDependencies`, never executes anything from the build artifact), signs/notarizes/staples the app, DMG, `verify_signed_*`, generates and verifies `appcast.xml` |
 | `publish` | tags only, Environment `release`, `contents: write` | none used | `gh release create` with the four assets and `release-notes/<tag>.md`; pushes nothing to the repository |
+
+**One run at a time.** The workflow has a single `concurrency` group, so a second tag's `sign` starts only
+after the first run finished; the feed is seeded from the latest release, so overlapping runs would drop each other's item. GitHub keeps one pending run per group: a third run arriving cancels the waiting one, so re-run it by hand.
 
 **Secrets and variables.** Environment `release` only (never repository secrets): secrets `DEVELOPER_ID_P12` (base64),
 `DEVELOPER_ID_P12_PASSWORD`, `NOTARY_KEY_P8`, `SPARKLE_PRIVATE_KEY`; variables `APPLE_TEAM_ID`, `NOTARY_KEY_ID`,
@@ -1083,8 +1086,10 @@ uploads artifact `signed` (1 day) and publishes nothing. Check the DMG with
 `spctl -a -vv -t open --context context:primary-signature <dmg>` and `xcrun stapler validate <dmg>`.
 
 **Runner.** `ci.yml` and `release.yml` both use `macos-26` with `DEVELOPER_DIR=/Applications/Xcode_26.6.app/Contents/Developer`;
-change them together. Actions are pinned by SHA (Dependabot, weekly, minor and patch only, covers actions and the Swift
-package); never add `actions/cache` or a self-hosted runner to the release workflow.
+change them together. Actions are pinned by SHA and Dependabot (weekly, minor and patch only) keeps them current; it does
+not cover Sparkle (no root `Package.swift`). Upgrade Sparkle by hand: change the requirement in Xcode, then refresh the
+committed `Package.resolved` (`xcodebuild -resolvePackageDependencies`) and review the diff. Never add `actions/cache` or a
+self-hosted runner to the release workflow.
 
 ## Key Files Reference
 

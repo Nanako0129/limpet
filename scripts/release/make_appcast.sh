@@ -40,7 +40,17 @@ NOTES_BASENAME="${ARCHIVE_BASENAME%.tar.gz}.md"          # limpet.app.md
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 
-[ -n "$PREVIOUS" ] && [ -f "$PREVIOUS" ] && cp "$PREVIOUS" "$WORK/appcast.xml"
+# The seed's old signature block is cut off first, so a signature block in the
+# output can only be one generate_appcast just made (not a stale one that
+# survived because the tool left it alone).
+if [ -n "$PREVIOUS" ] && [ -f "$PREVIOUS" ]; then
+  python3 - "$PREVIOUS" "$WORK/appcast.xml" <<'PY'
+import re, sys
+b = open(sys.argv[1], "rb").read()
+b = re.sub(rb"<!-- sparkle-signatures:.*?-->\s*\Z", b"", b, flags=re.S)
+open(sys.argv[2], "wb").write(b)
+PY
+fi
 cp "$ARCHIVE" "$WORK/$ARCHIVE_BASENAME"
 
 # A same-base-name sidecar becomes the new item's description; an empty one

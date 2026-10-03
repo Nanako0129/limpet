@@ -29,7 +29,7 @@ for code in "$APP" "$SPARKLE" "$SPARKLE/Versions/B/Autoupdate" "$SPARKLE/Version
   ENT=$(codesign -d --entitlements - --xml "$code" 2>/dev/null || true)
   [ -z "$ENT" ] || fail "$code carries entitlements; adding any needs the maintainer's sign-off"
 done
-[ ! -e "$SPARKLE/Versions/B/XPCServices" ] || fail "Sparkle XPCServices present"
+[ ! -e "$SPARKLE/Versions/B/XPCServices" ] && [ ! -e "$SPARKLE/XPCServices" ] || fail "Sparkle XPCServices present"
 
 xcrun stapler validate "$APP" >/dev/null || fail "no stapled notarization ticket"
 # Captured first: `spctl | grep -q` under pipefail can fail a passing check

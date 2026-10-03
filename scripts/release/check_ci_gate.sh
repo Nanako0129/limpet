@@ -76,6 +76,11 @@ while :; do
   elif [[ "$conclusion" == "success" ]]; then
     echo "check_ci_gate: $wf for $sha passed: $url"
     exit 0
+  elif [[ "$conclusion" == "cancelled" ]]; then
+    id="${url##*/}"
+    echo "::error::check_ci_gate: $wf for $sha was cancelled: $url"
+    echo "Re-run that CI run (gh run rerun $id), wait for it to pass, then re-run this Release run."
+    exit 1
   else
     echo "::error::check_ci_gate: $wf for $sha concluded '$conclusion': $url"
     echo "$recovery"

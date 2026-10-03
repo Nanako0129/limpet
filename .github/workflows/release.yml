@@ -15,6 +15,17 @@ on:
 # Every job states its own permissions; nothing is granted by default.
 permissions: {}
 
+# One release run at a time, for the whole workflow: `sign` seeds the feed
+# from the latest release's appcast.xml, so a second tag's `sign` must start
+# only after the first run has published (or failed). A dry run on main queues
+# behind a tag run for the same reason. Limit: GitHub keeps one pending run per
+# group, so a third run arriving while one runs and one waits cancels the
+# waiting one (actionlint 1.7.12 rejects `queue: max`); re-run a cancelled tag
+# run by hand.
+concurrency:
+  group: release-${{ github.repository }}
+  cancel-in-progress: false
+
 # Signing material lives only in the `release` Environment (required
 # reviewer: the maintainer), never in repository secrets:
 #   secrets    DEVELOPER_ID_P12, DEVELOPER_ID_P12_PASSWORD, NOTARY_KEY_P8,
@@ -104,10 +115,9 @@ jobs:
         run: |
           set -euo pipefail
           xcodebuild -version
+          # On a tag run the gate has already required the tag to equal
+          # v + this version.
           VERSION=$(scripts/release/project_version.sh)
-          # A tag run builds the version the tag names (the gate has already
-          # required it to equal the project's); a dry run builds the project's.
-          if [ "$GITHUB_EVENT_NAME" = push ]; then VERSION="${GITHUB_REF_NAME#v}"; fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
           echo "BUILD=$(git rev-list --count HEAD)" >> "$GITHUB_ENV"
@@ -115,8 +125,6 @@ jobs:
       - name: Build (Release, unsigned)
         run: |
           set -euo pipefail
-          ARGS=(CURRENT_PROJECT_VERSION="$BUILD")
-          if [ "$GITHUB_EVENT_NAME" = push ]; then ARGS+=(MARKETING_VERSION="$VERSION"); fi
           xcodebuild -project limpet.xcodeproj \
             -scheme limpet \
             -configuration Release \
@@ -124,7 +132,7 @@ jobs:
             -disableAutomaticPackageResolution \
             -onlyUsePackageVersionsFromResolvedFile \
             CODE_SIGNING_ALLOWED=NO \
-            "${ARGS[@]}" \
+            CURRENT_PROJECT_VERSION="$BUILD" \
             build > "$RUNNER_TEMP/xcodebuild.log" 2>&1 || {
               grep -E '(error|warning): ' "$RUNNER_TEMP/xcodebuild.log" | head -200 || true
               tail -80 "$RUNNER_TEMP/xcodebuild.log"
@@ -144,9 +152,6 @@ jobs:
           echo "CFBundleVersion=$BUILD CFBundleShortVersionString=$VERSION"
           SPARKLE="$APP/Contents/Frameworks/Sparkle.framework"
           [ -d "$SPARKLE" ] || { echo "error: $SPARKLE is missing" >&2; exit 1; }
-          if [ -e "$SPARKLE/Versions/B/XPCServices" ] || [ -e "$SPARKLE/XPCServices" ]; then
-            echo "error: Sparkle XPCServices present" >&2; exit 1
-          fi
 
       # A tar keeps the framework's symlinks and modes; upload-artifact does
       # not, and Sparkle.framework/Versions/Current would break.
@@ -356,22 +361,11 @@ jobs:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     environment: release
-    # One publication at a time; a second tag waits instead of racing.
-    concurrency:
-      group: release-publish
-      cancel-in-progress: false
     permissions:
       contents: write
     env:
       VERSION: ${{ needs.build.outputs.version }}
     steps:
-      - name: Require a release tag
-        run: |
-          case "$GITHUB_REF" in
-            refs/tags/v*) ;;
-            *) echo "error: publishing refused for $GITHUB_REF" >&2; exit 1 ;;
-          esac
-
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false

@@ -20,14 +20,8 @@ SIGN=(codesign --force --options runtime --timestamp --sign "$IDENTITY")
 [ -n "$KEYCHAIN" ] && SIGN+=(--keychain "$KEYCHAIN")
 
 SPARKLE="$APP/Contents/Frameworks/Sparkle.framework"
-# The Xcode build phase removes Sparkle's XPC services (only sandboxed apps
-# use them). A bundle that still has them carries unsigned nested code and
-# would fail notarization with a less obvious message, so stop here instead.
-if [ -e "$SPARKLE/Versions/B/XPCServices" ] || [ -e "$SPARKLE/XPCServices" ]; then
-  echo "error: $SPARKLE still has XPCServices; the build phase should have removed them" >&2
-  exit 1
-fi
-
+# The Xcode build phase removes Sparkle's XPC services and
+# verify_signed_app.sh fails a bundle that still has them.
 "${SIGN[@]}" "$SPARKLE/Versions/B/Autoupdate"
 "${SIGN[@]}" "$SPARKLE/Versions/B/Updater.app"
 "${SIGN[@]}" "$SPARKLE"
