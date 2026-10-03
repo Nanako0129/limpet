@@ -1,0 +1,392 @@
+name: Release
+
+# Developer ID signed, notarized DMG plus a signed Sparkle feed, released from
+# CI. Ported from Syrtis (Nanako0129/TokenBar-Native, release.yml); limpet
+# builds with xcodebuild, so only the steps from signing onward are shared.
+on:
+  push:
+    tags: ["v*"]
+  # Dry run: build, sign, notarize, verify and generate the appcast exactly as
+  # a tag would, and publish nothing. The signed files are kept as a one-day
+  # artifact. The `release` Environment admits only `v*` tags and `main`, so a
+  # dry run from any other branch stops at the sign job.
+  workflow_dispatch:
+
+# Every job states its own permissions; nothing is granted by default.
+permissions: {}
+
+# One release run at a time, for the whole workflow: `sign` seeds the feed
+# from the latest release's appcast.xml, so a second tag's `sign` must start
+# only after the first run has published (or failed). A dry run on main queues
+# behind a tag run for the same reason. Limit: GitHub keeps one pending run per
+# group, so a third run arriving while one runs and one waits cancels the
+# waiting one (actionlint 1.7.12 rejects `queue: max`); re-run a cancelled tag
+# run by hand.
+concurrency:
+  group: release-${{ github.repository }}
+  cancel-in-progress: false
+
+# Signing material lives only in the `release` Environment (required
+# reviewer: the maintainer), never in repository secrets:
+#   secrets    DEVELOPER_ID_P12, DEVELOPER_ID_P12_PASSWORD, NOTARY_KEY_P8,
+#              SPARKLE_PRIVATE_KEY
+#   variables  APPLE_TEAM_ID, NOTARY_KEY_ID, NOTARY_ISSUER_ID
+# Only `sign` and `publish` enter it. `build` runs third-party toolchains and
+# holds no secret and cannot write to the repository.
+#
+# The Sparkle key alone can push an update (Sparkle checks the EdDSA
+# signature, not the code-signing identity). Keep `sign` minimal: it executes
+# only Apple's tools, the scripts of the tagged commit, and Sparkle's binaries
+# that it resolves itself from the checked-out Package.resolved, never
+# anything taken from the build artifact.
+#
+# Actions are pinned by commit SHA and the runner image is pinned; Dependabot
+# keeps the action pins current. No actions/cache, no self-hosted runners.
+#
+# Runner: macos-26 carries Xcode 26.6 (images/macos/macos-26-arm64-Readme.md
+# in actions/runner-images, image 20260907) at /Applications/Xcode_26.6.app.
+# ci.yml uses the same image and DEVELOPER_DIR, so CI and a release build with
+# one toolchain. Change both together.
+
+jobs:
+  # Cheap checks on Linux before any macOS job: the tag names the project's
+  # version, the release notes exist, the commit is on main, and CI is green.
+  # A mistake guard, not a security boundary: the tagged commit carries this
+  # file and the scripts. The Environment policy is the control.
+  gate:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    # Backstop above the script's own limits (5 min grace, 30 min wait).
+    timeout-minutes: 40
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Tag, notes and branch
+        run: |
+          set -euo pipefail
+          VERSION=$(scripts/release/project_version.sh)
+          if [ "$GITHUB_REF_NAME" != "v$VERSION" ]; then
+            echo "error: tag $GITHUB_REF_NAME does not equal v$VERSION (MARKETING_VERSION in project.pbxproj)" >&2
+            exit 1
+          fi
+          if [ ! -s "release-notes/$GITHUB_REF_NAME.md" ]; then
+            echo "error: release-notes/$GITHUB_REF_NAME.md is missing or empty" >&2
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "error: $GITHUB_SHA is not an ancestor of origin/main; release only commits that were merged" >&2
+            exit 1
+          fi
+
+      # CI does not run on tags, so the tagged commit's own run on main is
+      # checked: runs still going are waited for.
+      - name: Require green CI for the tagged commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/release/check_ci_gate.sh "$GITHUB_SHA"
+
+  # Unsigned build. No Environment, read-only token, no persisted credentials.
+  build:
+    needs: gate
+    # A tag needs the gate; a dry run skips it.
+    if: ${{ !cancelled() && (github.event_name == 'workflow_dispatch' || needs.gate.result == 'success') }}
+    runs-on: macos-26
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Version
+        id: version
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          # On a tag run the gate has already required the tag to equal
+          # v + this version.
+          VERSION=$(scripts/release/project_version.sh)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "BUILD=$(git rev-list --count HEAD)" >> "$GITHUB_ENV"
+
+      - name: Build (Release, unsigned)
+        run: |
+          set -euo pipefail
+          xcodebuild -project limpet.xcodeproj \
+            -scheme limpet \
+            -configuration Release \
+            -derivedDataPath "$RUNNER_TEMP/dd" \
+            -disableAutomaticPackageResolution \
+            -onlyUsePackageVersionsFromResolvedFile \
+            CODE_SIGNING_ALLOWED=NO \
+            CURRENT_PROJECT_VERSION="$BUILD" \
+            build > "$RUNNER_TEMP/xcodebuild.log" 2>&1 || {
+              grep -E '(error|warning): ' "$RUNNER_TEMP/xcodebuild.log" | head -200 || true
+              tail -80 "$RUNNER_TEMP/xcodebuild.log"
+              exit 1
+            }
+          tail -5 "$RUNNER_TEMP/xcodebuild.log"
+
+      - name: Assert the bundle
+        run: |
+          set -euo pipefail
+          APP="$RUNNER_TEMP/dd/Build/Products/Release/limpet.app"
+          PLIST="$APP/Contents/Info.plist"
+          GOT=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$PLIST")
+          [ "$GOT" = "$BUILD" ] || { echo "error: CFBundleVersion is $GOT, expected the commit count $BUILD" >&2; exit 1; }
+          GOT=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$PLIST")
+          [ "$GOT" = "$VERSION" ] || { echo "error: CFBundleShortVersionString is $GOT, expected $VERSION" >&2; exit 1; }
+          echo "CFBundleVersion=$BUILD CFBundleShortVersionString=$VERSION"
+          SPARKLE="$APP/Contents/Frameworks/Sparkle.framework"
+          [ -d "$SPARKLE" ] || { echo "error: $SPARKLE is missing" >&2; exit 1; }
+
+      # A tar keeps the framework's symlinks and modes; upload-artifact does
+      # not, and Sparkle.framework/Versions/Current would break.
+      - name: Archive the unsigned app
+        run: COPYFILE_DISABLE=1 tar -cf "$RUNNER_TEMP/unsigned.tar" -C "$RUNNER_TEMP/dd/Build/Products/Release" limpet.app
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: unsigned
+          path: ${{ runner.temp }}/unsigned.tar
+          if-no-files-found: error
+          retention-days: 1
+
+  # Developer ID signing, notarization, verification and the appcast.
+  sign:
+    needs: build
+    # Explicit: without it the skipped `gate` of a dry run would skip this
+    # job too, and the dry run would end green having signed nothing.
+    if: ${{ !cancelled() && needs.build.result == 'success' }}
+    runs-on: macos-26
+    # Two notarizations (app, then DMG), each allowed 60 min by
+    # notarize_app.sh; they usually take minutes. This bounds a stalled queue.
+    timeout-minutes: 150
+    environment: release
+    permissions:
+      contents: read
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+      VERSION: ${{ needs.build.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Backstop for the Environment's deployment policy: signing runs only
+      # for a `v*` tag push or a dry run dispatched on main.
+      - name: Require a release ref
+        run: |
+          case "$GITHUB_EVENT_NAME:$GITHUB_REF" in
+            push:refs/tags/v*|workflow_dispatch:refs/heads/main) ;;
+            *) echo "error: signing refused for $GITHUB_EVENT_NAME on $GITHUB_REF" >&2; exit 1 ;;
+          esac
+
+      # Into RUNNER_TEMP, never over the checkout: the artifact comes from
+      # the unprivileged job, and unpacked here it could replace the scripts
+      # this job runs with the keys.
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: unsigned
+          path: ${{ runner.temp }}/unsigned
+
+      # Sparkle's tools come from the pinned package resolved HERE from the
+      # checked-out Package.resolved (no secret is exposed to this step), not
+      # from the build job.
+      - name: Resolve Sparkle
+        run: |
+          set -euo pipefail
+          xcodebuild -resolvePackageDependencies \
+            -project limpet.xcodeproj -scheme limpet \
+            -derivedDataPath "$RUNNER_TEMP/sp" \
+            -disableAutomaticPackageResolution \
+            -onlyUsePackageVersionsFromResolvedFile
+          BIN="$RUNNER_TEMP/sp/SourcePackages/artifacts/sparkle/Sparkle/bin"
+          for tool in generate_appcast sign_update; do
+            [ -x "$BIN/$tool" ] || { echo "error: $BIN/$tool is missing or not executable" >&2; exit 1; }
+          done
+
+      # An empty secret must stop the release, not quietly yield an unsigned
+      # build (a misnamed secret or a missing `environment:` reads as "").
+      # SPARKLE_PRIVATE_KEY is checked here too, so a dry run proves every key
+      # a tag reads. Values are never printed.
+      - name: Require the signing material
+        env:
+          DEVELOPER_ID_P12: ${{ secrets.DEVELOPER_ID_P12 }}
+          DEVELOPER_ID_P12_PASSWORD: ${{ secrets.DEVELOPER_ID_P12_PASSWORD }}
+          NOTARY_KEY_P8: ${{ secrets.NOTARY_KEY_P8 }}
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+          NOTARY_KEY_ID: ${{ vars.NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ vars.NOTARY_ISSUER_ID }}
+        run: |
+          missing=0
+          for name in DEVELOPER_ID_P12 DEVELOPER_ID_P12_PASSWORD NOTARY_KEY_P8 SPARKLE_PRIVATE_KEY APPLE_TEAM_ID NOTARY_KEY_ID NOTARY_ISSUER_ID; do
+            if [ -z "${!name}" ]; then echo "error: $name is empty in the release Environment" >&2; missing=1; fi
+          done
+          exit "$missing"
+
+      # No `set -x` anywhere in this step: it would print the passwords.
+      - name: Sign, notarize and verify
+        env:
+          DEVELOPER_ID_P12: ${{ secrets.DEVELOPER_ID_P12 }}
+          DEVELOPER_ID_P12_PASSWORD: ${{ secrets.DEVELOPER_ID_P12_PASSWORD }}
+          NOTARY_KEY_P8: ${{ secrets.NOTARY_KEY_P8 }}
+          NOTARY_KEY_ID: ${{ vars.NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ vars.NOTARY_ISSUER_ID }}
+          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          umask 077
+          KC="$RUNNER_TEMP/signing.keychain-db"
+          P12="$RUNNER_TEMP/developer-id.p12"
+          P8="$RUNNER_TEMP/notary.p8"
+          trap 'rm -f "$P12" "$P8"' EXIT
+          WORK="$RUNNER_TEMP/work"
+          OUT="$RUNNER_TEMP/out"
+          mkdir -p "$WORK" "$OUT"
+
+          printf '%s' "$DEVELOPER_ID_P12" | base64 -D > "$P12"
+          printf '%s' "$NOTARY_KEY_P8" > "$P8"
+
+          # A throwaway keychain with a random password, locked again after
+          # 30 minutes. `-x` imports the private key as non-extractable.
+          KC_PW=$(openssl rand -base64 32)
+          security create-keychain -p "$KC_PW" "$KC"
+          security set-keychain-settings -lut 1800 "$KC"
+          security unlock-keychain -p "$KC_PW" "$KC"
+          security import "$P12" -k "$KC" -P "$DEVELOPER_ID_P12_PASSWORD" -T /usr/bin/codesign -x
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KC_PW" "$KC" > /dev/null
+          # The runner's keychain paths contain no spaces; xargs strips the
+          # quotes `list-keychains` prints around each one.
+          # shellcheck disable=SC2046
+          security list-keychains -d user -s "$KC" $(security list-keychains -d user | xargs)
+          rm -f "$P12"
+
+          # By SHA-1, not display name (a renewed certificate shares the name),
+          # and only one whose team matches, before anything is signed.
+          IDENTITY=$(security find-identity -v -p codesigning "$KC" \
+            | awk -v team="($APPLE_TEAM_ID)" 'index($0, "Developer ID Application:") && index($0, team) { print $2; exit }')
+          [ -n "$IDENTITY" ] || { echo "error: no Developer ID Application identity for team $APPLE_TEAM_ID in the certificate" >&2; exit 1; }
+
+          tar -xf "$RUNNER_TEMP/unsigned/unsigned.tar" -C "$WORK"
+          scripts/release/codesign_app.sh "$WORK/limpet.app" "$IDENTITY" "$KC"
+          NOTARY_KEY_FILE="$P8" scripts/release/notarize_app.sh "$WORK/limpet.app"
+
+          COPYFILE_DISABLE=1 tar -czf "$OUT/limpet.app.tar.gz" -C "$WORK" limpet.app
+          shasum -a 256 "$OUT/limpet.app.tar.gz" | awk '{print $1}' > "$OUT/sha256.txt"
+
+          # Verify what ships: the app as extracted from the final archive.
+          mkdir -p "$RUNNER_TEMP/check"
+          tar -xzf "$OUT/limpet.app.tar.gz" -C "$RUNNER_TEMP/check"
+          scripts/release/verify_signed_app.sh "$RUNNER_TEMP/check/limpet.app" "$APPLE_TEAM_ID"
+
+          # Installer DMG around the signed, stapled app, then signed,
+          # notarized and stapled itself, and verified mounted.
+          DMG="$OUT/Limpet-$VERSION.dmg"
+          scripts/release/make_dmg.sh "$WORK/limpet.app" "$DMG"
+          # The keychain relocks after 30 idle minutes, and the app's
+          # notarization wait may have been longer.
+          security unlock-keychain -p "$KC_PW" "$KC"
+          codesign --force --timestamp --sign "$IDENTITY" --keychain "$KC" "$DMG"
+          NOTARY_KEY_FILE="$P8" scripts/release/notarize_app.sh "$DMG"
+          scripts/release/verify_signed_dmg.sh "$DMG" "$APPLE_TEAM_ID"
+
+      # The feed is a release asset: the app reads
+      # releases/latest/download/appcast.xml. Seeded from the previous
+      # release's asset (none exists for 1.0.0). Dry runs generate it too.
+      - name: Sign and verify the appcast
+        env:
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          umask 077
+          KEY="$RUNNER_TEMP/sparkle_ed.key"
+          trap 'rm -f "$KEY"' EXIT
+          BIN="$RUNNER_TEMP/sp/SourcePackages/artifacts/sparkle/Sparkle/bin"
+          OUT="$RUNNER_TEMP/out"
+          printf '%s' "$SPARKLE_PRIVATE_KEY" > "$KEY"
+
+          PREVIOUS=""
+          if [ "$GITHUB_EVENT_NAME" = push ]; then
+            LATEST=$(gh release list --repo "$GITHUB_REPOSITORY" --exclude-drafts --exclude-pre-releases \
+              --limit 1 --json tagName --jq '.[0].tagName // empty')
+            if [ -n "$LATEST" ]; then
+              # A latest release without the asset is an error, not a reason
+              # to publish a feed that forgets every earlier version.
+              mkdir -p "$RUNNER_TEMP/previous"
+              gh release download "$LATEST" --repo "$GITHUB_REPOSITORY" --pattern appcast.xml --dir "$RUNNER_TEMP/previous"
+              PREVIOUS="$RUNNER_TEMP/previous/appcast.xml"
+            fi
+          fi
+
+          NOTES="release-notes/v$VERSION.md"
+          [ -s "$NOTES" ] || NOTES=""
+          scripts/release/make_appcast.sh "$BIN" "$OUT/limpet.app.tar.gz" "v$VERSION" "$KEY" \
+            "$OUT/appcast.xml" "$NOTES" "$PREVIOUS"
+          # sparkle:version == CFBundleVersion, and the signature verifies
+          # with the key in the shipped Info.plist, before anything is public.
+          scripts/release/verify_appcast.sh "$RUNNER_TEMP/check/limpet.app" "$OUT/limpet.app.tar.gz" \
+            "$OUT/appcast.xml" "$BIN" "$KEY"
+
+      - name: Remove the signing keychain
+        if: always()
+        run: security delete-keychain "$RUNNER_TEMP/signing.keychain-db" 2>/dev/null || true
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: signed
+          path: ${{ runner.temp }}/out
+          if-no-files-found: error
+          retention-days: 1
+
+  # The only job that writes: the GitHub Release. It runs gh only and pushes
+  # nothing to the repository.
+  publish:
+    needs: [build, sign]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    environment: release
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.build.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: release-notes
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: signed
+          path: ${{ runner.temp }}/signed
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          NOTES="release-notes/$GITHUB_REF_NAME.md"
+          [ -s "$NOTES" ] || { echo "error: $NOTES is missing or empty" >&2; exit 1; }
+          cd "$RUNNER_TEMP/signed"
+          gh release create "$GITHUB_REF_NAME" \
+            "Limpet-$VERSION.dmg" limpet.app.tar.gz sha256.txt appcast.xml \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "limpet $VERSION" \
+            --notes-file "$GITHUB_WORKSPACE/$NOTES"
