@@ -684,7 +684,9 @@ is the separate, fail-closed schema-drift gate.
   future Xcode stops embedding it, the app crashes at launch: check `Contents/Frameworks/Sparkle.framework` in the bundle.
 - The Run Script phase `Remove Sparkle XPC Services` runs after that and deletes `Sparkle.framework/Versions/B/XPCServices`
   (limpet is not sandboxed; the script runs `set -e`, declares that path as its output, and fails the build if it still
-  exists; checked on the unsigned Release build). Because Xcode already signed the framework, the script re-seals the outer framework with
+  exists; checked on the unsigned Release build). The target sets `ENABLE_USER_SCRIPT_SANDBOXING = NO`: CI's
+  Xcode 26.6 runs user scripts in a sandbox that denied the `rm` (`Sandbox: rm deny file-write-unlink …/XPCServices`,
+  PR #14 CI 2026-10-03), while local Xcode 27 allowed it; the `set -e` check is what turned that into a failed build. Because Xcode already signed the framework, the script re-seals the outer framework with
   `$EXPANDED_CODE_SIGN_IDENTITY` when one is set (verified with an ad-hoc identity: `codesign --verify --deep --strict` passes);
   unsigned CI builds skip it and L7.2 re-signs everything inside out.
 - Info.plist: `SUFeedURL` = the `appcast.xml` RELEASE ASSET of the latest release (not a file on main),
