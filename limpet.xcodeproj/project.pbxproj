@@ -538,7 +538,7 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 1.0.0;
+				MARKETING_VERSION = 1.0.1;
 				SPARKLE_PUBLIC_ED_KEY = "NFj325ucHi8AIjkhqz+3LTt22jGOMtEu36tcaPdYTFw=";
 				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				PRODUCT_BUNDLE_IDENTIFIER = "com.nanako.limpet$(BUNDLE_ID_SUFFIX)";
@@ -566,7 +566,7 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 1.0.0;
+				MARKETING_VERSION = 1.0.1;
 				SPARKLE_PUBLIC_ED_KEY = "NFj325ucHi8AIjkhqz+3LTt22jGOMtEu36tcaPdYTFw=";
 				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				PRODUCT_BUNDLE_IDENTIFIER = "com.nanako.limpet$(BUNDLE_ID_SUFFIX)";
