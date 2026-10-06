@@ -181,6 +181,10 @@ enum ConfigSelfTest {
             testLogWatcherMissingPathNeverCreated,
             testPurgeStatsLineIsInertAndFlagged,
             testStartupTailStaysIdle,
+            testSourceChangedScript,
+            testSourceChangedScheduler,
+            testSourceChangedLastError,
+            testSourceChangedManagerIdle,
             testLogWatcherSplitMultibyteLine,
             testStalledLineIsAFailureMarker,
             testStalledSyncWatchdogEndToEnd,
@@ -6412,6 +6416,135 @@ enum ConfigSelfTest {
         guard manager.profileStates[started.id] == .idle, manager.profileStates[failed.id] == .idle,
               manager.profileErrors[started.id] == nil, manager.profileErrors[failed.id] == nil else {
             return report(id, slug, false, "(states: \(String(describing: manager.profileStates[started.id])), \(String(describing: manager.profileStates[failed.id])))")
+        }
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L91 — source changed mid-upload: 77, retry in 30 s, never red (limpet-plan.md L9.1)
+
+    /// rclone 1.75.1's line for a file appended while it uploaded (seen 2026-10-06).
+    private static let sourceChangedLine = #"{"level":"error","msg":"corrupted on transfer: md5 hashes differ src(Local file system at /x) \"a\" vs dst(S3 bucket b path p) \"b\"","object":"r.jsonl"}"#
+
+    private static func testSourceChangedScript() -> Bool {
+        let id = "AC-L91-A", slug = "script-maps-source-changed-to-77"
+        let changed = "echo '\(sourceChangedLine)' >&2\n"
+        let attempt = #"echo '{"level":"error","msg":"Attempt 3/3 failed with 1 errors and: corrupted on transfer: md5 hashes differ"}' >&2"# + "\n"
+        let other = #"echo '{"level":"error","msg":"Failed to copy: permission denied","object":"x"}' >&2"# + "\n"
+        let counter = "\(selfTestRoot)/ac-l91-a/profile.source-changed"
+        // (name, stub tail, overrides, preset counter, expected status, expected counter after)
+        let cases: [(String, String, [String: Any], String?, Int32, String?)] = [
+            ("ac-l91-a", changed + attempt + "exit 1\n", [:], nil, 77, "1"),
+            ("ac-l91-b", changed + other + "exit 1\n", [:], nil, 1, nil),
+            ("ac-l91-c", other + "exit 1\n", [:], nil, 1, nil),
+            ("ac-l91-d", changed + "exit 1\n", ["syncDirection": "remoteToLocal"], nil, 1, nil),
+        ]
+        for (name, tail, overrides, _, expected, after) in cases {
+            guard let r = runScriptFixture(name: name, overrides: overrides, stubTail: tail) else {
+                return report(id, slug, false, "(\(name): fixture setup failed)")
+            }
+            let counterNow = try? String(contentsOfFile: "\(selfTestRoot)/\(name)/profile.source-changed", encoding: .utf8)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard r.status == expected, counterNow == after,
+                  r.log.contains("Source changed during upload") == (expected == 77) else {
+                return report(id, slug, false, "(\(name): status \(r.status), counter \(counterNow ?? "none"))")
+            }
+        }
+        // The cap: 19 in a row already → the 20th exits 1 and resets; a success clears it.
+        // runScriptFixture wipes its directory, so preset the counter through the stub.
+        let preset19 = "echo 19 > \"\(counter)\"\n" + changed + "exit 1\n"
+        guard let capped = runScriptFixture(name: "ac-l91-a", overrides: [:], stubTail: preset19),
+              capped.status == 1, capped.log.contains("kept changing during upload for 20 runs"),
+              !FileManager.default.fileExists(atPath: counter) else {
+            return report(id, slug, false, "(20th consecutive source-changed run did not exit 1 and reset)")
+        }
+        let presetThenOk = "echo 5 > \"\(counter)\"\nexit 0\n"
+        guard let ok = runScriptFixture(name: "ac-l91-a", overrides: [:], stubTail: presetThenOk),
+              ok.status == 0, !FileManager.default.fileExists(atPath: counter) else {
+            return report(id, slug, false, "(a successful run did not clear the counter)")
+        }
+        return report(id, slug, true)
+    }
+
+    private static func testSourceChangedScheduler() -> Bool {
+        let id = "AC-L91-B", slug = "scheduler-reruns-77-once-after-30s"
+        var codes: [Int32] = [77, 0]
+        let clock = VirtualClock()
+        let scheduler = SyncWatchScheduler(runner: fakeSchedulerRunner(
+            exitCode: { codes.isEmpty ? 0 : codes.removeFirst() }, clock: clock))
+        scheduler.trigger()  // run 1 → 77
+        scheduler.trigger()  // a change during the wait
+        clock.advance(by: 29)
+        guard scheduler.runCount == 1 else { return report(id, slug, false, "(reran before 30 s: \(scheduler.runCount))") }
+        clock.advance(by: 2)
+        guard scheduler.runCount == 2, scheduler.state == .idle else {
+            return report(id, slug, false, "(expected exactly 1 rerun after 30 s, got runCount \(scheduler.runCount), \(scheduler.state))")
+        }
+        clock.advance(by: 120)
+        guard scheduler.runCount == 2 else { return report(id, slug, false, "(extra runs: \(scheduler.runCount))") }
+        // 77 then 1 (the script's cap) → idle, nothing further.
+        codes = [77, 1]
+        let clock2 = VirtualClock()
+        let capped = SyncWatchScheduler(runner: fakeSchedulerRunner(
+            exitCode: { codes.isEmpty ? 0 : codes.removeFirst() }, clock: clock2))
+        capped.trigger()
+        clock2.advance(by: 300)
+        guard capped.runCount == 2, capped.state == .idle else {
+            return report(id, slug, false, "(77 then 1: runCount \(capped.runCount), \(capped.state))")
+        }
+        return report(id, slug, true)
+    }
+
+    private static func testSourceChangedLastError() -> Bool {
+        let id = "AC-L91-C", slug = "last-error-ignores-77"
+        let dir = "\(selfTestRoot)/ac-l91-c"
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        func lastError(exitCode: Int) -> String? {
+            let log = "\(dir)/\(exitCode).log"
+            let text = ["2026-10-06 22:58:00 - Starting sync (local → remote)", sourceChangedLine,
+                        "2026-10-06 22:58:42 - Source changed during upload (1/20); retrying in 30 s",
+                        "2026-10-06 22:58:42 - Sync failed with exit code \(exitCode)", ""].joined(separator: "\n")
+            try? text.write(toFile: log, atomically: true, encoding: .utf8)
+            return SyncManager.readLastErrorFromLog(log)
+        }
+        let on77 = lastError(exitCode: 77), on1 = lastError(exitCode: 1)
+        return report(id, slug, on77 == nil && on1 != nil, "(77 → \(on77 ?? "nil"), 1 → \(on1 ?? "nil"))")
+    }
+
+    private static func testSourceChangedManagerIdle() -> Bool {
+        let id = "AC-L91-C2", slug = "manager-77-stays-idle"
+        let dir = "\(selfTestRoot)/ac-l91-c2"
+        try? FileManager.default.removeItem(atPath: dir)
+        let store = ProfileStore(
+            profilesDirectory: "\(dir)/profiles",
+            defaults: UserDefaults(suiteName: "com.nanako.limpet.selftest.l91-c2.\(UUID().uuidString)")!)
+        var retried = sampleProfile(name: "L91 retried")
+        var failed = sampleProfile(name: "L91 failed")
+        retried.localSyncPath = "\(dir)/src-a"
+        failed.localSyncPath = "\(dir)/src-b"
+        for p in [retried, failed] {
+            try? FileManager.default.createDirectory(
+                atPath: (p.logPath as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
+            guard p.logPath.hasPrefix(LimpetPaths.home), !FileManager.default.fileExists(atPath: p.lockFilePath),
+                  FileManager.default.createFile(atPath: p.logPath, contents: nil) else {
+                return report(id, slug, false, "(fixture setup failed or the lock path is occupied)")
+            }
+            store.add(p)
+        }
+        let manager = SyncManager(profileStore: store)
+        _ = pumpMain(timeout: 1.0) { false }
+        for (p, code) in [(retried, 77), (failed, 1)] {
+            let lines = ["2026-10-06 22:58:00 - Starting sync (local → remote)", sourceChangedLine,
+                         "2026-10-06 22:58:42 - Sync failed with exit code \(code)", ""].joined(separator: "\n")
+            guard let h = FileHandle(forWritingAtPath: p.logPath) else { return report(id, slug, false, "(log open failed)") }
+            h.seekToEndOfFile(); h.write(Data(lines.utf8)); try? h.close()
+        }
+        // The exit-1 profile turning red shows both logs were processed.
+        let processed = pumpMain(timeout: 15) {
+            if case .error = manager.profileStates[failed.id] { return true } else { return false }
+        }
+        _ = pumpMain(timeout: 1.0) { false }
+        guard processed, manager.profileStates[retried.id] == .idle, manager.profileErrors[retried.id] == nil else {
+            return report(id, slug, false, "(processed \(processed); 77 state \(String(describing: manager.profileStates[retried.id])), error \(manager.profileErrors[retried.id] ?? "nil"))")
         }
         return report(id, slug, true)
     }
