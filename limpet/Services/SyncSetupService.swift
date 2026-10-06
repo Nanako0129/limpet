@@ -837,7 +837,10 @@ final class SyncSetupService {
             # red. Capped at 20 in a row by a per-profile counter, so a genuine,
             # persistent "corrupted on transfer" still surfaces as exit 1.
             SOURCE_CHANGED_FILE="${CONFIG_FILE%.json}.source-changed"
-            if [[ $EXIT_CODE -eq 1 && "$SYNC_DIRECTION" == "localToRemote" ]] \
+            # rclone exits 1 for "corrupted on transfer" but 6 (NoLowLevelRetryError)
+            # for "source file is being updated" (measured with 1.75.1, code review
+            # of PR #19), and a run with both ends with either.
+            if [[ ( $EXIT_CODE -eq 1 || $EXIT_CODE -eq 6 ) && "$SYNC_DIRECTION" == "localToRemote" ]] \
                 && grep -q '^C$' "$RUN_ERRORS" && ! grep -q '^R$' "$RUN_ERRORS"; then
                 SOURCE_CHANGED_COUNT=$(cat "$SOURCE_CHANGED_FILE" 2>/dev/null)
                 [[ "$SOURCE_CHANGED_COUNT" =~ ^[0-9]+$ ]] || SOURCE_CHANGED_COUNT=0

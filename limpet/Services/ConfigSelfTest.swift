@@ -6440,6 +6440,9 @@ enum ConfigSelfTest {
             ("ac-l91-b", changed + other + "exit 1\n", [:], nil, 1, nil),
             ("ac-l91-c", other + "exit 1\n", [:], nil, 1, nil),
             ("ac-l91-d", changed + "exit 1\n", ["syncDirection": "remoteToLocal"], nil, 1, nil),
+            // rclone 1.75.1's line and exit code for a file appended mid-read.
+            ("ac-l91-e", info + #"echo '{"level":"error","msg":"Failed to copy: source file is being updated (size changed from 1 to 2)","object":"r.jsonl"}' >&2"# + "\n" + "exit 6\n", [:], nil, 77, "1"),
+            ("ac-l91-f", other + "exit 6\n", [:], nil, 6, nil),
         ]
         for (name, tail, overrides, _, expected, after) in cases {
             guard let r = runScriptFixture(name: name, overrides: overrides, stubTail: tail) else {

@@ -464,7 +464,8 @@ sees that code — showing a refusal in the menu is open work.
 only error lines are rclone's `corrupted on transfer` / `source file is being
 updated` (a file appended while it uploaded; rclone's follow-up `Attempt N/M
 failed` and `not deleting ... IO errors` lines are ignored) exits 77 and logs
-`Source changed during upload (N/20); retrying in 30 s`. The count lives in
+`Source changed during upload (N/20); retrying in 30 s`. rclone 1.75.1
+exits 1 for the first and 6 for the second, so both codes qualify. The count lives in
 `profiles/{shortId}.source-changed` (removed by any other outcome); the 20th in
 a row exits 1 instead, so a genuine persistent corruption still turns red. The
 watcher reruns once 30 s after a 77 (`SyncWatchScheduler.sourceChangedExitCode`).
