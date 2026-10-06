@@ -466,8 +466,9 @@ updated` (a file appended while it uploaded; rclone's follow-up `Attempt N/M
 failed` and `not deleting ... IO errors` lines are ignored) exits 77 and logs
 `Source changed during upload (N/20); retrying in 30 s`. rclone 1.75.1
 exits 1 for the first and 6 for the second, so both codes qualify. The count lives in
-`profiles/{shortId}.source-changed` (removed by any other outcome); the 20th in
-a row exits 1 instead, so a genuine persistent corruption still turns red. The
+`profiles/{shortId}.source-changed` (removed by any other outcome); from the 20th
+in a row on, the run keeps rclone's code (1 or 6) and the counter is not reset, so
+a genuine persistent corruption stays red. The
 watcher reruns once 30 s after a 77 (`SyncWatchScheduler.sourceChangedExitCode`).
 The GUI treats 77 as idle on both completion paths (`processLogEvent`'s
 `.syncFailed` clears `profileErrors`; `readLastErrorFromLog` returns nil), with

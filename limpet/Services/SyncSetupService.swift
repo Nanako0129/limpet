@@ -834,8 +834,9 @@ final class SyncSetupService {
             # limpet-plan.md L9.1: a run that failed ONLY because files changed
             # while they were uploading (an experiment appending to a log) exits
             # 77, and the watcher reruns it 30 s later without the menu turning
-            # red. Capped at 20 in a row by a per-profile counter, so a genuine,
-            # persistent "corrupted on transfer" still surfaces as exit 1.
+            # red. Capped at 19 in a row by a per-profile counter: from the 20th
+            # on, the run keeps rclone's own code (1 or 6), so a genuine,
+            # persistent "corrupted on transfer" stays red.
             SOURCE_CHANGED_FILE="${CONFIG_FILE%.json}.source-changed"
             # rclone exits 1 for "corrupted on transfer" but 6 (NoLowLevelRetryError)
             # for "source file is being updated" (measured with 1.75.1, code review
@@ -850,8 +851,10 @@ final class SyncSetupService {
                     echo "$(date '+%Y-%m-%d %H:%M:%S') - Source changed during upload ($SOURCE_CHANGED_COUNT/20); retrying in 30 s" >> "$LOG_FILE"
                     EXIT_CODE=77
                 else
-                    rm -f "$SOURCE_CHANGED_FILE"
-                    echo "$(date '+%Y-%m-%d %H:%M:%S') - Files kept changing during upload for 20 runs" >> "$LOG_FILE"
+                    # Stays at 20+: every later run like this fails too, until
+                    # one ends any other way and the else branch below clears it.
+                    echo "$SOURCE_CHANGED_COUNT" > "$SOURCE_CHANGED_FILE"
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') - Files kept changing during upload for $SOURCE_CHANGED_COUNT runs in a row" >> "$LOG_FILE"
                 fi
             else
                 rm -f "$SOURCE_CHANGED_FILE"

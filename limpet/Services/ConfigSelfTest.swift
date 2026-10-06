@@ -6455,13 +6455,17 @@ enum ConfigSelfTest {
                 return report(id, slug, false, "(\(name): status \(r.status), counter \(counterNow ?? "none"))")
             }
         }
-        // The cap: 19 in a row already → the 20th exits 1 and resets; a success clears it.
+        // The cap: 19 in a row already → the 20th keeps rclone's code and the
+        // counter stays at 20+, so the 21st fails too (no reset to 1/20).
         // runScriptFixture wipes its directory, so preset the counter through the stub.
-        let preset19 = "echo 19 > \"\(counter)\"\n" + changed + "exit 1\n"
-        guard let capped = runScriptFixture(name: "ac-l91-a", overrides: [:], stubTail: preset19),
-              capped.status == 1, capped.log.contains("kept changing during upload for 20 runs"),
-              !FileManager.default.fileExists(atPath: counter) else {
-            return report(id, slug, false, "(20th consecutive source-changed run did not exit 1 and reset)")
+        for (preset, code) in [(19, 1), (20, 6)] {
+            let tail = "echo \(preset) > \"\(counter)\"\n" + changed + "exit \(code)\n"
+            guard let capped = runScriptFixture(name: "ac-l91-a", overrides: [:], stubTail: tail),
+                  capped.status == Int32(code), capped.log.contains("kept changing during upload for \(preset + 1) runs"),
+                  (try? String(contentsOfFile: counter, encoding: .utf8))?
+                    .trimmingCharacters(in: .whitespacesAndNewlines) == "\(preset + 1)" else {
+                return report(id, slug, false, "(run \(preset + 1) in a row did not keep exit \(code) and counter \(preset + 1))")
+            }
         }
         let presetThenOk = "echo 5 > \"\(counter)\"\nexit 0\n"
         guard let ok = runScriptFixture(name: "ac-l91-a", overrides: [:], stubTail: presetThenOk),
