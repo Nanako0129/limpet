@@ -267,6 +267,7 @@ final class ProfileStore: ObservableObject {
         if let removed {
             let path = "\(profilesDirectory)/\(removed.shortId).profile.json"
             try? FileManager.default.removeItem(atPath: path)
+            try? FileManager.default.removeItem(atPath: "\(profilesDirectory)/\(removed.shortId)-exclude.txt")
         }
     }
 

@@ -88,6 +88,7 @@ enum ConfigSelfTest {
             testSchemaInstalledAndReferenced,
             testIsolatedLaunchAtLogin,
             testDeleteDurable,
+            testUninstallKeepsExcludeFilter,
             testMigrationIntegrity,
             testExternalCreateEnabled,
             testExternalCreateDisabledNoInstall,
@@ -622,10 +623,16 @@ enum ConfigSelfTest {
             return report("AC-19", "delete-durable", false, "(profile file not written on add at \(path))")
         }
 
+        let filterPath = "\(dir)/\(profile.shortId)-exclude.txt"
+        try? "- build/**\n".write(toFile: filterPath, atomically: true, encoding: .utf8)
+
         store.delete(id: profile.id)
 
         guard !FileManager.default.fileExists(atPath: path) else {
             return report("AC-19", "delete-durable", false, "(profile file still present after delete)")
+        }
+        guard !FileManager.default.fileExists(atPath: filterPath) else {
+            return report("AC-19", "delete-durable", false, "(exclude filter left behind after delete)")
         }
 
         // A fresh store over the same directory must load nothing — proving the
@@ -639,6 +646,26 @@ enum ConfigSelfTest {
         }
 
         return report("AC-19", "delete-durable", true)
+    }
+
+    // MARK: - AC-19b — uninstall keeps the user-edited exclude filter
+
+    /// Every reinstall (a reinstall-triggering setting change, `limpet profile
+    /// set`) runs `uninstall` first; it used to delete `<shortId>-exclude.txt`,
+    /// so the install after it rewrote the defaults over the user's rules.
+    private static func testUninstallKeepsExcludeFilter() -> Bool {
+        let profile = sampleProfile(name: "Keeps Filter")
+        try? FileManager.default.createDirectory(atPath: SyncProfile.configDirectory, withIntermediateDirectories: true)
+        let edited = "- build/**\n"
+        try? edited.write(toFile: profile.filterFilePath, atomically: true, encoding: .utf8)
+        let violationsBefore = SelfTestGuard.violations.count
+        try? SyncSetupService.shared.uninstall(profile: profile)
+        // uninstall's own `launchctl unload` was refused and recorded; it is
+        // expected here, so drop it rather than fail the suite's final check.
+        SelfTestGuard.violations.removeSubrange(violationsBefore...)
+        let after = try? String(contentsOfFile: profile.filterFilePath, encoding: .utf8)
+        return report("AC-19b", "uninstall-keeps-exclude-filter", after == edited,
+                      "(exclude filter after uninstall: \(after.map { "\"\($0)\"" } ?? "missing"))")
     }
 
     // MARK: - AC-22 — migration integrity (files written == profiles in blob)

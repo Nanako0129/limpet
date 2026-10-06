@@ -272,9 +272,10 @@ final class SyncSetupService {
             try fm.removeItem(atPath: profile.configPath)
         }
 
-        if fm.fileExists(atPath: profile.filterFilePath) {
-            try fm.removeItem(atPath: profile.filterFilePath)
-        }
+        // The exclude filter is user-editable and survives uninstall: every
+        // reinstall (any reinstall-triggering setting change) goes through here,
+        // and deleting it reset hand edits to the defaults. Deleting the
+        // profile removes it (ProfileStore.delete, CLI `profile delete`).
 
         // The lock file belongs to the launchd-owned watcher, never the GUI
         // (limpet-plan.md L3(c)) — not touched here even on uninstall. The
