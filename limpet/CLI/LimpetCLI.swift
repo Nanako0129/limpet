@@ -747,13 +747,15 @@ enum LimpetCLI {
     /// Derive the last sync outcome from a log file's tail using the shared
     /// `SyncLogPatterns` — the SAME matchers `LogParser`/`SyncManager` use, so
     /// the CLI can never disagree with the app on what a log line means. Returns
-    /// `started` / `completed` / `failed` / `none`.
+    /// `started` / `completed` / `failed` / `retrying` (exit 77, limpet-plan.md
+    /// L9.1) / `none`.
     static func lastLogEvent(inFileAt path: String, read: (String) -> String?) -> String {
         guard let contents = read(path) else { return "none" }
         // Scan bottom-up for the most recent recognised lifecycle line.
         for line in contents.split(separator: "\n", omittingEmptySubsequences: true).reversed() {
             let message = String(line)
             if SyncLogPatterns.isSyncCompleted(message) { return "completed" }
+            if SyncLogPatterns.isSourceChangedRetry(message) { return "retrying" }
             if SyncLogPatterns.isSyncFailed(message) { return "failed" }
             if SyncLogPatterns.isSyncStarted(message) { return "started" }
         }

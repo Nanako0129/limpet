@@ -460,6 +460,20 @@ the prior generic "Exit code N"; 79 (the stalled-sync watchdog's code, see
 script exits before writing "Sync failed with exit code", so the GUI never
 sees that code — showing a refusal in the menu is open work.
 
+**Source changed mid-upload (limpet-plan.md L9.1).** A localToRemote run whose
+only error lines are rclone's `corrupted on transfer` / `source file is being
+updated` (a file appended while it uploaded; rclone's follow-up `Attempt N/M
+failed` and `not deleting ... IO errors` lines are ignored) exits 77 and logs
+`Source changed during upload (N/20); retrying in 30 s`. rclone 1.75.1
+exits 1 for the first and 6 for the second, so both codes qualify. The count lives in
+`profiles/{shortId}.source-changed` (removed by any other outcome); from the 20th
+in a row on, the run keeps rclone's code (1 or 6) and the counter is not reset, so
+a genuine persistent corruption stays red. The
+watcher reruns once 30 s after a 77 (`SyncWatchScheduler.sourceChangedExitCode`).
+The GUI treats 77 as idle on both completion paths (`processLogEvent`'s
+`.syncFailed` clears `profileErrors`; `readLastErrorFromLog` returns nil), with
+no notification. Self-tests AC-L91-A/B/C/C2.
+
 **GUI responsiveness, log rotation and the stalled-sync watchdog
 (limpet-plan.md L6.3, plan v1-v3).** Three defects found by reading the code
 (none is claimed to be THE cause of the multi-day menu freeze; the decisive

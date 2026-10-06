@@ -787,7 +787,12 @@ final class SyncSetupService {
                 echo "$(date '+%Y-%m-%d %H:%M:%S') - Refusing to sync: could not create a temporary file" >> "$LOG_FILE"
                 exit 1
             }
-            trap 'rm -f "$LOCK_FILE" "$RUN_MATCHES"' EXIT
+            RUN_ERRORS=$(mktemp "${TMPDIR:-/tmp}/limpet-err.XXXXXX") || {
+                rm -f "$RUN_MATCHES"
+                echo "$(date '+%Y-%m-%d %H:%M:%S') - Refusing to sync: could not create a temporary file" >> "$LOG_FILE"
+                exit 1
+            }
+            trap 'rm -f "$LOCK_FILE" "$RUN_MATCHES" "$RUN_ERRORS"' EXIT
 
             # Run sync command. awk passes every line on and copies matching ones
             # to RUN_MATCHES. It is a pipeline stage, not a process substitution:
@@ -795,7 +800,18 @@ final class SyncSetupService {
             # script could not wait for it. awk reads to the end (no early exit,
             # so no SIGPIPE for tee or rclone), and the pipeline has finished
             # before the check below.
-            "${cmd[@]}" 2>&1 | tee -a "$LOG_FILE" | awk -v m="$MAX_DELETE_MESSAGE" -v f="$RUN_MATCHES" 'index($0, m) { print > f } { print }'
+            # It also classifies this run's error/critical JSON lines into
+            # RUN_ERRORS (limpet-plan.md L9.1): C = the source changed under the
+            # upload (rclone verify()'s "corrupted on transfer", local backend's
+            # "source file is being updated"), nothing = rclone's own follow-up
+            # noise for such a run, R = any other error.
+            "${cmd[@]}" 2>&1 | tee -a "$LOG_FILE" | awk -v m="$MAX_DELETE_MESSAGE" -v f="$RUN_MATCHES" -v e="$RUN_ERRORS" -v le='"level":"error"' -v lc='"level":"critical"' '
+                index($0, m) { print > f }
+                index($0, le) || index($0, lc) {
+                    if (index($0, "corrupted on transfer") || index($0, "source file is being updated")) print "C" > e
+                    else if (!index($0, "not deleting files as there were IO errors") && !index($0, "not deleting directories as there were IO errors") && !(index($0, "Attempt ") && index($0, " failed with "))) print "R" > e
+                }
+                { print }'
 
             EXIT_CODE=${PIPESTATUS[0]}
 
@@ -813,6 +829,35 @@ final class SyncSetupService {
             if [[ $EXIT_CODE -eq 7 && -s "$RUN_MATCHES" ]]; then
                 echo "$(date '+%Y-%m-%d %H:%M:%S') - Delete limit reached: rclone stopped at --max-delete $MAX_DELETE; limpet will not sync this profile again until the limit is cleared (limpet profile clear-delete-limit, or the menu)" >> "$LOG_FILE"
                 EXIT_CODE=76
+            fi
+
+            # limpet-plan.md L9.1: a run that failed ONLY because files changed
+            # while they were uploading (an experiment appending to a log) exits
+            # 77, and the watcher reruns it 30 s later without the menu turning
+            # red. Capped at 19 in a row by a per-profile counter: from the 20th
+            # on, the run keeps rclone's own code (1 or 6), so a genuine,
+            # persistent "corrupted on transfer" stays red.
+            SOURCE_CHANGED_FILE="${CONFIG_FILE%.json}.source-changed"
+            # rclone exits 1 for "corrupted on transfer" but 6 (NoLowLevelRetryError)
+            # for "source file is being updated" (measured with 1.75.1, code review
+            # of PR #19), and a run with both ends with either.
+            if [[ ( $EXIT_CODE -eq 1 || $EXIT_CODE -eq 6 ) && "$SYNC_DIRECTION" == "localToRemote" ]] \
+                && grep -q '^C$' "$RUN_ERRORS" && ! grep -q '^R$' "$RUN_ERRORS"; then
+                SOURCE_CHANGED_COUNT=$(cat "$SOURCE_CHANGED_FILE" 2>/dev/null)
+                [[ "$SOURCE_CHANGED_COUNT" =~ ^[0-9]+$ ]] || SOURCE_CHANGED_COUNT=0
+                SOURCE_CHANGED_COUNT=$((SOURCE_CHANGED_COUNT + 1))
+                if [[ $SOURCE_CHANGED_COUNT -lt 20 ]]; then
+                    echo "$SOURCE_CHANGED_COUNT" > "$SOURCE_CHANGED_FILE"
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') - Source changed during upload ($SOURCE_CHANGED_COUNT/20); retrying in 30 s" >> "$LOG_FILE"
+                    EXIT_CODE=77
+                else
+                    # Stays at 20+: every later run like this fails too, until
+                    # one ends any other way and the else branch below clears it.
+                    echo "$SOURCE_CHANGED_COUNT" > "$SOURCE_CHANGED_FILE"
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') - Files kept changing during upload for $SOURCE_CHANGED_COUNT runs in a row" >> "$LOG_FILE"
+                fi
+            else
+                rm -f "$SOURCE_CHANGED_FILE"
             fi
 
             if [[ $EXIT_CODE -eq 0 ]]; then

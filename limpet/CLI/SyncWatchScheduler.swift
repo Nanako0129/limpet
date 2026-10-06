@@ -84,6 +84,7 @@ final class SyncWatchScheduler {
     private let runner: SchedulerRunner
     private let backoffInterval: TimeInterval
     private let missingSourceRecheckInterval: TimeInterval
+    private let sourceChangedRetryInterval: TimeInterval
     private var lastMissingSourceLogAt: TimeInterval?
     private var lastRefusalLogAt: TimeInterval?
     private var lastRunLogAt: TimeInterval?
@@ -93,15 +94,20 @@ final class SyncWatchScheduler {
 
     /// The sync script's exit code for "rclone stopped at --max-delete".
     static let deleteLimitExitCode: Int32 = 76
+    /// The sync script's exit code for "only failed because files changed
+    /// while uploading" (limpet-plan.md L9.1); the script caps it at 19 in a row.
+    static let sourceChangedExitCode: Int32 = 77
 
     init(
         runner: SchedulerRunner,
         backoffInterval: TimeInterval = 10,
-        missingSourceRecheckInterval: TimeInterval = 30
+        missingSourceRecheckInterval: TimeInterval = 30,
+        sourceChangedRetryInterval: TimeInterval = 30
     ) {
         self.runner = runner
         self.backoffInterval = backoffInterval
         self.missingSourceRecheckInterval = missingSourceRecheckInterval
+        self.sourceChangedRetryInterval = sourceChangedRetryInterval
     }
 
     /// Request a sync: from FSEvents (already debounced upstream by
@@ -161,6 +167,15 @@ final class SyncWatchScheduler {
             // Stop for good: a pending trigger is dropped, not rerun.
             if !runner.recordDeleteLimit() { deleteLimitUnrecorded = true }
             state = .idle
+            return
+        }
+        if code == Self.sourceChangedExitCode {
+            // One rerun after the interval; a trigger during the wait is
+            // covered by that run, which starts after it.
+            state = .backoff(pending: false)
+            runner.scheduleAfter(sourceChangedRetryInterval) { [weak self] in
+                self?.attemptRun(pending: false)
+            }
             return
         }
         if code == 75 {

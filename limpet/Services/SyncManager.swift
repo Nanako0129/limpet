@@ -725,6 +725,11 @@ final class SyncManager: ObservableObject {
 
             // Mark that we found the failure point
             if SyncLogPatterns.isSyncFailed(line) {
+                // limpet-plan.md L9.1: a source-changed run is retried by the
+                // watcher in 30 s; it is not an error to show.
+                if SyncLogPatterns.isSourceChangedRetry(line) {
+                    return nil
+                }
                 foundFailedMarker = true
                 continue
             }
@@ -834,6 +839,10 @@ final class SyncManager: ObservableObject {
            let error = Self.readLastErrorFromLog(profile.logPath) {
             profileStates[profileId] = .error("Sync failed")
             profileErrors[profileId] = error
+        } else if let profile = profileStore.profile(for: profileId),
+                  LimpetCLI.lastLogEvent(inFileAt: profile.logPath, read: { FileManager.default.contents(atPath: $0).flatMap { String(data: $0, encoding: .utf8) } }) == "retrying" {
+            // L9.1: a 77 run is waiting for its retry, not a completed sync.
+            profileStates[profileId] = .idle
         } else {
             profileStates[profileId] = .idle
             lastSyncTime = Date()
@@ -1064,6 +1073,9 @@ final class SyncManager: ObservableObject {
         switch exitCode {
         case 76:
             return "Delete limit reached"
+        case 77:
+            // L9.1: normally never shown (77 goes idle); defensive text.
+            return "Retrying: files changed during upload"
         case 79:
             // L6.3 watchdog: `SyncWatchDaemon` stopped a run with no log output
             // for 30 min and wrote `Sync failed with exit code 79`. (78 is
@@ -1167,6 +1179,17 @@ final class SyncManager: ObservableObject {
             currentSyncChanges[profileId] = nil
 
         case .syncFailed(let exitCode, let message):
+            // limpet-plan.md L9.1: files changed while uploading; the watcher
+            // reruns in 30 s. Drop the run's "corrupted on transfer" lines too.
+            if exitCode == Int(SyncWatchScheduler.sourceChangedExitCode) {
+                profileProgress[profileId] = nil
+                profileErrors[profileId] = nil
+                lastSeenErrorMessage[profileId] = nil
+                logWatchers[profileId]?.setActivelySyncing(false)
+                currentSyncChanges[profileId] = nil
+                profileStates[profileId] = .idle
+                break
+            }
             // Check if the error message (or the last seen error) is a transient one
             let errorToCheck = message ?? lastSeenErrorMessage[profileId]
             if let msg = errorToCheck, SyncLogPatterns.isTransientAllFilesChangedError(msg) {
