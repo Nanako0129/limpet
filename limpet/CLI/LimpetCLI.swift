@@ -1519,6 +1519,7 @@ extension CLIEnvironment {
             deleteProfileFile: { profile in
                 let path = "\(SyncProfile.configDirectory)/\(profile.shortId).profile.json"
                 try? FileManager.default.removeItem(atPath: path)
+                try? FileManager.default.removeItem(atPath: profile.filterFilePath)
             },
             removeFile: { (try? FileManager.default.removeItem(atPath: $0)) != nil },
             moveFile: { from, to, replace in

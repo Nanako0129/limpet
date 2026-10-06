@@ -1113,7 +1113,7 @@ self-hosted runner to the release workflow.
 | Path | Purpose |
 |------|---------|
 | `~/.config/limpet/profiles/{shortId}.json` | Profile config |
-| `~/.config/limpet/profiles/{shortId}-exclude.txt` | Exclude filter (user-editable) |
+| `~/.config/limpet/profiles/{shortId}-exclude.txt` | Exclude filter (user-editable; kept across uninstall/reinstall, removed only when the profile is deleted) |
 | `~/.local/bin/limpet-sync.sh` | Shared sync script (all profiles) |
 | `~/Library/LaunchAgents/com.nanako.limpet.watch.{shortId}.plist` | launchd schedule |
 | `~/.local/log/limpet-sync-{shortId}.log` | Sync logs |
