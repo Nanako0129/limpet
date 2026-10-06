@@ -6430,10 +6430,13 @@ enum ConfigSelfTest {
         let changed = "echo '\(sourceChangedLine)' >&2\n"
         let attempt = #"echo '{"level":"error","msg":"Attempt 3/3 failed with 1 errors and: corrupted on transfer: md5 hashes differ"}' >&2"# + "\n"
         let other = #"echo '{"level":"error","msg":"Failed to copy: permission denied","object":"x"}' >&2"# + "\n"
+        // An ordinary info line too: every real run has them, and a broken
+        // level match once counted them as real errors (code review, PR #19).
+        let info = #"echo '{"level":"info","msg":"Copied (new)","object":"a.txt"}' >&2"# + "\n"
         let counter = "\(selfTestRoot)/ac-l91-a/profile.source-changed"
         // (name, stub tail, overrides, preset counter, expected status, expected counter after)
         let cases: [(String, String, [String: Any], String?, Int32, String?)] = [
-            ("ac-l91-a", changed + attempt + "exit 1\n", [:], nil, 77, "1"),
+            ("ac-l91-a", info + changed + attempt + "exit 1\n", [:], nil, 77, "1"),
             ("ac-l91-b", changed + other + "exit 1\n", [:], nil, 1, nil),
             ("ac-l91-c", other + "exit 1\n", [:], nil, 1, nil),
             ("ac-l91-d", changed + "exit 1\n", ["syncDirection": "remoteToLocal"], nil, 1, nil),
@@ -6507,7 +6510,12 @@ enum ConfigSelfTest {
             return SyncManager.readLastErrorFromLog(log)
         }
         let on77 = lastError(exitCode: 77), on1 = lastError(exitCode: 1)
-        return report(id, slug, on77 == nil && on1 != nil, "(77 → \(on77 ?? "nil"), 1 → \(on1 ?? "nil"))")
+        // `limpet status` agrees with the GUI.
+        let read: (String) -> String? = { try? String(contentsOfFile: $0, encoding: .utf8) }
+        let status77 = LimpetCLI.lastLogEvent(inFileAt: "\(dir)/77.log", read: read)
+        let status1 = LimpetCLI.lastLogEvent(inFileAt: "\(dir)/1.log", read: read)
+        return report(id, slug, on77 == nil && on1 != nil && status77 == "retrying" && status1 == "failed",
+                      "(77 → \(on77 ?? "nil") / \(status77), 1 → \(on1 ?? "nil") / \(status1))")
     }
 
     private static func testSourceChangedManagerIdle() -> Bool {

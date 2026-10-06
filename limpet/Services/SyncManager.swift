@@ -727,7 +727,7 @@ final class SyncManager: ObservableObject {
             if SyncLogPatterns.isSyncFailed(line) {
                 // limpet-plan.md L9.1: a source-changed run is retried by the
                 // watcher in 30 s; it is not an error to show.
-                if SyncLogPatterns.extractExitCode(from: line) == Int(SyncWatchScheduler.sourceChangedExitCode) {
+                if SyncLogPatterns.isSourceChangedRetry(line) {
                     return nil
                 }
                 foundFailedMarker = true
@@ -839,6 +839,10 @@ final class SyncManager: ObservableObject {
            let error = Self.readLastErrorFromLog(profile.logPath) {
             profileStates[profileId] = .error("Sync failed")
             profileErrors[profileId] = error
+        } else if let profile = profileStore.profile(for: profileId),
+                  LimpetCLI.lastLogEvent(inFileAt: profile.logPath, read: { FileManager.default.contents(atPath: $0).flatMap { String(data: $0, encoding: .utf8) } }) == "retrying" {
+            // L9.1: a 77 run is waiting for its retry, not a completed sync.
+            profileStates[profileId] = .idle
         } else {
             profileStates[profileId] = .idle
             lastSyncTime = Date()

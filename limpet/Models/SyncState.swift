@@ -358,6 +358,12 @@ enum SyncLogPatterns {
     /// rclone aborts a sync that looks like it would change every file (e.g. a
     /// clock/timezone shift making every mtime appear different) rather than
     /// risk a mass unwanted overwrite; this resolves on the next sync.
+    /// limpet-plan.md L9.1: the script's `Sync failed with exit code 77` line —
+    /// a run the watcher retries in 30 s because files changed mid-upload.
+    static func isSourceChangedRetry(_ line: String) -> Bool {
+        isSyncFailed(line) && extractExitCode(from: line) == Int(SyncWatchScheduler.sourceChangedExitCode)
+    }
+
     static func isTransientAllFilesChangedError(_ message: String) -> Bool {
         message.contains("all files were changed") || message.contains("Safety abort")
     }

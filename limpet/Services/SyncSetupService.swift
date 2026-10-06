@@ -805,9 +805,9 @@ final class SyncSetupService {
             # upload (rclone verify()'s "corrupted on transfer", local backend's
             # "source file is being updated"), nothing = rclone's own follow-up
             # noise for such a run, R = any other error.
-            "${cmd[@]}" 2>&1 | tee -a "$LOG_FILE" | awk -v m="$MAX_DELETE_MESSAGE" -v f="$RUN_MATCHES" -v e="$RUN_ERRORS" '
+            "${cmd[@]}" 2>&1 | tee -a "$LOG_FILE" | awk -v m="$MAX_DELETE_MESSAGE" -v f="$RUN_MATCHES" -v e="$RUN_ERRORS" -v le='"level":"error"' -v lc='"level":"critical"' '
                 index($0, m) { print > f }
-                index($0, "\"level\":\"error\"") || index($0, "\"level\":\"critical\"") {
+                index($0, le) || index($0, lc) {
                     if (index($0, "corrupted on transfer") || index($0, "source file is being updated")) print "C" > e
                     else if (!index($0, "not deleting files as there were IO errors") && !index($0, "not deleting directories as there were IO errors") && !(index($0, "Attempt ") && index($0, " failed with "))) print "R" > e
                 }
