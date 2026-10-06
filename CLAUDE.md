@@ -688,7 +688,7 @@ is the separate, fail-closed schema-drift gate.
 ### Versioning, Sparkle updates and the watcher self-restart (limpet-plan.md L7.1)
 
 **Version wiring.** `Info.plist` carries `CFBundleShortVersionString = $(MARKETING_VERSION)` and
-`CFBundleVersion = $(CURRENT_PROJECT_VERSION)`. `project.pbxproj` sets `MARKETING_VERSION = 1.0.0`
+`CFBundleVersion = $(CURRENT_PROJECT_VERSION)`. `project.pbxproj` sets `MARKETING_VERSION = 1.0.1`
 (Debug and Release) and leaves `CURRENT_PROJECT_VERSION = 1` locally; CI overrides it in L7.2 (commit count).
 
 **Sparkle (SwiftPM, `upToNextMajor` from 2.9.0, pinned in the committed
@@ -791,7 +791,7 @@ isn't limpet's own.
 | Command | Purpose |
 |---------|---------|
 | `limpet doctor` | Health report: rclone found + version, config schemas installed, per-profile derived-config presence, a stale installed `maxDelete` (warn), launchd agent loaded (enabled profiles), stale lock files, remote reachability (a keychain-backed remote reads its secret without ever prompting), B2 bucket without a `daysFromHidingToDeleting` rule (warn). Exits non-zero iff any check is `[fail]`; `[warn]` never fails the run. |
-| `limpet status [name\|shortId]` | One tab-separated line per profile (or a single one): `enabled=`, `agent=loaded\|unloaded\|n/a`, `running=` (lock present), `last=started\|completed\|failed\|none` (from the log tail via the shared `SyncLogPatterns`). |
+| `limpet status [name\|shortId]` | One tab-separated line per profile (or a single one): `enabled=`, `agent=loaded\|unloaded\|n/a`, `running=` (lock present), `last=started\|completed\|failed\|retrying\|none` (from the log tail via the shared `SyncLogPatterns`). |
 | `limpet profiles` | List every profile: name, shortId, mode, `enabled=`, `remote=` — no secrets. (`profile list` is an alias.) |
 | `limpet profile show <name\|shortId>` | Print one profile's FULL config as pretty, sorted-key JSON — the same shape as its `.profile.json`, so an agent can `show` → edit → `profile create`/`profile set` round-trip. No secrets (credentials live in `rclone.conf` or the login keychain). |
 | `limpet logs <name\|shortId> [--follow]` | Print (or `tail -F`, which follows the name across rotation) that profile's sync log. |
