@@ -192,6 +192,10 @@ enum ConfigSelfTest {
             testDirtySetObjectErrors,
             testExcludeOracleRefusals,
             testDirtySetRoundThree,
+            testIncrementalProfileAndEligibility,
+            testBatchScriptMode,
+            testBatchFilterFile,
+            testRunClassifier,
             testLogWatcherSplitMultibyteLine,
             testStalledLineIsAFailureMarker,
             testStalledSyncWatchdogEndToEnd,
@@ -2091,7 +2095,8 @@ enum ConfigSelfTest {
     /// not be set up; otherwise the script's exit status, whether the stub ran, and
     /// the profile log text.
     private static func runScriptFixture(
-        name: String, overrides: [String: Any], stubTail: String = "exit 0\n", extraEnvironment: [String: String] = [:]
+        name: String, overrides: [String: Any], stubTail: String = "exit 0\n", extraEnvironment: [String: String] = [:],
+        extraArgs: [String] = []
     ) -> (status: Int32, stubRan: Bool, log: String, argv: [String])? {
         let fm = FileManager.default
         let root = (selfTestRoot as NSString).appendingPathComponent(name)
@@ -2130,7 +2135,7 @@ enum ConfigSelfTest {
         }
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/bash")
-        process.arguments = [scriptPath, configPath]
+        process.arguments = [scriptPath, configPath] + extraArgs
         var env = ProcessInfo.processInfo.environment
         env["RCLONE_BIN"] = stubPath
         env.merge(extraEnvironment) { _, new in new }
@@ -7110,6 +7115,127 @@ enum ConfigSelfTest {
               ExcludeOracle(dump: reWrapped(#"- (^|/)\w+\.log$"#)) == nil, ExcludeOracle(dump: reWrapped("- (?i)(^|/)STRASSE\\.txt$")) == nil,
               ExcludeOracle(dump: reWrapped(#"- (^|/)a\.b\$\(c\)$"#)) != nil else {
             return report(id, slug, false, "(RE2/ICU-divergent syntax not refused, or a plain -- refused)")
+        }
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L92-S2a — batch mode building blocks (limpet-plan.md L9.2 S2)
+
+    private static func testIncrementalProfileAndEligibility() -> Bool {
+        let id = "AC-L92-S2a1", slug = "incremental-field-and-eligibility"
+        // Absent key decodes to false; the field round-trips; a change reinstalls.
+        let minimal = #"{"id":"6C2D3F9A-1111-4E2B-9C1D-2A3B4C5D6E7F","name":"m","rcloneRemote":"r","remotePath":"b/p","localSyncPath":"/tmp/x"}"#
+        guard let decoded = try? JSONDecoder().decode(SyncProfile.self, from: Data(minimal.utf8)), !decoded.incrementalSync else {
+            return report(id, slug, false, "(a profile without incrementalSync did not decode to false)")
+        }
+        var on = sampleProfile()
+        on.isEnabled = true
+        on.incrementalSync = true
+        guard let data = try? JSONEncoder().encode(on), let back = try? JSONDecoder().decode(SyncProfile.self, from: data), back.incrementalSync else {
+            return report(id, slug, false, "(incrementalSync did not round-trip)")
+        }
+        var off = on
+        off.incrementalSync = false
+        guard SyncManager.reconcileAction(from: off, to: on) == .reinstall else {
+            return report(id, slug, false, "(toggling incrementalSync does not reinstall the watcher)")
+        }
+        var p = sampleProfile()
+        guard LimpetCLI.applyProfileAssignment(&p, key: "incrementalSync", value: "true") == nil, p.incrementalSync,
+              LimpetCLI.applyProfileAssignment(&p, key: "incrementalSync", value: "yes please") != nil else {
+            return report(id, slug, false, "(profile set incrementalSync)")
+        }
+        // Eligibility matrix.
+        func reason(_ flags: String, direction: SyncDirection = .localToRemote, enabled: Bool = true) -> String? {
+            var q = sampleProfile()
+            q.incrementalSync = enabled
+            q.syncDirection = direction
+            q.additionalRcloneFlags = flags
+            return q.incrementalIneligibility
+        }
+        let eligible = ["", "--s3-no-head --update", "--exclude=build/** --fast-list", "--delete-excluded=false", "--files-from-x"]
+        let ineligible = ["--include=*.txt", "--include-from=f", "--filter=+_x", "-f", "-f+x", "--filter-from=f",
+                          "--files-from=f", "--files-from-raw=f", "--delete-excluded", "--delete-excluded=true",
+                          "--delete_excluded", "--include_from=f"]
+        for f in eligible where reason(f) != nil { return report(id, slug, false, "(\(f) refused: \(reason(f)!))") }
+        for f in ineligible where reason(f) == nil { return report(id, slug, false, "(\(f) accepted)") }
+        guard reason("", enabled: false) != nil, reason("", direction: .remoteToLocal) != nil else {
+            return report(id, slug, false, "(off or remoteToLocal accepted)")
+        }
+        return report(id, slug, true)
+    }
+
+    private static func testBatchScriptMode() -> Bool {
+        let id = "AC-L92-S2a2", slug = "batch-script-argv"
+        let dirty = "\(selfTestRoot)/ac-l92-s2a2.filter"
+        try? "+ /a.txt\n- **\n".write(toFile: dirty, atomically: true, encoding: .utf8)
+        guard let batch = runScriptFixture(name: "ac-l92-s2a2", overrides: ["additionalFlags": "--fast-list --s3-no-head --fast-list=true"],
+                                           extraEnvironment: ["LIMPET_BATCH_ITEMS": "3"], extraArgs: [dirty]),
+              let full = runScriptFixture(name: "ac-l92-s2a2-full", overrides: ["additionalFlags": "--s3-no-head"]) else {
+            return report(id, slug, false, "(fixture setup failed)")
+        }
+        let a = batch.argv
+        let filterFroms = a.indices.filter { a[$0] == "--filter-from" && $0 + 1 < a.count }.map { a[$0 + 1] }
+        guard batch.status == 0, filterFroms.count == 2, filterFroms[0].hasSuffix("exclude.txt"), filterFroms[1] == dirty,
+              !a.contains(where: { $0.hasPrefix("--fast-list") }), a.contains("--s3-no-head"),
+              let t = a.firstIndex(of: "--tpslimit"), a.indices.contains(t + 1), a[t + 1] == "4",
+              batch.log.contains("Starting sync (local → remote, 3 changed paths)") else {
+            return report(id, slug, false, "(batch argv/log wrong: \(a))")
+        }
+        guard full.argv.contains("--fast-list"), !full.argv.contains("--tpslimit"),
+              full.argv.filter({ $0 == "--filter-from" }).count == 1 else {
+            return report(id, slug, false, "(full run changed: \(full.argv))")
+        }
+        guard let reverse = runScriptFixture(name: "ac-l92-s2a2-rev", overrides: ["syncDirection": "remoteToLocal"], extraArgs: [dirty]),
+              let missing = runScriptFixture(name: "ac-l92-s2a2-miss", overrides: [:], extraArgs: ["\(selfTestRoot)/no-such.filter"]),
+              reverse.status == 64, !reverse.stubRan, missing.status == 64, !missing.stubRan else {
+            return report(id, slug, false, "(a remoteToLocal or unreadable batch was not refused)")
+        }
+        return report(id, slug, true)
+    }
+
+    private static func testBatchFilterFile() -> Bool {
+        let id = "AC-L92-S2a3", slug = "batch-filter-file"
+        let items = [
+            DirtySet.BatchItem(path: "a/b.txt", subtree: false, generation: 0),
+            DirtySet.BatchItem(path: "dir", subtree: true, generation: 0),
+            DirtySet.BatchItem(path: "old.txt", subtree: false, generation: 0),
+            DirtySet.BatchItem(path: "x/star*[a]{b}?\\.txt", subtree: false, generation: 0),
+            DirtySet.BatchItem(path: "x/trail \u{A0}", subtree: false, generation: 0),
+            DirtySet.BatchItem(path: "y/line\nbreak/f", subtree: false, generation: 0),
+        ]
+        let text = DirtySet.filterRules(for: items, exists: { $0 != "old.txt" })
+        let expected = [
+            "+ /a/b.txt", "+ /a/b.txt.rclonelink",
+            "+ /dir", "+ /dir.rclonelink", "+ /dir/**",
+            "+ /old.txt", "+ /old.txt.rclonelink", "+ /old.txt/**",
+            #"+ /x/star\*\[a\]\{b\}\?\\.txt"#, #"+ /x/star\*\[a\]\{b\}\?\\.txt.rclonelink"#,
+            "+ /x/trail[ ][\u{A0}]", "+ /x/trail \u{A0}.rclonelink",
+            "+ /y", "+ /y.rclonelink", "+ /y/**",
+            "- **",
+        ].joined(separator: "\n") + "\n"
+        return report(id, slug, text == expected, "(got:\n\(text))")
+    }
+
+    private static func testRunClassifier() -> Bool {
+        let id = "AC-L92-S2a4", slug = "run-classifier"
+        // Line shapes from the live side-project log (rclone 1.75.1), 2026-10-10.
+        let objectError = #"{"time":"2026-10-06T22:58:40+08:00","level":"error","msg":"corrupted on transfer: md5 hashes differ","object":"shanjie-s5p/r.jsonl","objectType":"*s3.Object","source":"operations/copy.go:296"}"#
+        let notDeleting = #"{"time":"2026-10-06T22:58:42+08:00","level":"error","msg":"not deleting files as there were IO errors","object":"S3 bucket nanako-mirror path side-project","objectType":"*s3.Fs","source":"sync/sync.go:994"}"#
+        let attempt = #"{"time":"2026-10-06T22:58:42+08:00","level":"error","msg":"Attempt 3/3 failed with 1 errors and: corrupted on transfer","source":"cmd/cmd.go:283"}"#
+        let succeeded = #"{"time":"2026-10-06T22:57:03+08:00","level":"error","msg":"Attempt 2/3 succeeded","source":"cmd/cmd.go:263"}"#
+        let other = #"{"time":"2026-10-06T22:58:42+08:00","level":"error","msg":"error reading destination directory: EOF","source":"sync/sync.go:100"}"#
+        let info = #"{"time":"2026-10-06T22:58:00+08:00","level":"info","msg":"Copied (new)","object":"a.txt","objectType":"*local.Object"}"#
+        let log = [info, objectError, attempt, notDeleting, succeeded, "2026-10-06 22:58:42 - Sync failed with exit code 1"].joined(separator: "\n")
+        let cases: [(Int32, String, RunOutcome)] = [
+            (0, log, .success),
+            (1, log, .objectErrors(failedPaths: ["shanjie-s5p/r.jsonl"], deletesSkipped: true)),
+            (6, [objectError, attempt].joined(separator: "\n"), .objectErrors(failedPaths: ["shanjie-s5p/r.jsonl"], deletesSkipped: false)),
+            (1, [objectError, other].joined(separator: "\n"), .runFailed),
+            (1, [attempt, notDeleting].joined(separator: "\n"), .runFailed),
+            (7, log, .runFailed), (77, log, .runFailed), (75, "", .runFailed),
+        ]
+        for (code, text, expected) in cases where RunOutcome.classify(exitCode: code, runLog: text) != expected {
+            return report(id, slug, false, "(exit \(code): \(RunOutcome.classify(exitCode: code, runLog: text)), expected \(expected))")
         }
         return report(id, slug, true)
     }

@@ -190,7 +190,7 @@ enum LimpetCLI {
     profile set keys: name, rcloneRemote, remotePath, localSyncPath,
       drivePathToMonitor, additionalRcloneFlags,
       syncDirection (localToRemote|remoteToLocal), syncIntervalMinutes,
-      transfers, isMuted, maxDelete, remoteVersioning, trashDays.
+      transfers, isMuted, maxDelete, remoteVersioning, trashDays, incrementalSync.
       Use enable/disable for isEnabled.
 
     trash list/restore work on any profile whose remotePath has a parent
@@ -1118,6 +1118,9 @@ enum LimpetCLI {
         case "remoteVersioning":
             guard let b = bool(value) else { return "remoteVersioning must be true or false" }
             profile.remoteVersioning = b
+        case "incrementalSync":
+            guard let b = bool(value) else { return "incrementalSync must be true or false" }
+            profile.incrementalSync = b
 
         // Bools.
         case "isMuted":

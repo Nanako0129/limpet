@@ -475,6 +475,28 @@ The GUI treats 77 as idle on both completion paths (`processLogEvent`'s
 `.syncFailed` clears `profileErrors`; `readLastErrorFromLog` returns nil), with
 no notification. Self-tests AC-L91-A/B/C/C2.
 
+**Incremental sync, batch mode (limpet-plan.md L9.2 S2a; not wired to the watcher
+yet).** Profile field `incrementalSync` (default false; `profile set`, schema,
+reinstall trigger). `SyncProfile.incrementalIneligibility` keeps a profile on full
+syncs when it is off, not localToRemote, or `additionalRcloneFlags` holds
+`--include`, `--include-from`, `--filter`/`-f`, `--filter-from`, `--files-from`,
+`--files-from-raw` or `--delete-excluded` (any form but `=false`; `_` read as `-`).
+The generated script runs a batch when given a second argument, a filter file:
+it refuses (exit 64) a batch for remoteToLocal or an unreadable file, logs
+`Starting sync (local → remote, N changed paths)` (N from `LIMPET_BATCH_ITEMS`),
+and runs `rclone sync` with `--filter-from <profile exclude file> --filter-from
+<batch file>`, `--tpslimit 4`, and no `--fast-list` (also removed from
+additionalFlags: with it rclone walks the whole remote prefix and ignores
+directory filters). Exit-code mapping (76, 77) is unchanged.
+`DirtySet.filterRules(for:exists:)` writes the batch file (`+ /p`,
+`+ /p.rclonelink`, `+ /p/**` for a subtree or gone path, then `- **`; glob
+metacharacters escaped, trailing whitespace bracketed because rclone TrimSpaces
+filter lines, a path with a line break replaced by its nearest clean ancestor as
+a subtree). `RunOutcome.classify(exitCode:runLog:)` turns a run's exit code and
+its own log lines into `.success` / `.objectErrors` / `.runFailed`. Verified end
+to end with real rclone 1.75.1 local→local (excluded, unlisted, deleted, new and
+symlink paths). Self-tests AC-L92-S2a1–4.
+
 **GUI responsiveness, log rotation and the stalled-sync watchdog
 (limpet-plan.md L6.3, plan v1-v3).** Three defects found by reading the code
 (none is claimed to be THE cause of the multi-day menu freeze; the decisive

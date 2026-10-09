@@ -54,6 +54,10 @@ struct SyncProfile: Identifiable, Codable, Equatable {
     /// keeps no deleted versions, and `remotePath` has a parent — resolved
     /// once, in `SyncSetupService.generateProfileConfig`/`trashRoot(for:remoteSection:)`.
     var trashDays: Int
+    /// limpet-plan.md L9.2: sync only the paths FSEvents reported (batches),
+    /// with a full run as the safety net, instead of a full diff per change.
+    /// Default false; see `incrementalIneligibility`.
+    var incrementalSync: Bool
 
     /// Short ID for file naming (first 8 chars of UUID)
     var shortId: String {
@@ -236,7 +240,8 @@ struct SyncProfile: Identifiable, Codable, Equatable {
         transfers: Int = 16,
         maxDelete: Int = 100,
         remoteVersioning: Bool = false,
-        trashDays: Int = 14
+        trashDays: Int = 14,
+        incrementalSync: Bool = false
     ) {
         self.id = id
         self.name = name
@@ -253,6 +258,29 @@ struct SyncProfile: Identifiable, Codable, Equatable {
         self.maxDelete = maxDelete
         self.remoteVersioning = remoteVersioning
         self.trashDays = trashDays
+        self.incrementalSync = incrementalSync
+    }
+
+    /// Why this profile must use full syncs although `incrementalSync` is on,
+    /// or nil when batches may run (limpet-plan.md L9.2 S2). A batch adds its
+    /// own `--filter-from` after the profile's rules and ends in `- **`, so a
+    /// flag that adds include rules, replaces filtering with a file list, or
+    /// deletes excluded files would widen or break the batch. The profile's
+    /// exclude file is checked separately (its rclone dump must hold no `+`
+    /// rule), because that needs rclone.
+    var incrementalIneligibility: String? {
+        guard incrementalSync else { return "incrementalSync is off" }
+        guard syncDirection == .localToRemote else { return "incremental sync needs localToRemote" }
+        let refused: Set<String> = ["--include", "--include-from", "--filter", "-f", "--filter-from",
+                                    "--files-from", "--files-from-raw", "--delete-excluded"]
+        for token in additionalRcloneFlags.split(whereSeparator: \.isWhitespace).map(String.init) {
+            let name = String(token.split(separator: "=", maxSplits: 1).first ?? "").replacingOccurrences(of: "_", with: "-")
+            let short = token.hasPrefix("-f") && !token.hasPrefix("--") && token.count > 1 ? "-f" : name
+            guard refused.contains(name) || refused.contains(short) else { continue }
+            if name == "--delete-excluded", token.hasSuffix("=false") { continue }
+            return "additionalRcloneFlags \(token) changes what a batch would sync"
+        }
+        return nil
     }
 
     /// Create a new profile with default values
@@ -268,7 +296,7 @@ extension SyncProfile {
         case id, name, rcloneRemote, remotePath, localSyncPath
         case drivePathToMonitor, syncIntervalMinutes, additionalRcloneFlags
         case isEnabled, isMuted, syncDirection, transfers
-        case maxDelete, remoteVersioning, trashDays
+        case maxDelete, remoteVersioning, trashDays, incrementalSync
     }
 
     init(from decoder: Decoder) throws {
@@ -297,6 +325,7 @@ extension SyncProfile {
         // Backwards compatibility: default 14 (limpet-plan.md L6.2), matching
         // the memberwise-init default so an app-written file round-trips.
         trashDays = try container.decodeIfPresent(Int.self, forKey: .trashDays) ?? 14
+        incrementalSync = try container.decodeIfPresent(Bool.self, forKey: .incrementalSync) ?? false
 
         // F4: a refused value never becomes a SyncProfile, so it can never be
         // written back out, installed, or run by a watcher.

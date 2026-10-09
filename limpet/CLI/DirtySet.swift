@@ -531,3 +531,95 @@ struct DirtySet {
 
     mutating func clearGaveUp() { gaveUp.removeAll() }
 }
+
+// MARK: - Batch filter file and run classification (limpet-plan.md L9.2 S2)
+
+extension DirtySet {
+    /// One rclone glob that matches `path` literally: `\` before each glob
+    /// metacharacter (fs/filter/glob.go), and trailing whitespace written as a
+    /// bracket expression, because rclone trims each filter-file line with Go's
+    /// strings.TrimSpace (fs/filter/rules.go) — which also takes U+0085,
+    /// U+00A0 and the Unicode space separators. Works on scalars, so a
+    /// combining mark cannot hide a metacharacter.
+    static func globEscaped(_ path: String) -> String {
+        var scalars = Array(path.unicodeScalars)
+        var trailing: [Unicode.Scalar] = []
+        while let last = scalars.last, last.properties.isWhitespace {
+            trailing.insert(scalars.removeLast(), at: 0)
+        }
+        var out = ""
+        for scalar in scalars {
+            if "\\*?[]{}".unicodeScalars.contains(scalar) { out.unicodeScalars.append("\\") }
+            out.unicodeScalars.append(scalar)
+        }
+        for scalar in trailing {
+            out += "["
+            out.unicodeScalars.append(scalar)
+            out += "]"
+        }
+        return out
+    }
+
+    /// The batch's filter file, read by rclone after the profile's rules:
+    /// `+ /p` and `+ /p.rclonelink` (a symlink under `--links`) for every item,
+    /// `+ /p/**` too for a subtree entry or a path that is gone (lstat), and a
+    /// final `- **`. A path holding a line break cannot be written on one line,
+    /// so its nearest ancestor without one is synced as a subtree instead.
+    static func filterRules(for batch: [BatchItem], exists: (String) -> Bool) -> String {
+        var lines: [String] = []
+        for item in batch {
+            var path = item.path
+            var subtree = item.subtree || !exists(item.path)
+            while path.unicodeScalars.contains(where: { $0 == "\n" || $0 == "\r" }) {
+                path = parent(of: path)
+                subtree = true
+            }
+            if path.isEmpty {
+                lines.append("+ /**")
+                continue
+            }
+            let glob = "/" + globEscaped(path)
+            lines.append("+ " + glob)
+            lines.append("+ /" + globEscaped(path + ".rclonelink"))
+            if subtree { lines.append("+ /" + globEscaped(path) + "/**") }
+        }
+        lines.append("- **")
+        return lines.joined(separator: "\n") + "\n"
+    }
+}
+
+extension RunOutcome {
+    /// What a finished run did, from its exit code and its own part of the
+    /// profile log (rclone 1.75.1 `--use-json-log` lines). Exit 0 is success.
+    /// Exit 1 or 6 whose error/critical lines are all per-object failures
+    /// (`objectType` ending `.Object`) or rclone's own follow-ups (`Attempt …`
+    /// with no object; `not deleting files|directories as there were IO
+    /// errors`, which sets `deletesSkipped`) is `.objectErrors`. Everything
+    /// else — any other code (75/76/77/78/79 …), any other error line, or no
+    /// named object at all — is `.runFailed`.
+    static func classify(exitCode: Int32, runLog: String) -> RunOutcome {
+        if exitCode == 0 { return .success }
+        guard exitCode == 1 || exitCode == 6 else { return .runFailed }
+        var failed: Set<String> = []
+        var deletesSkipped = false
+        for line in runLog.split(separator: "\n") where line.hasPrefix("{") {
+            guard let json = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+                  let level = json["level"] as? String, level == "error" || level == "critical" else { continue }
+            let message = json["msg"] as? String ?? ""
+            let type = json["objectType"] as? String ?? ""
+            let object = json["object"] as? String
+            if type.hasSuffix(".Object"), let object, !object.isEmpty {
+                failed.insert(object)
+            } else if type.hasSuffix(".Fs"),
+                      message.hasPrefix("not deleting files as there were IO errors")
+                        || message.hasPrefix("not deleting directories as there were IO errors") {
+                deletesSkipped = true
+            } else if object == nil, message.hasPrefix("Attempt ") {
+                continue
+            } else {
+                return .runFailed
+            }
+        }
+        return failed.isEmpty ? .runFailed : .objectErrors(failedPaths: failed, deletesSkipped: deletesSkipped)
+    }
+}
