@@ -79,7 +79,7 @@
     },
     "incrementalSync": {
       "type": "boolean",
-      "description": "Sync only the paths macOS reported as changed (in batches), with a periodic full sync as the safety net, instead of a full comparison per change. localToRemote only; ignored (full syncs) when additionalRcloneFlags (or its RCLONE_* environment variable) has a flag that changes what a batch would sync (SyncProfile.batchRefusedFlags: include/filter/files-from rules, --delete-excluded, --min-age/--max-age, --hash-filter, --exclude-if-present, --local-encoding, --local-unicode-normalization, --error-on-no-transfer, log flags), or the exclude file has a + rule. Default false."
+      "description": "Sync only the paths macOS reported as changed (in batches), with a periodic full sync as the safety net, instead of a full comparison per change. localToRemote only; ignored (full syncs) when additionalRcloneFlags (or its RCLONE_* environment variable) has a flag that changes what a batch would sync (SyncProfile.batchRefusedFlags: include/filter/files-from rules, --delete-excluded, --min-age/--max-age, --hash-filter, --exclude-if-present, --local-encoding, --local-unicode-normalization, --error-on-no-transfer, log flags), RCLONE_CONFIG_LOCAL_ENCODING or RCLONE_CONFIG_LOCAL_UNICODE_NORMALIZATION is set, or the exclude file has a + rule. A batch is also refused (and a full run takes its place) when rclone.conf's [local] section sets encoding or unicode_normalization, or rclone cannot show that section. Default false."
     }
   },
   "required": [

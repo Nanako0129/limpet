@@ -496,7 +496,8 @@ also lists `RCLONE_CONFIG_LOCAL_ENCODING` / `_UNICODE_NORMALIZATION`), except
 (`SyncProfile.refusedEnvironmentVariable` is the same rule in Swift; AC-L92-S2a2
 compares them), and unsets `RCLONE_FAST_LIST`. Once rclone is found it also
 refuses a batch whose `rclone config show local` sets `encoding` or
-`unicode_normalization` (rclone reads a `[local]` section, typed or not). The case
+`unicode_normalization` (rclone reads a `[local]` section, typed or not) or
+fails (an encrypted config whose password only the flags give). The case
 pattern and the variable list are generated from `batchRefusedFlags`; a
 single-dash token is judged raw (a value like `_drafts/**` is no flag), exactly
 as `SyncProfile.refusesBatch` does (AC-L92-S2a1 runs every listed token through
@@ -521,6 +522,35 @@ without it), `.objectErrors` (exit 1/5/6 with only per-object failures, taken fr
 the last attempt, and known rclone follow-up lines) or `.runFailed`. Verified end
 to end with real rclone 1.75.1 local→local (excluded, unlisted, deleted, new,
 symlink, tab-named and `{{…}}` paths). Self-tests AC-L92-S2a1–4.
+
+**Incremental sync, the watcher (limpet-plan.md L9.2 S2b).** With
+`incrementalSync` on and eligible, `SyncWatchDaemon.makeIncrementalDriver` asks
+rclone for the compiled rules (`rclone lsf --dump filters` of an empty dir, 30 s
+cap) and stays on full syncs, with one `Incremental sync off: …` log line, when
+the profile is ineligible, an `RCLONE_*` variable from
+`SyncProfile.batchRefusedEnvironment` is set, the root cannot be resolved, rclone
+cannot produce the dump, or the dump holds a `+` rule. Otherwise it logs
+`Incremental sync on` and builds an `IncrementalDriver` (`DirtySet.swift`) around
+an `IncrementalPlanner` and the `ExcludeOracle`. The `DirectoryWatcher` then
+watches the realpath root and delivers every event with flags and id
+(`onEvents`, no debounce); `FSEventNote.convert` maps them (root-only events
+ignored unless a gap; MustScanSubDirs below the root = a subtree), excluded paths
+are dropped, a path whose first component rclone re-encodes becomes a full run.
+The scheduler asks `prepareRun` before spawning (nothing due = stay idle) and
+tells `refused` on every gate refusal; the planner runs a requested, required or
+owed full run before a batch (limit min(500, maxDelete)), delays a batch 30 s
+doubling to 30 min after a failure and both after a refusal, and serves the owed
+run on its own backoff (`owedDelay`). A batch passes its filter file
+(`~/.local/state/limpet/<shortId>-batch.filter`) and `LIMPET_BATCH_ITEMS` to the
+script; the run's own log segment (from the size before the spawn, or from 0
+after a rotation) is classified, exit 0 included. A batch the script refuses
+(exit 64) requests a full run instead of a retry. A wake timer fires at `nextWake`. The periodic
+full run is every max(syncIntervalMinutes, 360) min; "Sync now", the source
+coming back and the catch-up at start request one. An exclude-file change makes
+the watcher exit when idle (launchd restarts it with fresh rules and a catch-up).
+Self-tests AC-L92-S2b1–6 (S2b6 drives real FSEvents through `DirectoryWatcher`;
+it found that the root's own Created/Xattr event used to require a full run and
+stall incremental mode).
 
 **GUI responsiveness, log rotation and the stalled-sync watchdog
 (limpet-plan.md L6.3, plan v1-v3).** Three defects found by reading the code

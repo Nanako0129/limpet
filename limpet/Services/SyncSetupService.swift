@@ -638,11 +638,14 @@ final class SyncSetupService {
 
             # rclone also reads the local backend's options from a [local] section
             # of its config, typed or not (measured, rclone 1.75.1): a batch
-            # refuses the two that rename files, like their flags.
+            # refuses the two that rename files, like their flags. `config show`
+            # exits 0 for a missing file or section (measured); a failure (an
+            # encrypted config whose password only the sync's flags supply) is
+            # refused too, since the section cannot be read.
             if [[ -n "$DIRTY_FILTER" ]]; then
-                local_section="$("$RCLONE_BIN" config show local 2>/dev/null || true)"
-                if grep -Eq '^(encoding|unicode_normalization)[[:space:]]*=' <<< "$local_section"; then
-                    echo "$(date '+%Y-%m-%d %H:%M:%S') - Refusing to sync: rclone.conf [local] sets encoding or unicode_normalization, which changes what a batch would sync" >> "$LOG_FILE"
+                if ! local_section="$("$RCLONE_BIN" config show local 2>/dev/null)" \\
+                    || grep -Eq '^(encoding|unicode_normalization)[[:space:]]*=' <<< "$local_section"; then
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') - Refusing to sync: rclone.conf [local] sets encoding or unicode_normalization (or rclone could not show it), which changes what a batch would sync" >> "$LOG_FILE"
                     exit 64
                 fi
             fi
