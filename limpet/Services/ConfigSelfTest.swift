@@ -6837,7 +6837,7 @@ enum ConfigSelfTest {
         guard h.checkpoint == nil, h.entries.isEmpty else { return report(id, slug, false, "(a batch finishing during a pending full run moved the checkpoint)") }
         h.fullRunStarted(startEventId: 7)
         h.fullRunFinished(outcome: .success, exists: { _ in true })
-        guard h.checkpoint == 7 || h.checkpoint == 0 else { return report(id, slug, false, "(checkpoint after the pending full run: \(String(describing: h.checkpoint)))") }
+        guard h.checkpoint == 7 else { return report(id, slug, false, "(checkpoint after the pending full run: \(String(describing: h.checkpoint)))") }
         g.fullRunStarted(startEventId: 10)
         g.note("b", isDirEvent: false, gap: false, eventId: 11, now: 3)
         g.advance(toEventId: 11)
@@ -7054,15 +7054,30 @@ enum ConfigSelfTest {
         pf.note("p", isDirEvent: false, gap: false, eventId: 1, now: 0)
         pf.finish(pf.takeBatch(now: 10, limit: 10), outcome: .objectErrors(failedPaths: ["p/x"], deletesSkipped: false), exists: { _ in true })
         guard pf.fullRunOwed else { return report(id, slug, false, "(a failure below an existing file entry was ignored)") }
-        // An IO error rclone named no object for: owed, and possible deletes are
-        // charged, so give-up bounds their retries.
+        // `.objectErrors` naming nothing, or a failure no item carries: the batch
+        // counts as failed for every item (kept, nothing counted, nobody blamed)
+        // and a full run is owed.
         var io = DirtySet()
         io.note("gone", isDirEvent: false, gap: false, eventId: 1, now: 0)
-        for t in [10.0, 20.0, 30.0] {
-            io.finish(io.takeBatch(now: t, limit: 10), outcome: .objectErrors(failedPaths: [], deletesSkipped: true), exists: { _ in false })
+        io.note("ok.txt", isDirEvent: false, gap: false, eventId: 2, now: 0)
+        for t in [10.0, 20.0, 30.0, 40.0] {
+            io.finish(io.takeBatch(now: t, limit: 10), outcome: .objectErrors(failedPaths: [], deletesSkipped: true), exists: { $0 != "gone" })
         }
-        guard io.fullRunOwed, io.gaveUp == ["gone"] else {
-            return report(id, slug, false, "(unnamed IO error: owed \(io.fullRunOwed), gaveUp \(io.gaveUp))")
+        guard io.fullRunOwed, io.gaveUp.isEmpty, io.entries["gone"]?.failures == 0, io.entries["ok.txt"] != nil else {
+            return report(id, slug, false, "(unnamed error: owed \(io.fullRunOwed), gaveUp \(io.gaveUp), entries \(io.entries.keys.sorted()))")
+        }
+        guard un.entries["a.txt"]?.failures == 0, pf.entries["p"] != nil else {
+            return report(id, slug, false, "(an unattributed failure settled or blamed an item)")
+        }
+        // An owe raised while a full run is in flight survives that run's success.
+        var od = DirtySet()
+        od.note("x.bin", isDirEvent: false, gap: false, eventId: 1, now: 0)
+        let odb = od.takeBatch(now: 10, limit: 10)
+        od.fullRunStarted(startEventId: 5)
+        od.finish(odb, outcome: .objectErrors(failedPaths: ["nobody"], deletesSkipped: false), exists: { _ in true })
+        od.fullRunFinished(outcome: .success, exists: { _ in true })
+        guard od.fullRunOwed, od.checkpoint == nil else {
+            return report(id, slug, false, "(an owe raised during a full run was cleared by it)")
         }
         // A top-level POSIX class reads as a Unicode property in ICU.
         let wrapped = "--- start filters ---\n--- File filter rules ---\n- (^|/)[^/]*[:digit:][^/]*$\n--- end filters ---"

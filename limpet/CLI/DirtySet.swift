@@ -211,9 +211,9 @@ struct DirtySet {
     /// A full run is owed but not urgent: a full run reported failed objects
     /// or skipped deletes, or a batch gave up on a path or reported a failure
     /// no item carries. The checkpoint is nil meanwhile. Cleared only by a full
-    /// run without errors that started after it was raised. The watcher runs it
-    /// on its own backoff from `owedFullRunFailures` (30 s doubling to 30 min,
-    /// then only the periodic full run), never back to back.
+    /// run without errors that started after it was raised. When S2 runs it
+    /// (its backoff from `owedFullRunFailures`) is S2's contract, recorded in
+    /// limpet-plan.md L9.2.
     private(set) var fullRunOwed = false
     /// Full runs in a row that ended with object errors; S2 derives the owed
     /// run's backoff from it (contract in limpet-plan.md). Only a clean full run
@@ -371,7 +371,6 @@ struct DirtySet {
 
     /// Up to `limit` ready entries, oldest first, marked in flight.
     mutating func takeBatch(now: TimeInterval, limit: Int) -> [BatchItem] {
-        assert(fullRunStartEventId == nil, "S2 runs one child at a time: no batch during a full run")
         let ready = entries.filter { isReady($0.value, now: now) }
             .sorted { ($0.value.firstSeen, $0.key) < ($1.value.firstSeen, $1.key) }
             .prefix(limit)
@@ -383,13 +382,16 @@ struct DirtySet {
         }
     }
 
-    /// Whether an entry covers one of the failed paths. rclone names a failed
-    /// symlink `<p>.rclonelink` under `--links`. A subtree entry, and a file
-    /// entry whose path is gone (the batch also sends `+ /p/**`), cover
-    /// everything below them.
+    /// The failed paths an entry carries: its own path, `<p>.rclonelink`
+    /// (rclone's name for a symlink under `--links`), and — for a subtree entry
+    /// or a path that is gone (the batch also sends `+ /p/**`) — anything below.
     private static func carried(by path: String, coversBelow: Bool, of failed: Set<String>) -> Set<String> {
-        let below = path + "/"
-        return failed.filter { $0 == path || $0 == path + ".rclonelink" || (coversBelow && $0.hasPrefix(below)) }
+        var mine = failed.intersection([path, path + ".rclonelink"])
+        if coversBelow {
+            let below = path + "/"
+            mine.formUnion(failed.lazy.filter { $0.hasPrefix(below) })
+        }
+        return mine
     }
 
     /// The one place an entry leaves flight and stays in the set: when it was
@@ -408,24 +410,27 @@ struct DirtySet {
     }
 
     /// `exists` must not follow symlinks (lstat): a dangling link still exists.
+    /// A failure that no item of this batch carries (or `.objectErrors` naming
+    /// nothing) cannot be pinned on anyone: the batch counts as failed for every
+    /// item (kept, no failure counted) and a full run is owed.
     mutating func finish(_ batch: [BatchItem], outcome: RunOutcome, exists: (String) -> Bool) {
-        assert(fullRunStartEventId == nil, "S2 runs one child at a time: no batch during a full run")
         var failed: Set<String> = [], deletesSkipped = false
-        if case .objectErrors(let f, let d) = outcome { failed = f; deletesSkipped = d }
-        // A failure no item carries — including an IO error rclone named no
-        // object for — is charged to every possible delete carrier in this
-        // batch (so give-up bounds their retries) and owes a full run.
-        var carriedFailures: Set<String> = []
-        var carriers: [String: Bool] = [:]
-        for item in batch {
-            guard let e = entries[item.path] else { continue }
-            let gone = !exists(item.path)
-            let mine = Self.carried(by: item.path, coversBelow: e.subtree || gone, of: failed)
-            carriedFailures.formUnion(mine)
-            carriers[item.path] = !mine.isEmpty
+        var gone: [String: Bool] = [:], carriers: Set<String> = []
+        if case .objectErrors(let f, let d) = outcome {
+            failed = f
+            deletesSkipped = d
+            var carriedFailures: Set<String> = []
+            for item in batch {
+                guard let e = entries[item.path] else { continue }
+                gone[item.path] = !exists(item.path)
+                let mine = Self.carried(by: item.path, coversBelow: e.subtree || gone[item.path]!, of: failed)
+                if !mine.isEmpty { carriers.insert(item.path); carriedFailures.formUnion(mine) }
+            }
+            if failed.isEmpty || !failed.isSubset(of: carriedFailures) {
+                raiseOwed()
+                return finish(batch, outcome: .runFailed, exists: exists)
+            }
         }
-        let unattributed = !failed.subtracting(carriedFailures).isEmpty || (deletesSkipped && failed.isEmpty)
-        if unattributed { raiseOwed() }
         for item in batch {
             guard let e = entries[item.path] else { continue }
             entries[item.path]!.inFlight = false
@@ -436,8 +441,7 @@ struct DirtySet {
             case .success:
                 done(item.path, changed: changed)
             case .objectErrors:
-                let mayDelete = e.subtree || !exists(item.path)
-                if carriers[item.path] == true || (unattributed && deletesSkipped && mayDelete) {
+                if carriers.contains(item.path) {
                     entries[item.path]!.failures += 1
                     // New content noted during the run was never tried: keep it,
                     // up to `giveUpFailuresWhileChanging`.
@@ -448,7 +452,7 @@ struct DirtySet {
                     } else {
                         requeue(item.path, changed: changed, uploaded: false)
                     }
-                } else if deletesSkipped && mayDelete {
+                } else if deletesSkipped && (e.subtree || gone[item.path] == true) {
                     // Its delete was skipped because of another item's failure:
                     // retry, no failure counted.
                     entries[item.path]!.failures = 0
@@ -460,8 +464,8 @@ struct DirtySet {
         }
     }
 
-    /// Owed full runs raised while a full run is in flight are not cleared by
-    /// that run's success (the same rule as `requiredDuringRun`).
+    /// An owe raised while a full run is in flight is not cleared by that
+    /// run's success (the same rule as `requiredDuringRun`).
     private mutating func raiseOwed() {
         fullRunOwed = true
         if fullRunStartEventId != nil { owedDuringRun = true }
