@@ -114,9 +114,9 @@ final class ExcludeOracle {
             ancestor += component + "/"
             if !dirIncluded(ancestor) { return true }
         }
-        let asLink = !maybeSymlink || Self.firstMatch(fileRules, (relativePath + ".rclonelink") as NSString) == false
-        if isDir { return !dirIncluded(ancestor + (components.last.map(String.init) ?? "") + "/") && asLink }
-        return Self.firstMatch(fileRules, relativePath as NSString) == false && asLink
+        let linkExcluded = { !maybeSymlink || Self.firstMatch(self.fileRules, (relativePath + ".rclonelink") as NSString) == false }
+        if isDir { return !dirIncluded(ancestor + (components.last.map(String.init) ?? "") + "/") && linkExcluded() }
+        return Self.firstMatch(fileRules, relativePath as NSString) == false && linkExcluded()
     }
 
     private func dirIncluded(_ dir: String) -> Bool {
@@ -214,6 +214,10 @@ struct DirtySet {
     /// checkpoint meanwhile). Cleared only by a full run without errors —
     /// today's full sync retried those at the next change.
     private(set) var fullRunOwed = false
+    /// Full runs in a row that ended with object errors: the watcher's backoff
+    /// for the owed run (30 s doubling to 30 min, then only the periodic
+    /// interval). Only a clean full run resets it — never a batch.
+    private(set) var owedFullRunFailures = 0
     private(set) var fullRunStartEventId: UInt64?
     /// What an empty set's checkpoint may claim: raised only by `advance` and
     /// by a covering full run, never by `note` (an unsorted replay delivers
@@ -347,7 +351,8 @@ struct DirtySet {
         fullRequiredEventId = max(fullRequiredEventId ?? 0, eventId)
         // Every idle entry goes, so the set is back under the limits that
         // raised this. If that run skips deletes (rclone skips them all when any
-        // object fails), `fullRunOwed` retries them.
+        // object fails), they wait for a full run that does not skip them
+        // (`fullRunOwed`); entries still live at its end are kept for batches.
         for (path, e) in entries where !e.inFlight { remove(path) }
     }
 
@@ -375,68 +380,70 @@ struct DirtySet {
         }
     }
 
-    /// Whether an entry covers one of the failed paths. A subtree entry, and a
-    /// file entry whose path is gone (the batch also sends `+ /p/**`), cover
+    /// Whether an entry covers one of the failed paths. rclone names a failed
+    /// symlink `<p>.rclonelink` under `--links`. A subtree entry, and a file
+    /// entry whose path is gone (the batch also sends `+ /p/**`), cover
     /// everything below them.
     private static func carries(_ path: String, coversBelow: Bool, of failed: Set<String>) -> Bool {
-        failed.contains(path) || (coversBelow && failed.contains { $0.hasPrefix(path + "/") })
+        failed.contains(path) || failed.contains(path + ".rclonelink")
+            || (coversBelow && failed.contains { $0.hasPrefix(path + "/") })
     }
 
-    /// An entry this run may have finished: dropped if nothing new arrived
-    /// while it was in flight, else kept with a fresh upload clock.
-    private mutating func settle(_ path: String, generation: Int) {
+    /// The one place an entry leaves flight and stays in the set: when it was
+    /// noted again during the run, its upload clock restarts from that note
+    /// (so maxDelay keeps throttling a never-quiet file); `uploaded` (the run
+    /// finished the content it took) also moves its first event there.
+    private mutating func requeue(_ path: String, changed: Bool, uploaded: Bool) {
         guard var e = entries[path] else { return }
-        if e.generation == generation { return remove(path) }
-        e.failures = 0
-        e.firstSeen = e.notedInFlightAt ?? e.lastSeen
-        e.firstEventId = e.notedInFlightEventId ?? e.firstEventId
+        if changed {
+            e.firstSeen = e.notedInFlightAt ?? e.lastSeen
+            if uploaded { e.firstEventId = e.notedInFlightEventId ?? e.firstEventId }
+        }
         e.notedInFlightAt = nil
         e.notedInFlightEventId = nil
         entries[path] = e
     }
 
+    /// `exists` must not follow symlinks (lstat): a dangling link still exists.
     mutating func finish(_ batch: [BatchItem], outcome: RunOutcome, exists: (String) -> Bool) {
         for item in batch {
-            guard entries[item.path] != nil else { continue }
+            guard let e = entries[item.path] else { continue }
             entries[item.path]!.inFlight = false
+            let changed = e.generation != item.generation
             switch outcome {
             case .runFailed:
-                if let at = entries[item.path]!.notedInFlightAt { entries[item.path]!.firstSeen = at }
-                entries[item.path]!.notedInFlightAt = nil
-                entries[item.path]!.notedInFlightEventId = nil
+                requeue(item.path, changed: changed, uploaded: false)
             case .success:
-                settle(item.path, generation: item.generation)
+                done(item.path, changed: changed)
             case .objectErrors(let failed, let deletesSkipped):
-                var e = entries[item.path]!
                 let gone = !exists(item.path)
                 if Self.carries(item.path, coversBelow: e.subtree || gone, of: failed) {
-                    e.failures += 1
-                    let changed = e.generation != item.generation
-                    if changed {
-                        // Restart the upload clock so maxDelay keeps throttling it.
-                        e.firstSeen = e.notedInFlightAt ?? e.lastSeen
-                    }
-                    e.notedInFlightAt = nil
-                    e.notedInFlightEventId = nil
-                    entries[item.path] = e
+                    entries[item.path]!.failures += 1
+                    requeue(item.path, changed: changed, uploaded: false)
                     // New content noted during the run was never tried: keep it,
                     // up to `giveUpFailuresWhileChanging`.
-                    if e.failures >= (changed ? Self.giveUpFailuresWhileChanging : Self.giveUpFailures) {
+                    if entries[item.path]!.failures >= (changed ? Self.giveUpFailuresWhileChanging : Self.giveUpFailures) {
                         gaveUp.append(item.path)
                         fullRunOwed = true
                         remove(item.path)
                     }
                 } else if deletesSkipped && (e.subtree || gone) {
                     // Its delete was skipped: retry, no failure counted.
-                    e.failures = 0
-                    e.notedInFlightAt = nil
-                    e.notedInFlightEventId = nil
-                    entries[item.path] = e
+                    entries[item.path]!.failures = 0
+                    requeue(item.path, changed: changed, uploaded: false)
                 } else {
-                    settle(item.path, generation: item.generation)
+                    done(item.path, changed: changed)
                 }
             }
         }
+    }
+
+    /// The run finished this entry as taken: dropped, or kept with a fresh
+    /// clock if it changed meanwhile.
+    private mutating func done(_ path: String, changed: Bool) {
+        guard changed else { return remove(path) }
+        entries[path]!.failures = 0
+        requeue(path, changed: true, uploaded: true)
     }
 
     /// `startEventId`: FSEvents' current id when the full run started.
@@ -445,9 +452,10 @@ struct DirtySet {
     }
 
     /// `.success` and `.objectErrors` both cover every change made before the
-    /// run started; failed objects and skipped deletes are left to the owed
-    /// full run rather than tracked path by path.
-    mutating func fullRunFinished(outcome: RunOutcome) {
+    /// run started; its failed objects are left to the owed full run. Entries
+    /// that may carry a delete the run skipped stay (a batch, which a failing
+    /// file is not part of, can still do it). `exists`: lstat, as in `finish`.
+    mutating func fullRunFinished(outcome: RunOutcome, exists: (String) -> Bool) {
         guard let start = fullRunStartEventId else { return }
         fullRunStartEventId = nil
         defer { requiredDuringRun = false }  // the next run starts after it
@@ -455,9 +463,18 @@ struct DirtySet {
         if let required = fullRequiredEventId, required <= start, !requiredDuringRun {
             fullRequiredEventId = nil
         }
-        fullRunOwed = outcome != .success
+        var deletesSkipped = false
+        if case .objectErrors(_, let skipped) = outcome {
+            deletesSkipped = skipped
+            fullRunOwed = true
+            owedFullRunFailures += 1
+        } else {
+            fullRunOwed = false
+            owedFullRunFailures = 0
+        }
         streamPosition = max(streamPosition, start)
         for (path, e) in entries where !e.inFlight {
+            if deletesSkipped && (e.subtree || !exists(path)) { continue }
             if e.lastEventId <= start {
                 remove(path)
             } else {
