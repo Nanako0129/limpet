@@ -6822,12 +6822,22 @@ enum ConfigSelfTest {
         guard zero.fullRequired, zero.checkpoint == nil else {
             return report(id, slug, false, "(a gap with id 0 during a full run was treated as covered)")
         }
-        // A gap at id N: no checkpoint until a full run succeeds, whatever batches do meanwhile.
+        // A gap at id N: no checkpoint until a full run succeeds.
         var g = DirtySet()
         g.note("a", isDirEvent: false, gap: false, eventId: 5, now: 0)
         g.note("", isDirEvent: true, gap: true, eventId: 10, now: 1)
         g.advance(toEventId: 10)
         guard g.checkpoint == nil else { return report(id, slug, false, "(checkpoint while a full run is required)") }
+        // A batch taken before the gap finishes while the full run is pending.
+        var h = DirtySet()
+        h.note("a", isDirEvent: false, gap: false, eventId: 5, now: 0)
+        let hb = h.takeBatch(now: 10, limit: 10)
+        h.note("", isDirEvent: true, gap: true, eventId: 6, now: 11)
+        h.finish(hb, outcome: .success, exists: { _ in true })
+        guard h.checkpoint == nil, h.entries.isEmpty else { return report(id, slug, false, "(a batch finishing during a pending full run moved the checkpoint)") }
+        h.fullRunStarted(startEventId: 7)
+        h.fullRunFinished(outcome: .success, exists: { _ in true })
+        guard h.checkpoint == 7 || h.checkpoint == 0 else { return report(id, slug, false, "(checkpoint after the pending full run: \(String(describing: h.checkpoint)))") }
         g.fullRunStarted(startEventId: 10)
         g.note("b", isDirEvent: false, gap: false, eventId: 11, now: 3)
         g.advance(toEventId: 11)
@@ -6845,7 +6855,7 @@ enum ConfigSelfTest {
         let failed = RunOutcome.objectErrors(failedPaths: ["x.bin"], deletesSkipped: true)
         set.finish(set.takeBatch(now: 10, limit: 10), outcome: failed, exists: exists)
         guard set.entries["x.bin"]?.failures == 1, set.entries["y.txt"] == nil,
-              set.entries["dir"]?.failures == 0, set.entries["gone.txt"]?.failures == 0 else {
+              set.entries["dir"]?.failures == 0, set.entries["gone.txt"]?.failures == 0, !set.fullRunOwed else {
             return report(id, slug, false, "(after one object error: \(set.entries.mapValues(\.failures)))")
         }
         // Third failure, but X was saved again during that run: count it, keep it.
@@ -7011,14 +7021,18 @@ enum ConfigSelfTest {
         var sl = DirtySet()
         sl.note("sub/link", isDirEvent: false, gap: false, eventId: 100, now: 0)
         sl.finish(sl.takeBatch(now: 10, limit: 10), outcome: .objectErrors(failedPaths: ["sub/link.rclonelink"], deletesSkipped: true), exists: { _ in true })
-        guard sl.entries["sub/link"]?.failures == 1 else { return report(id, slug, false, "(a failed symlink was settled as done)") }
+        guard sl.entries["sub/link"]?.failures == 1, !sl.fullRunOwed else { return report(id, slug, false, "(a failed symlink was settled as done, or owed a full run)") }
         // A delete kept because deletes were skipped also restarts its upload clock.
         var lg = DirtySet()
         lg.note("logs", isDirEvent: true, gap: false, eventId: 1, now: 0)
+        lg.note("other.bin", isDirEvent: false, gap: false, eventId: 1, now: 0)  // the item that fails
         let lgb = lg.takeBatch(now: 400, limit: 10)
         lg.note("logs/app.log", isDirEvent: false, gap: false, eventId: 2, now: 401)
         lg.finish(lgb, outcome: .objectErrors(failedPaths: ["other.bin"], deletesSkipped: true), exists: { _ in true })
-        guard lg.entries["logs"]?.firstSeen == 401 else { return report(id, slug, false, "(kept delete kept an old upload clock)") }
+        guard lg.entries["logs"]?.firstSeen == 401, lg.entries["logs"]?.firstEventId == 1,
+              lg.entries["logs"]?.failures == 0, lg.entries["other.bin"]?.failures == 1, !lg.fullRunOwed else {
+            return report(id, slug, false, "(kept delete: clock not restarted, first event moved, or owed)")
+        }
         // A kept (not uploaded) entry keeps its first event: the checkpoint must
         // not pass a skipped delete (round 7: guarded by no test before).
         var pb = DirtySet()
@@ -7027,13 +7041,29 @@ enum ConfigSelfTest {
         pb.note("logs/app.log", isDirEvent: false, gap: false, eventId: 200, now: 11)
         pb.finish(pbb, outcome: .objectErrors(failedPaths: ["logs/x"], deletesSkipped: true), exists: { _ in true })
         pb.advance(toEventId: 200)
-        guard pb.entries["logs"]?.firstEventId == 100, pb.entries["logs"]?.failures == 1 else {
+        guard pb.entries["logs"]?.firstEventId == 100, pb.entries["logs"]?.failures == 1, !pb.fullRunOwed else {
             return report(id, slug, false, "(a failed entry's first event moved: \(String(describing: pb.entries["logs"]?.firstEventId)))")
         }
         var un = DirtySet()
         un.note("a.txt", isDirEvent: false, gap: false, eventId: 1, now: 0)
         un.finish(un.takeBatch(now: 10, limit: 10), outcome: .objectErrors(failedPaths: ["elsewhere"], deletesSkipped: false), exists: { _ in true })
         guard un.fullRunOwed else { return report(id, slug, false, "(a failure no item carries did not owe a full run)") }
+        // A failure below a file entry that exists at finish is not that entry's
+        // (carries needs subtree or gone), so it is unattributed: owed.
+        var pf = DirtySet()
+        pf.note("p", isDirEvent: false, gap: false, eventId: 1, now: 0)
+        pf.finish(pf.takeBatch(now: 10, limit: 10), outcome: .objectErrors(failedPaths: ["p/x"], deletesSkipped: false), exists: { _ in true })
+        guard pf.fullRunOwed else { return report(id, slug, false, "(a failure below an existing file entry was ignored)") }
+        // An IO error rclone named no object for: owed, and possible deletes are
+        // charged, so give-up bounds their retries.
+        var io = DirtySet()
+        io.note("gone", isDirEvent: false, gap: false, eventId: 1, now: 0)
+        for t in [10.0, 20.0, 30.0] {
+            io.finish(io.takeBatch(now: t, limit: 10), outcome: .objectErrors(failedPaths: [], deletesSkipped: true), exists: { _ in false })
+        }
+        guard io.fullRunOwed, io.gaveUp == ["gone"] else {
+            return report(id, slug, false, "(unnamed IO error: owed \(io.fullRunOwed), gaveUp \(io.gaveUp))")
+        }
         // A top-level POSIX class reads as a Unicode property in ICU.
         let wrapped = "--- start filters ---\n--- File filter rules ---\n- (^|/)[^/]*[:digit:][^/]*$\n--- end filters ---"
         return report(id, slug, ExcludeOracle(dump: wrapped) == nil, "(top-level [:digit:] not refused)")
