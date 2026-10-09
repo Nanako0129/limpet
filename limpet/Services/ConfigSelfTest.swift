@@ -6826,13 +6826,14 @@ enum ConfigSelfTest {
         var g = DirtySet()
         g.note("a", isDirEvent: false, gap: false, eventId: 5, now: 0)
         g.note("", isDirEvent: true, gap: true, eventId: 10, now: 1)
+        g.advance(toEventId: 10)
+        guard g.checkpoint == nil else { return report(id, slug, false, "(checkpoint while a full run is required)") }
         g.fullRunStarted(startEventId: 10)
         g.note("b", isDirEvent: false, gap: false, eventId: 11, now: 3)
         g.advance(toEventId: 11)
-        g.finish(g.takeBatch(now: 20, limit: 10), outcome: .success, exists: { _ in true })
         guard g.checkpoint == nil else { return report(id, slug, false, "(checkpoint advanced past a pending full run)") }
         g.fullRunFinished(outcome: .success, exists: { _ in true })
-        return report(id, slug, g.checkpoint == 11 && !g.fullRequired, "(checkpoint after the full run: \(String(describing: g.checkpoint)))")
+        return report(id, slug, g.checkpoint == 10 && !g.fullRequired, "(checkpoint after the full run: \(String(describing: g.checkpoint)))")
     }
 
     private static func testDirtySetObjectErrors() -> Bool {
@@ -6950,10 +6951,9 @@ enum ConfigSelfTest {
         var d = DirtySet()
         d.note("old", isDirEvent: true, gap: false, eventId: 5, now: 0)
         d.fullRunStarted(startEventId: 10)
-        d.note("old/new.txt", isDirEvent: false, gap: false, eventId: 20, now: 1)
         d.fullRunFinished(outcome: .objectErrors(failedPaths: ["bad.txt"], deletesSkipped: true), exists: { _ in true })
-        guard d.fullRunOwed, d.checkpoint == nil else {
-            return report(id, slug, false, "(skipped deletes not owed to a full run)")
+        guard d.fullRunOwed, d.checkpoint == nil, d.entries["old"] != nil else {
+            return report(id, slug, false, "(skipped subtree delete dropped or not owed to a full run)")
         }
         // A full run's failure on an existing entry does not move its clock back.
         var w = DirtySet()
@@ -7019,6 +7019,21 @@ enum ConfigSelfTest {
         lg.note("logs/app.log", isDirEvent: false, gap: false, eventId: 2, now: 401)
         lg.finish(lgb, outcome: .objectErrors(failedPaths: ["other.bin"], deletesSkipped: true), exists: { _ in true })
         guard lg.entries["logs"]?.firstSeen == 401 else { return report(id, slug, false, "(kept delete kept an old upload clock)") }
+        // A kept (not uploaded) entry keeps its first event: the checkpoint must
+        // not pass a skipped delete (round 7: guarded by no test before).
+        var pb = DirtySet()
+        pb.note("logs", isDirEvent: true, gap: false, eventId: 100, now: 0)
+        let pbb = pb.takeBatch(now: 10, limit: 10)
+        pb.note("logs/app.log", isDirEvent: false, gap: false, eventId: 200, now: 11)
+        pb.finish(pbb, outcome: .objectErrors(failedPaths: ["logs/x"], deletesSkipped: true), exists: { _ in true })
+        pb.advance(toEventId: 200)
+        guard pb.entries["logs"]?.firstEventId == 100, pb.entries["logs"]?.failures == 1 else {
+            return report(id, slug, false, "(a failed entry's first event moved: \(String(describing: pb.entries["logs"]?.firstEventId)))")
+        }
+        var un = DirtySet()
+        un.note("a.txt", isDirEvent: false, gap: false, eventId: 1, now: 0)
+        un.finish(un.takeBatch(now: 10, limit: 10), outcome: .objectErrors(failedPaths: ["elsewhere"], deletesSkipped: false), exists: { _ in true })
+        guard un.fullRunOwed else { return report(id, slug, false, "(a failure no item carries did not owe a full run)") }
         // A top-level POSIX class reads as a Unicode property in ICU.
         let wrapped = "--- start filters ---\n--- File filter rules ---\n- (^|/)[^/]*[:digit:][^/]*$\n--- end filters ---"
         return report(id, slug, ExcludeOracle(dump: wrapped) == nil, "(top-level [:digit:] not refused)")

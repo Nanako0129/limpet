@@ -209,14 +209,14 @@ struct DirtySet {
     /// whatever the ids say (RootChanged carries id 0; replays are unsorted).
     private var requiredDuringRun = false
     /// A full run is owed but not urgent: a full run reported failed objects
-    /// or skipped deletes, or a batch gave up on a path. The watcher runs it on
-    /// its retry delay (never back to back), and a restart runs it first (no
-    /// checkpoint meanwhile). Cleared only by a full run without errors —
-    /// today's full sync retried those at the next change.
+    /// or skipped deletes, or a batch gave up on a path or reported a failure
+    /// no item carries. The checkpoint is nil meanwhile. Cleared only by a full
+    /// run without errors. When the watcher runs it is S2's contract
+    /// (limpet-plan.md L9.2 "S1 → S2/S3 contract changes").
     private(set) var fullRunOwed = false
-    /// Full runs in a row that ended with object errors: the watcher's backoff
-    /// for the owed run (30 s doubling to 30 min, then only the periodic
-    /// interval). Only a clean full run resets it — never a batch.
+    /// Full runs in a row that ended with object errors; S2 derives the owed
+    /// run's backoff from it (contract in limpet-plan.md). Only a clean full run
+    /// resets it — never a batch.
     private(set) var owedFullRunFailures = 0
     private(set) var fullRunStartEventId: UInt64?
     /// What an empty set's checkpoint may claim: raised only by `advance` and
@@ -369,6 +369,7 @@ struct DirtySet {
 
     /// Up to `limit` ready entries, oldest first, marked in flight.
     mutating func takeBatch(now: TimeInterval, limit: Int) -> [BatchItem] {
+        assert(fullRunStartEventId == nil, "S2 runs one child at a time: no batch during a full run")
         let ready = entries.filter { isReady($0.value, now: now) }
             .sorted { ($0.value.firstSeen, $0.key) < ($1.value.firstSeen, $1.key) }
             .prefix(limit)
@@ -406,6 +407,12 @@ struct DirtySet {
 
     /// `exists` must not follow symlinks (lstat): a dangling link still exists.
     mutating func finish(_ batch: [BatchItem], outcome: RunOutcome, exists: (String) -> Bool) {
+        assert(fullRunStartEventId == nil, "S2 runs one child at a time: no batch during a full run")
+        if case .objectErrors(let failed, _) = outcome,
+           failed.contains(where: { f in !batch.contains { f == $0.path || f == $0.path + ".rclonelink" || f.hasPrefix($0.path + "/") } }) {
+            // A failure this batch's items cannot account for: let a full run sort it out.
+            fullRunOwed = true
+        }
         for item in batch {
             guard let e = entries[item.path] else { continue }
             entries[item.path]!.inFlight = false
@@ -419,13 +426,14 @@ struct DirtySet {
                 let gone = !exists(item.path)
                 if Self.carries(item.path, coversBelow: e.subtree || gone, of: failed) {
                     entries[item.path]!.failures += 1
-                    requeue(item.path, changed: changed, uploaded: false)
                     // New content noted during the run was never tried: keep it,
                     // up to `giveUpFailuresWhileChanging`.
                     if entries[item.path]!.failures >= (changed ? Self.giveUpFailuresWhileChanging : Self.giveUpFailures) {
                         gaveUp.append(item.path)
                         fullRunOwed = true
                         remove(item.path)
+                    } else {
+                        requeue(item.path, changed: changed, uploaded: false)
                     }
                 } else if deletesSkipped && (e.subtree || gone) {
                     // Its delete was skipped: retry, no failure counted.
@@ -453,8 +461,9 @@ struct DirtySet {
 
     /// `.success` and `.objectErrors` both cover every change made before the
     /// run started; its failed objects are left to the owed full run. Entries
-    /// that may carry a delete the run skipped stay (a batch, which a failing
-    /// file is not part of, can still do it). `exists`: lstat, as in `finish`.
+    /// that may carry a delete the run skipped stay, so a batch can retry the
+    /// delete (it succeeds when the failing file is not in that batch).
+    /// `exists`: lstat, as in `finish`.
     mutating func fullRunFinished(outcome: RunOutcome, exists: (String) -> Bool) {
         guard let start = fullRunStartEventId else { return }
         fullRunStartEventId = nil
