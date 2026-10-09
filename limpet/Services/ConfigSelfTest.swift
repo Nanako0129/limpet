@@ -7155,7 +7155,8 @@ enum ConfigSelfTest {
         let eligible = ["", "--s3-no-head --update", "--exclude=build/** --fast-list", "--delete-excluded=false", "--files-from-x"]
         let ineligible = ["--include=*.txt", "--include-from=f", "--filter=+_x", "-f", "-f+x", "--filter-from=f",
                           "--files-from=f", "--files-from-raw=f", "--delete-excluded", "--delete-excluded=true",
-                          "--delete_excluded", "--include_from=f"]
+                          "--delete_excluded", "--include_from=f", "--min-age=2m", "--max-age=1d",
+                          "--exclude-if-present=.nosync", "--files-from0=f", "--error-on-no-transfer"]
         for f in eligible where reason(f) != nil { return report(id, slug, false, "(\(f) refused: \(reason(f)!))") }
         for f in ineligible where reason(f) == nil { return report(id, slug, false, "(\(f) accepted)") }
         guard reason("", enabled: false) != nil, reason("", direction: .remoteToLocal) != nil else {
@@ -7168,8 +7169,10 @@ enum ConfigSelfTest {
         let id = "AC-L92-S2a2", slug = "batch-script-argv"
         let dirty = "\(selfTestRoot)/ac-l92-s2a2.filter"
         try? "+ /a.txt\n- **\n".write(toFile: dirty, atomically: true, encoding: .utf8)
-        guard let batch = runScriptFixture(name: "ac-l92-s2a2", overrides: ["additionalFlags": "--fast-list --s3-no-head --fast-list=true"],
-                                           extraEnvironment: ["LIMPET_BATCH_ITEMS": "3"], extraArgs: [dirty]),
+        let envProbe = "echo \"ENV=${RCLONE_DELETE_EXCLUDED:-unset}\" >> \"\(selfTestRoot)/ac-l92-s2a2/stub-argv\"\nexit 0\n"
+        guard let batch = runScriptFixture(name: "ac-l92-s2a2", overrides: ["additionalFlags": "--fast-list --s3-no-head --fast-list=true --tpslimit=20"],
+                                           stubTail: envProbe,
+                                           extraEnvironment: ["LIMPET_BATCH_ITEMS": "3", "RCLONE_DELETE_EXCLUDED": "true"], extraArgs: [dirty]),
               let full = runScriptFixture(name: "ac-l92-s2a2-full", overrides: ["additionalFlags": "--s3-no-head"]) else {
             return report(id, slug, false, "(fixture setup failed)")
         }
@@ -7177,7 +7180,8 @@ enum ConfigSelfTest {
         let filterFroms = a.indices.filter { a[$0] == "--filter-from" && $0 + 1 < a.count }.map { a[$0 + 1] }
         guard batch.status == 0, filterFroms.count == 2, filterFroms[0].hasSuffix("exclude.txt"), filterFroms[1] == dirty,
               !a.contains(where: { $0.hasPrefix("--fast-list") }), a.contains("--s3-no-head"),
-              let t = a.firstIndex(of: "--tpslimit"), a.indices.contains(t + 1), a[t + 1] == "4",
+              let t = a.lastIndex(where: { $0.hasPrefix("--tpslimit") }), a[t] == "--tpslimit", a.indices.contains(t + 1), a[t + 1] == "4",
+              a.contains("ENV=unset"),
               batch.log.contains("Starting sync (local → remote, 3 changed paths)") else {
             return report(id, slug, false, "(batch argv/log wrong: \(a))")
         }
@@ -7189,6 +7193,15 @@ enum ConfigSelfTest {
               let missing = runScriptFixture(name: "ac-l92-s2a2-miss", overrides: [:], extraArgs: ["\(selfTestRoot)/no-such.filter"]),
               reverse.status == 64, !reverse.stubRan, missing.status == 64, !missing.stubRan else {
             return report(id, slug, false, "(a remoteToLocal or unreadable batch was not refused)")
+        }
+        for flags in ["--delete-excluded", "--include=*.txt", "-f", "--min-age=2m"] {
+            guard let refused = runScriptFixture(name: "ac-l92-s2a2-ref", overrides: ["additionalFlags": flags], extraArgs: [dirty]),
+                  refused.status == 64, !refused.stubRan, refused.log.contains("changes what a batch would sync") else {
+                return report(id, slug, false, "(a batch with \(flags) was not refused by the script)")
+            }
+        }
+        guard let fullOK = runScriptFixture(name: "ac-l92-s2a2-full2", overrides: ["additionalFlags": "--delete-excluded"]), fullOK.status == 0 else {
+            return report(id, slug, false, "(the batch flag check also refused a full run)")
         }
         return report(id, slug, true)
     }
@@ -7202,15 +7215,17 @@ enum ConfigSelfTest {
             DirtySet.BatchItem(path: "x/star*[a]{b}?\\.txt", subtree: false, generation: 0),
             DirtySet.BatchItem(path: "x/trail \u{A0}", subtree: false, generation: 0),
             DirtySet.BatchItem(path: "y/line\nbreak/f", subtree: false, generation: 0),
+            DirtySet.BatchItem(path: "tab\there.txt", subtree: false, generation: 0),
         ]
         let text = DirtySet.filterRules(for: items, exists: { $0 != "old.txt" })
         let expected = [
             "+ /a/b.txt", "+ /a/b.txt.rclonelink",
             "+ /dir", "+ /dir.rclonelink", "+ /dir/**",
             "+ /old.txt", "+ /old.txt.rclonelink", "+ /old.txt/**",
-            #"+ /x/star\*\[a\]\{b\}\?\\.txt"#, #"+ /x/star\*\[a\]\{b\}\?\\.txt.rclonelink"#,
+            #"+ /x/star\*\[a\]?b?\?\\.txt"#, #"+ /x/star\*\[a\]?b?\?\\.txt.rclonelink"#,
             "+ /x/trail[ ][\u{A0}]", "+ /x/trail \u{A0}.rclonelink",
             "+ /y", "+ /y.rclonelink", "+ /y/**",
+            "+ /**",
             "- **",
         ].joined(separator: "\n") + "\n"
         return report(id, slug, text == expected, "(got:\n\(text))")
@@ -7225,13 +7240,26 @@ enum ConfigSelfTest {
         let succeeded = #"{"time":"2026-10-06T22:57:03+08:00","level":"error","msg":"Attempt 2/3 succeeded","source":"cmd/cmd.go:263"}"#
         let other = #"{"time":"2026-10-06T22:58:42+08:00","level":"error","msg":"error reading destination directory: EOF","source":"sync/sync.go:100"}"#
         let info = #"{"time":"2026-10-06T22:58:00+08:00","level":"info","msg":"Copied (new)","object":"a.txt","objectType":"*local.Object"}"#
-        let log = [info, objectError, attempt, notDeleting, succeeded, "2026-10-06 22:58:42 - Sync failed with exit code 1"].joined(separator: "\n")
+        // rclone's order within an attempt: per-object errors, then "not deleting …",
+        // then cmd's "Attempt N/M failed …" (live side-project log, 2026-10-06).
+        let log = [info, objectError, notDeleting, attempt, "2026-10-06 22:58:42 - Sync failed with exit code 1"].joined(separator: "\n")
+        let completed = info + "\n2026-10-06 22:58:42 - Sync completed successfully"
+        let cantRetry = #"{"level":"error","msg":"Can't retry any of the errors - not attempting retries","source":"cmd/cmd.go:272"}"#
+        func objErr(_ o: String) -> String { #"{"level":"error","msg":"Failed to copy: denied","object":"\#(o)","objectType":"*s3.Object"}"# }
+        let a1 = #"{"level":"error","msg":"Attempt 1/3 failed with 2 errors and: denied"}"#
+        let a2 = #"{"level":"error","msg":"Attempt 2/3 failed with 1 errors and: denied"}"#
+        let retried = [objErr("x"), objErr("y"), a1, objErr("y"), a2].joined(separator: "\n")
         let cases: [(Int32, String, RunOutcome)] = [
-            (0, log, .success),
+            (0, completed, .success),
+            (0, "2026-10-06 22:58:42 - Drive not mounted, skipping sync", .runFailed),
+            (6, [objectError, notDeleting, cantRetry].joined(separator: "\n"), .objectErrors(failedPaths: ["shanjie-s5p/r.jsonl"], deletesSkipped: true)),
+            (1, retried, .objectErrors(failedPaths: ["y"], deletesSkipped: false)),
+            (1, [objectError, "{not json"].joined(separator: "\n"), .runFailed),
             (1, log, .objectErrors(failedPaths: ["shanjie-s5p/r.jsonl"], deletesSkipped: true)),
             (6, [objectError, attempt].joined(separator: "\n"), .objectErrors(failedPaths: ["shanjie-s5p/r.jsonl"], deletesSkipped: false)),
             (1, [objectError, other].joined(separator: "\n"), .runFailed),
-            (1, [attempt, notDeleting].joined(separator: "\n"), .runFailed),
+            (1, [notDeleting, attempt].joined(separator: "\n"), .runFailed),
+            (1, [objectError, notDeleting, attempt, succeeded].joined(separator: "\n"), .runFailed),
             (7, log, .runFailed), (77, log, .runFailed), (75, "", .runFailed),
         ]
         for (code, text, expected) in cases where RunOutcome.classify(exitCode: code, runLog: text) != expected {

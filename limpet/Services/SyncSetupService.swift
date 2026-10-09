@@ -554,6 +554,41 @@ final class SyncSetupService {
                 fi
             done
 
+            # limpet-plan.md L9.2: a batch is checked here as well as by the watcher
+            # (SyncProfile.batchRefusedFlags, same list), before the lock: a config
+            # written by a newer install can reach a batch an older watcher starts.
+            if [[ -n "$DIRTY_FILTER" ]]; then
+                if [[ "$SYNC_DIRECTION" != "localToRemote" ]]; then
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') - Refusing to sync: a batch needs localToRemote" >> "$LOG_FILE"
+                    exit 64
+                fi
+                if [[ ! -r "$DIRTY_FILTER" ]]; then
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') - Refusing to sync: batch filter not readable: $DIRTY_FILTER" >> "$LOG_FILE"
+                    exit 64
+                fi
+                for flag_token in ${ADDITIONAL_FLAGS_ARRAY[@]+"${ADDITIONAL_FLAGS_ARRAY[@]}"}; do
+                    flag_name="${flag_token%%=*}"
+                    flag_name="${flag_name//_/-}"
+                    case "$flag_name" in
+                        --include|--include-from|--filter|--filter-from|--files-from|--files-from-raw|--files-from0|--min-age|--max-age|--exclude-if-present|--error-on-no-transfer)
+                            batch_refused="$flag_token" ;;
+                        --delete-excluded)
+                            [[ "$flag_token" == *=false ]] || batch_refused="$flag_token" ;;
+                        --*) ;;
+                        -f*)
+                            batch_refused="$flag_token" ;;
+                    esac
+                    if [[ -n "${batch_refused:-}" ]]; then
+                        echo "$(date '+%Y-%m-%d %H:%M:%S') - Refusing to sync: additionalRcloneFlags $batch_refused changes what a batch would sync" >> "$LOG_FILE"
+                        exit 64
+                    fi
+                done
+                # rclone also reads any flag from an RCLONE_<FLAG> environment variable.
+                unset RCLONE_INCLUDE RCLONE_INCLUDE_FROM RCLONE_FILTER RCLONE_FILTER_FROM RCLONE_FILES_FROM \
+                    RCLONE_FILES_FROM_RAW RCLONE_FILES_FROM0 RCLONE_DELETE_EXCLUDED RCLONE_MIN_AGE RCLONE_MAX_AGE \
+                    RCLONE_EXCLUDE_IF_PRESENT RCLONE_ERROR_ON_NO_TRANSFER RCLONE_FAST_LIST RCLONE_TPSLIMIT
+            fi
+
             # Find rclone binary. Cover the common package-manager locations,
             # including nix-darwin's system and per-user profiles which live outside
             # Homebrew's dirs (issue #53). $USER can be unset under launchd, so derive
@@ -746,25 +781,18 @@ final class SyncSetupService {
             # string re-interpreted by the shell (a value like `~/Data$old` in
             # LOCAL_PATH/REMOTE/FILTER_FILE must never be re-expanded, or `$old`
             # collapses to empty and the wrong directory gets synced/deleted).
-            if [[ -n "$DIRTY_FILTER" && "$SYNC_DIRECTION" != "localToRemote" ]]; then
-                echo "$(date '+%Y-%m-%d %H:%M:%S') - Refusing to sync: a batch needs localToRemote" >> "$LOG_FILE"
-                exit 64
-            fi
-            if [[ -n "$DIRTY_FILTER" && ! -r "$DIRTY_FILTER" ]]; then
-                echo "$(date '+%Y-%m-%d %H:%M:%S') - Refusing to sync: batch filter not readable: $DIRTY_FILTER" >> "$LOG_FILE"
-                exit 64
-            fi
             if [[ -n "$DIRTY_FILTER" ]]; then
                 # A batch (limpet-plan.md L9.2): the dirty rules come after the
                 # profile's (first match wins, so a profile exclude beats a dirty
                 # include; rclone puts every --exclude flag before both files).
                 # No --fast-list: with it rclone walks the whole remote prefix
                 # and ignores directory filters (march.go/walk.go, 1.75.1).
-                # --tpslimit 4 keeps two busy profiles far below the S4 IP block.
+                # --tpslimit 4 (appended after additionalFlags below, so a profile's own
+                # value cannot raise it) keeps two busy profiles far below the S4 IP block.
                 BATCH_ITEMS="${LIMPET_BATCH_ITEMS:-}"
                 [[ "$BATCH_ITEMS" =~ ^[0-9]+$ ]] || BATCH_ITEMS="?"
                 echo "$(date '+%Y-%m-%d %H:%M:%S') - Starting sync (local → remote, $BATCH_ITEMS changed paths)" >> "$LOG_FILE"
-                cmd=("$RCLONE_BIN" sync "$LOCAL_PATH" "$REMOTE" --verbose --use-json-log --stats 2s --filter-from "$FILTER_FILE" --filter-from "$DIRTY_FILTER" --links --tpslimit 4 --transfers "$TRANSFERS" --checkers "$CHECKERS")
+                cmd=("$RCLONE_BIN" sync "$LOCAL_PATH" "$REMOTE" --verbose --use-json-log --stats 2s --filter-from "$FILTER_FILE" --filter-from "$DIRTY_FILTER" --links --transfers "$TRANSFERS" --checkers "$CHECKERS")
                 BATCH_FLAGS=()
                 for flag_token in ${ADDITIONAL_FLAGS_ARRAY[@]+"${ADDITIONAL_FLAGS_ARRAY[@]}"}; do
                     case "$flag_token" in
@@ -803,6 +831,9 @@ final class SyncSetupService {
             # ADDITIONAL_FLAGS_ARRAY above; append its tokens as-is.
             if [[ ${#ADDITIONAL_FLAGS_ARRAY[@]} -gt 0 ]]; then
                 cmd+=("${ADDITIONAL_FLAGS_ARRAY[@]}")
+            fi
+            if [[ -n "$DIRTY_FILTER" ]]; then
+                cmd+=(--tpslimit 4)
             fi
 
             # The max-delete lines of THIS run only (never an older run's lines in

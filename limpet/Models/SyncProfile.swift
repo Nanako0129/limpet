@@ -261,22 +261,30 @@ struct SyncProfile: Identifiable, Codable, Equatable {
         self.incrementalSync = incrementalSync
     }
 
+    /// Flags a batch must not run with: include rules or a file list widen or
+    /// replace the batch's own `- **`; --delete-excluded would delete everything
+    /// outside it; age filters and --exclude-if-present change a path's verdict
+    /// without any FSEvent; --error-on-no-transfer fails every no-op batch.
+    /// The generated script refuses a batch carrying any of them as well.
+    static let batchRefusedFlags: Set<String> = [
+        "--include", "--include-from", "--filter", "-f", "--filter-from", "--files-from",
+        "--files-from-raw", "--files-from0", "--delete-excluded", "--min-age", "--max-age",
+        "--exclude-if-present", "--error-on-no-transfer",
+    ]
+
     /// Why this profile must use full syncs although `incrementalSync` is on,
     /// or nil when batches may run (limpet-plan.md L9.2 S2). A batch adds its
     /// own `--filter-from` after the profile's rules and ends in `- **`, so a
-    /// flag that adds include rules, replaces filtering with a file list, or
-    /// deletes excluded files would widen or break the batch. The profile's
+    /// flag in `batchRefusedFlags` would widen, break or silently skip it. The profile's
     /// exclude file is checked separately (its rclone dump must hold no `+`
     /// rule), because that needs rclone.
     var incrementalIneligibility: String? {
         guard incrementalSync else { return "incrementalSync is off" }
         guard syncDirection == .localToRemote else { return "incremental sync needs localToRemote" }
-        let refused: Set<String> = ["--include", "--include-from", "--filter", "-f", "--filter-from",
-                                    "--files-from", "--files-from-raw", "--delete-excluded"]
         for token in additionalRcloneFlags.split(whereSeparator: \.isWhitespace).map(String.init) {
             let name = String(token.split(separator: "=", maxSplits: 1).first ?? "").replacingOccurrences(of: "_", with: "-")
-            let short = token.hasPrefix("-f") && !token.hasPrefix("--") && token.count > 1 ? "-f" : name
-            guard refused.contains(name) || refused.contains(short) else { continue }
+            let short = token.hasPrefix("-f") && !token.hasPrefix("--") ? "-f" : name
+            guard Self.batchRefusedFlags.contains(name) || Self.batchRefusedFlags.contains(short) else { continue }
             if name == "--delete-excluded", token.hasSuffix("=false") { continue }
             return "additionalRcloneFlags \(token) changes what a batch would sync"
         }

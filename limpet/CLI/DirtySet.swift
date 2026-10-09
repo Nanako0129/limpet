@@ -535,12 +535,26 @@ struct DirtySet {
 // MARK: - Batch filter file and run classification (limpet-plan.md L9.2 S2)
 
 extension DirtySet {
-    /// One rclone glob that matches `path` literally: `\` before each glob
-    /// metacharacter (fs/filter/glob.go), and trailing whitespace written as a
-    /// bracket expression, because rclone trims each filter-file line with Go's
-    /// strings.TrimSpace (fs/filter/rules.go) — which also takes U+0085,
-    /// U+00A0 and the Unicode space separators. Works on scalars, so a
-    /// combining mark cannot hide a metacharacter.
+    /// Scalars rclone's local backend re-encodes in a name's Standard form
+    /// (lib/encoder: control characters, DEL, the replacement symbols
+    /// U+2400–U+2421, the quote rune U+201B, fullwidth slash and full stop).
+    /// rclone filters on that form, so a rule built from the raw name would
+    /// miss; such a path is synced through its nearest clean ancestor instead.
+    static func rcloneReencodes(_ path: String) -> Bool {
+        path.unicodeScalars.contains { s in
+            s.value < 0x20 || s.value == 0x7F || (0x2400...0x2421).contains(s.value)
+                || s.value == 0x201B || s.value == 0xFF0F || s.value == 0xFF0E
+        }
+    }
+
+    /// One rclone glob that matches `path`: `\` before `\ * ? [ ]`
+    /// (fs/filter/glob.go); `{` and `}` as `?` (any one character), because
+    /// rclone's directory-glob derivation gives up on brace patterns even when
+    /// escaped (`tooHardRe`) and would walk every directory — matching a few
+    /// extra same-named siblings is harmless; trailing whitespace bracketed,
+    /// because rclone trims each filter-file line with Go's strings.TrimSpace
+    /// (which also takes U+0085, U+00A0 and the Unicode space separators).
+    /// Works on scalars, so a combining mark cannot hide a metacharacter.
     static func globEscaped(_ path: String) -> String {
         var scalars = Array(path.unicodeScalars)
         var trailing: [Unicode.Scalar] = []
@@ -549,7 +563,8 @@ extension DirtySet {
         }
         var out = ""
         for scalar in scalars {
-            if "\\*?[]{}".unicodeScalars.contains(scalar) { out.unicodeScalars.append("\\") }
+            if scalar == "{" || scalar == "}" { out += "?"; continue }
+            if "\\*?[]".unicodeScalars.contains(scalar) { out.unicodeScalars.append("\\") }
             out.unicodeScalars.append(scalar)
         }
         for scalar in trailing {
@@ -563,14 +578,15 @@ extension DirtySet {
     /// The batch's filter file, read by rclone after the profile's rules:
     /// `+ /p` and `+ /p.rclonelink` (a symlink under `--links`) for every item,
     /// `+ /p/**` too for a subtree entry or a path that is gone (lstat), and a
-    /// final `- **`. A path holding a line break cannot be written on one line,
-    /// so its nearest ancestor without one is synced as a subtree instead.
+    /// final `- **`. A path rclone re-encodes is replaced by its nearest
+    /// ancestor without such a scalar, as a subtree (the whole tree, `+ /**`,
+    /// when even its first component has one).
     static func filterRules(for batch: [BatchItem], exists: (String) -> Bool) -> String {
         var lines: [String] = []
         for item in batch {
             var path = item.path
             var subtree = item.subtree || !exists(item.path)
-            while path.unicodeScalars.contains(where: { $0 == "\n" || $0 == "\r" }) {
+            while rcloneReencodes(path) {
                 path = parent(of: path)
                 subtree = true
             }
@@ -581,7 +597,7 @@ extension DirtySet {
             let glob = "/" + globEscaped(path)
             lines.append("+ " + glob)
             lines.append("+ /" + globEscaped(path + ".rclonelink"))
-            if subtree { lines.append("+ /" + globEscaped(path) + "/**") }
+            if subtree { lines.append("+ " + glob + "/**") }
         }
         lines.append("- **")
         return lines.joined(separator: "\n") + "\n"
@@ -590,36 +606,54 @@ extension DirtySet {
 
 extension RunOutcome {
     /// What a finished run did, from its exit code and its own part of the
-    /// profile log (rclone 1.75.1 `--use-json-log` lines). Exit 0 is success.
-    /// Exit 1 or 6 whose error/critical lines are all per-object failures
-    /// (`objectType` ending `.Object`) or rclone's own follow-ups (`Attempt …`
-    /// with no object; `not deleting files|directories as there were IO
-    /// errors`, which sets `deletesSkipped`) is `.objectErrors`. Everything
-    /// else — any other code (75/76/77/78/79 …), any other error line, or no
-    /// named object at all — is `.runFailed`.
+    /// profile log (rclone 1.75.1 `--use-json-log` lines).
+    /// - Exit 0 is success only if the script logged `Sync completed
+    ///   successfully` (an unmounted drive exits 0 without running rclone).
+    /// - Exit 1 or 6 whose error/critical lines are all per-object failures
+    ///   (`objectType` ending `.Object`) or rclone's own follow-ups is
+    ///   `.objectErrors`, with the failures of the LAST attempt only (a path
+    ///   that failed in attempt 1 and succeeded in attempt 2 is fine).
+    ///   Follow-ups: `Attempt …` and `Can't retry any of the errors …` with no
+    ///   object; `not deleting files|directories as there were IO errors`
+    ///   (an `.Fs` objectType), which sets `deletesSkipped`.
+    /// - Everything else — any other code (75/76/77/78/79 …), any other error
+    ///   line, a `{` line that is not JSON, or no named object — is `.runFailed`.
     static func classify(exitCode: Int32, runLog: String) -> RunOutcome {
-        if exitCode == 0 { return .success }
+        if exitCode == 0 {
+            return runLog.contains(" - Sync completed successfully") ? .success : .runFailed
+        }
         guard exitCode == 1 || exitCode == 6 else { return .runFailed }
-        var failed: Set<String> = []
-        var deletesSkipped = false
+        var attempt: Set<String> = [], lastFailedAttempt: Set<String> = []
+        var attemptSkipped = false, lastSkipped = false, sawAttemptLine = false
         for line in runLog.split(separator: "\n") where line.hasPrefix("{") {
-            guard let json = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
-                  let level = json["level"] as? String, level == "error" || level == "critical" else { continue }
+            guard let json = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any] else { return .runFailed }
+            guard let level = json["level"] as? String, level == "error" || level == "critical" else { continue }
             let message = json["msg"] as? String ?? ""
             let type = json["objectType"] as? String ?? ""
             let object = json["object"] as? String
             if type.hasSuffix(".Object"), let object, !object.isEmpty {
-                failed.insert(object)
+                attempt.insert(object)
             } else if type.hasSuffix(".Fs"),
                       message.hasPrefix("not deleting files as there were IO errors")
                         || message.hasPrefix("not deleting directories as there were IO errors") {
-                deletesSkipped = true
+                attemptSkipped = true
             } else if object == nil, message.hasPrefix("Attempt ") {
+                // The end of one attempt: its failures are what counts so far
+                // (none after `Attempt N/M succeeded`).
+                let failedAttempt = message.contains(" failed with ")
+                sawAttemptLine = true
+                lastFailedAttempt = failedAttempt ? attempt : []
+                lastSkipped = failedAttempt && attemptSkipped
+                attempt = []
+                attemptSkipped = false
+            } else if object == nil, message.hasPrefix("Can't retry any of the errors") {
                 continue
             } else {
                 return .runFailed
             }
         }
-        return failed.isEmpty ? .runFailed : .objectErrors(failedPaths: failed, deletesSkipped: deletesSkipped)
+        let failed = attempt.isEmpty && sawAttemptLine ? lastFailedAttempt : attempt
+        let skipped = attempt.isEmpty && sawAttemptLine ? lastSkipped : attemptSkipped
+        return failed.isEmpty ? .runFailed : .objectErrors(failedPaths: failed, deletesSkipped: skipped)
     }
 }
