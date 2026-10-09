@@ -6802,6 +6802,17 @@ enum ConfigSelfTest {
         guard late.fullRequired, late.checkpoint == nil else {
             return report(id, slug, false, "(a gap after the full run started was treated as covered)")
         }
+        // RootChanged carries id 0 (FSEvents.h) and replays are unsorted: a gap
+        // raised while a full run is in flight is never cleared by that run.
+        var zero = DirtySet()
+        zero.requireFullRun(eventId: 100)
+        zero.fullRunStarted(startEventId: 200)
+        zero.note("a.txt", isDirEvent: false, gap: false, eventId: 201, now: 1)
+        zero.note("", isDirEvent: true, gap: true, eventId: 0, now: 2)
+        zero.fullRunFinished(outcome: .success, exists: { _ in true })
+        guard zero.fullRequired, zero.checkpoint == nil else {
+            return report(id, slug, false, "(a gap with id 0 during a full run was treated as covered)")
+        }
         // A gap at id N: no checkpoint until a full run succeeds, whatever batches do meanwhile.
         var g = DirtySet()
         g.note("a", isDirEvent: false, gap: false, eventId: 5, now: 0)
@@ -6863,9 +6874,36 @@ enum ConfigSelfTest {
         f.note("busy.txt", isDirEvent: false, gap: false, eventId: 500, now: 1)
         f.fullRunFinished(outcome: .objectErrors(failedPaths: ["bad.txt", "busy.txt"], deletesSkipped: true), exists: exists)
         guard f.entries["gone.txt"] != nil, f.entries["done.txt"] == nil, f.entries["bad.txt"]?.failures == 1,
-              f.entries["bad.txt"]?.firstEventId == 10, f.entries["busy.txt"]?.firstEventId == 10, f.checkpoint == 0 else {
+              f.entries["bad.txt"]?.firstEventId == 10, f.entries["busy.txt"]?.firstEventId == 10, f.checkpoint == nil else {
             return report(id, slug, false, "(full run objectErrors: \(f.entries.mapValues(\.firstEventId)), checkpoint \(String(describing: f.checkpoint)))")
         }
+        // A full run's failed path has no replayable event: no checkpoint until it succeeds.
+        var u = DirtySet()
+        u.advance(toEventId: 1)
+        u.fullRunStarted(startEventId: 900)
+        u.fullRunFinished(outcome: .objectErrors(failedPaths: ["bad.bin"], deletesSkipped: false), exists: { _ in true })
+        guard u.checkpoint == nil else { return report(id, slug, false, "(checkpoint saved while a full run's failure is pending)") }
+        u.finish(u.takeBatch(now: 100, limit: 10), outcome: .success, exists: { _ in true })
+        guard u.checkpoint == 900 else { return report(id, slug, false, "(checkpoint after the failed path succeeded: \(String(describing: u.checkpoint)))") }
+        // A mass failure (every PUT failing) becomes a full-run requirement, not 6,000 entries.
+        var m = DirtySet()
+        m.fullRunStarted(startEventId: 50)
+        m.fullRunFinished(outcome: .objectErrors(failedPaths: Set((0..<6000).map { "d\($0)/f" }), deletesSkipped: true), exists: { _ in true })
+        guard m.fullRequired, m.entries.count <= DirtySet.fullRunThreshold else {
+            return report(id, slug, false, "(mass failure: \(m.entries.count) entries, full=\(m.fullRequired))")
+        }
+        // A never-quiet path does not pin the checkpoint: kept entries move their first
+        // event to the first in-flight note, and a covering full run lifts it past its start.
+        var q = DirtySet()
+        q.note("log.txt", isDirEvent: false, gap: false, eventId: 1000, now: 0)
+        let qb = q.takeBatch(now: 10, limit: 10)
+        q.note("log.txt", isDirEvent: false, gap: false, eventId: 1005, now: 11)
+        q.finish(qb, outcome: .success, exists: { _ in true })
+        guard q.entries["log.txt"]?.firstEventId == 1005 else { return report(id, slug, false, "(kept entry still pins its first event)") }
+        q.fullRunStarted(startEventId: 2801)
+        q.note("log.txt", isDirEvent: false, gap: false, eventId: 3000, now: 20)
+        q.fullRunFinished(outcome: .success, exists: { _ in true })
+        guard q.checkpoint == 2801 else { return report(id, slug, false, "(checkpoint after a covering full run: \(String(describing: q.checkpoint)))") }
         return report(id, slug, true)
     }
 
@@ -6884,7 +6922,9 @@ enum ConfigSelfTest {
         }
         let reWrapped = { (rule: String) in "--- start filters ---\n--- File filter rules ---\n\(rule)\n--- end filters ---" }
         guard ExcludeOracle(dump: reWrapped("- (?P<n>a)$")) == nil, ExcludeOracle(dump: reWrapped("- ^[a&&b]$")) == nil,
-              ExcludeOracle(dump: reWrapped("- ^[a--b]$")) == nil, ExcludeOracle(dump: reWrapped("- ^a--b$")) != nil else {
+              ExcludeOracle(dump: reWrapped("- ^[a--b]$")) == nil, ExcludeOracle(dump: reWrapped("- ^a--b$")) != nil,
+              ExcludeOracle(dump: reWrapped(#"- (^|/)\w+\.log$"#)) == nil, ExcludeOracle(dump: reWrapped("- (?i)(^|/)STRASSE\\.txt$")) == nil,
+              ExcludeOracle(dump: reWrapped(#"- (^|/)a\.b\$\(c\)$"#)) != nil else {
             return report(id, slug, false, "(RE2/ICU-divergent syntax not refused, or a plain -- refused)")
         }
         return report(id, slug, true)
