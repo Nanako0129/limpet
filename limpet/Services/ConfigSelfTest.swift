@@ -185,6 +185,11 @@ enum ConfigSelfTest {
             testSourceChangedScheduler,
             testSourceChangedLastError,
             testSourceChangedManagerIdle,
+            testExcludeOracleMatchesRclone,
+            testDirtySetCoalesceAndReady,
+            testDirtySetCollapseAndCheckpoint,
+            testDirtySetFullRunRules,
+            testDirtySetObjectErrors,
             testLogWatcherSplitMultibyteLine,
             testStalledLineIsAFailureMarker,
             testStalledSyncWatchdogEndToEnd,
@@ -6560,6 +6565,260 @@ enum ConfigSelfTest {
         _ = pumpMain(timeout: 1.0) { false }
         guard processed, manager.profileStates[retried.id] == .idle, manager.profileErrors[retried.id] == nil else {
             return report(id, slug, false, "(processed \(processed); 77 state \(String(describing: manager.profileStates[retried.id])), error \(manager.profileErrors[retried.id] ?? "nil"))")
+        }
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L92-S1 — DirtySet + ExcludeOracle (limpet-plan.md L9.2 S1)
+
+    /// rclone 1.75.1's `--dump filters` for side-project's real rule sources
+    /// (`2e6f0e92-exclude.txt` + its `additionalFlags` excludes), captured 2026-10-10.
+    private static let l92FilterDump = #"""
+--- start filters ---
+--- File filter rules ---
+- (^|/)build/.*$
+- (^|/)dist/.*$
+- (^|/)[^/]*\.trace/.*$
+- (^|/)[^/]*\.xcresult/.*$
+- (^|/)xcuserdata/.*$
+- (^|/)\.agent-local/perf/.*$
+- (^|/)\.agent-local/worktrees/.*$
+- (^|/)\._[^/]*$
+- (^|/)\.DS_Store$
+- (^|/)\.fseventsd$
+- (^|/)Thumbs\.db$
+- (^|/)Thumbs\.db:Encryptable$
+- (^|/)ehthumbs\.db$
+- (^|/)desktop\.ini$
+- (^|/)#recycle/.*$
+- (^|/)#snapshot/.*$
+- (^|/)@eadir/.*$
+- (^|/)[^/]*\.tmp$
+- (^|/)[^/]*\.temp$
+- (^|/)~\$[^/]*$
+- (^|/)[^/]*\.partial$
+- (^|/)\.limpet-check$
+- (^|/)target/.*$
+- (^|/)\.build/.*$
+- (^|/)node_modules/.*$
+- (^|/)\.venv/.*$
+- (^|/)__pycache__/.*$
+- (^|/)DerivedData/.*$
+--- Directory filter rules ---
+- (^|/)build/.*$
+- (^|/)dist/.*$
+- (^|/)[^/]*\.trace/.*$
+- (^|/)[^/]*\.xcresult/.*$
+- (^|/)xcuserdata/.*$
+- (^|/)\.agent-local/perf/.*$
+- (^|/)\.agent-local/worktrees/.*$
+- (^|/)#recycle/.*$
+- (^|/)#snapshot/.*$
+- (^|/)@eadir/.*$
+- (^|/)target/.*$
+- (^|/)\.build/.*$
+- (^|/)node_modules/.*$
+- (^|/)\.venv/.*$
+- (^|/)__pycache__/.*$
+- (^|/)DerivedData/.*$
+--- end filters ---
+"""#
+
+    private static func testExcludeOracleMatchesRclone() -> Bool {
+        let id = "AC-L92-S1a", slug = "exclude-oracle-matches-rclone"
+        guard let oracle = ExcludeOracle(dump: l92FilterDump) else { return report(id, slug, false, "(dump did not parse)") }
+        // Each path's verdict from `rclone lsf -R --files-only` over a tree of
+        // exactly these files with the same rules (captured with the dump).
+        let expected: [(String, Bool)] = [
+            ("._meta", true),
+            (".agent-local/perf/p.json", true),
+            (".agent-local/plans/plan.md", false),
+            (".agent-local/worktrees/a/f", true),
+            (".DS_Store", true),
+            (".fseventsd", true),
+            (".limpet-check", true),
+            (".venv/bin/python", true),
+            ("@eadir/t", true),
+            ("中文/檔案.md", false),
+            ("#recycle/a", true),
+            ("~$lock.docx", true),
+            ("a.txt", false),
+            ("a/.fseventsd", true),
+            ("build/x.o", true),
+            ("buildx/a", false),
+            ("deep/a/b/c/d.txt", false),
+            ("dir/desktop.ini", true),
+            ("dist.txt", false),
+            ("dist/app.js", true),
+            ("ios/DerivedData/x", true),
+            ("keep/#recycle/b", true),
+            ("lib/target/a", true),
+            ("mybuild/a", false),
+            ("node_modules/m/i.js", true),
+            ("notes.temp", true),
+            ("p/xcuserdata/u.plist", true),
+            ("perf.trace/data", true),
+            ("pkg/dist/b.js", true),
+            ("proj/.build/b", true),
+            ("py/__pycache__/m.pyc", true),
+            ("r/run.xcresult/info", true),
+            ("space name/file.txt", false),
+            ("src/._meta", true),
+            ("src/.DS_Store", true),
+            ("src/build/out.bin", true),
+            ("src/builds/keep.txt", false),
+            ("src/main.swift", false),
+            ("sub/.agent-local/worktrees/b/g", true),
+            ("target.txt", false),
+            ("target/debug/app", true),
+            ("Thumbs.db", true),
+            ("tmp/file.tmp", true),
+            ("web/node_modules/m/i.js", true),
+            ("x.partial", true)
+        ]
+        for (path, excluded) in expected where oracle.isExcluded(path) != excluded {
+            return report(id, slug, false, "(\(path): oracle says excluded=\(!excluded), rclone says \(excluded))")
+        }
+        // A directory event for an excluded directory itself (`rm -rf build`).
+        guard oracle.isExcluded("build", isDir: true), oracle.isExcluded("src/node_modules", isDir: true),
+              !oracle.isExcluded("src", isDir: true), !oracle.isExcluded("src/builds", isDir: true) else {
+            return report(id, slug, false, "(directory verdicts wrong)")
+        }
+        guard ExcludeOracle(dump: "--- start filters ---\n--- File filter rules ---\n- (unclosed\n--- end filters ---") == nil,
+              ExcludeOracle(dump: "no filters here") == nil else {
+            return report(id, slug, false, "(a broken dump was accepted)")
+        }
+        // Excluded churn never becomes an entry: 6,000 build outputs, then one source file.
+        var set = DirtySet()
+        for i in 0..<6000 where !oracle.isExcluded("photophore/build/obj\(i).o") {
+            set.note("photophore/build/obj\(i).o", isDirEvent: false, gap: false, eventId: UInt64(i + 1), now: 0)
+        }
+        guard set.entries.isEmpty, !set.fullRequired else {
+            return report(id, slug, false, "(build churn reached DirtySet: \(set.entries.count) entries, full=\(set.fullRequired))")
+        }
+        if !oracle.isExcluded("photophore/App/Main.swift") {
+            set.note("photophore/App/Main.swift", isDirEvent: false, gap: false, eventId: 6001, now: 0)
+        }
+        return report(id, slug, set.entries.count == 1, "(included file not noted)")
+    }
+
+    private static func testDirtySetCoalesceAndReady() -> Bool {
+        let id = "AC-L92-S1b", slug = "dirtyset-coalesce-ready"
+        var set = DirtySet()
+        for i in 0..<1000 { set.note("a/f.txt", isDirEvent: false, gap: false, eventId: UInt64(i + 1), now: 0) }
+        guard set.entries.count == 1, set.entries["a/f.txt"]?.firstEventId == 1 else {
+            return report(id, slug, false, "(1,000 notes of one path: \(set.entries.count) entries)")
+        }
+        guard set.takeBatch(now: 9.9, limit: 10).isEmpty, set.nextWakeup(now: 0) == 10 else {
+            return report(id, slug, false, "(ready before 10 s quiet)")
+        }
+        guard set.takeBatch(now: 10, limit: 10).map(\.path) == ["a/f.txt"] else {
+            return report(id, slug, false, "(not ready after 10 s quiet)")
+        }
+        // Never quiet: noted every 5 s, still taken once 300 s have passed since the first note.
+        var busy = DirtySet()
+        var t: TimeInterval = 0
+        while t < 300 { busy.note("log.txt", isDirEvent: false, gap: false, eventId: 1, now: t); t += 5 }
+        guard busy.takeBatch(now: 299, limit: 10).isEmpty, busy.takeBatch(now: 300, limit: 10).count == 1 else {
+            return report(id, slug, false, "(maxDelay not honoured)")
+        }
+        return report(id, slug, true)
+    }
+
+    private static func testDirtySetCollapseAndCheckpoint() -> Bool {
+        let id = "AC-L92-S1c", slug = "dirtyset-collapse-checkpoint"
+        var set = DirtySet()
+        for i in 1...201 { set.note("d/f\(i)", isDirEvent: false, gap: false, eventId: UInt64(i), now: 0) }
+        guard set.entries.count == 1, set.entries["d"]?.subtree == true, set.checkpoint == 0 else {
+            return report(id, slug, false, "(201 children: \(set.entries.count) entries, checkpoint \(String(describing: set.checkpoint)))")
+        }
+        let batch = set.takeBatch(now: 10, limit: 500)
+        set.finish(batch, outcome: .success, exists: { _ in true })
+        guard set.entries.isEmpty, set.checkpoint == 201 else {
+            return report(id, slug, false, "(after the subtree succeeded: checkpoint \(String(describing: set.checkpoint)))")
+        }
+        // A note under a subtree entry folds into it.
+        set.note("e", isDirEvent: true, gap: false, eventId: 300, now: 20)
+        set.note("e/x/y.txt", isDirEvent: false, gap: false, eventId: 301, now: 21)
+        guard set.entries.count == 1, set.entries["e"]?.lastSeen == 21 else {
+            return report(id, slug, false, "(note under a subtree entry not folded in)")
+        }
+        // In flight, re-noted: a successful finish keeps it; a failed run keeps everything.
+        let b2 = set.takeBatch(now: 40, limit: 500)
+        set.note("e", isDirEvent: true, gap: false, eventId: 302, now: 41)
+        set.finish(b2, outcome: .success, exists: { _ in true })
+        guard set.entries["e"] != nil, set.entries["e"]?.inFlight == false else {
+            return report(id, slug, false, "(re-noted in-flight entry dropped)")
+        }
+        let b3 = set.takeBatch(now: 60, limit: 500)
+        set.finish(b3, outcome: .runFailed, exists: { _ in true })
+        return report(id, slug, set.entries["e"] != nil, "(runFailed dropped an entry)")
+    }
+
+    private static func testDirtySetFullRunRules() -> Bool {
+        let id = "AC-L92-S1d", slug = "dirtyset-full-run-rules"
+        var set = DirtySet()
+        for i in 0...DirtySet.fullRunThreshold { set.note("p\(i)/f", isDirEvent: false, gap: false, eventId: UInt64(i + 1), now: 0) }
+        guard set.fullRequired, set.entries.isEmpty, set.checkpoint == nil else {
+            return report(id, slug, false, "(5,001 entries did not require a full run)")
+        }
+        set.note("late/f", isDirEvent: false, gap: false, eventId: 9000, now: 5)
+        guard set.entries.isEmpty else { return report(id, slug, false, "(note stored while a full run is pending)") }
+        set.fullRunStarted(at: 10)
+        set.note("during/f", isDirEvent: false, gap: false, eventId: 9001, now: 11)
+        set.fullRunFinished(outcome: .runFailed, exists: { _ in true })
+        guard set.fullRequired, set.entries["during/f"] != nil else {
+            return report(id, slug, false, "(a failed full run cleared the requirement or the entries)")
+        }
+        set.fullRunStarted(at: 20)
+        set.note("after/f", isDirEvent: false, gap: false, eventId: 9002, now: 21)
+        set.fullRunFinished(outcome: .success, exists: { _ in true })
+        guard !set.fullRequired, set.entries["during/f"] == nil, set.entries["after/f"] != nil else {
+            return report(id, slug, false, "(successful full run: full=\(set.fullRequired), entries \(set.entries.keys.sorted()))")
+        }
+        // A gap at id N: no checkpoint until a full run succeeds, whatever batches do meanwhile.
+        var g = DirtySet()
+        g.note("a", isDirEvent: false, gap: false, eventId: 5, now: 0)
+        g.note("", isDirEvent: true, gap: true, eventId: 10, now: 1)
+        g.fullRunStarted(at: 2)
+        g.note("b", isDirEvent: false, gap: false, eventId: 11, now: 3)
+        g.finish(g.takeBatch(now: 20, limit: 10), outcome: .success, exists: { _ in true })
+        guard g.checkpoint == nil else { return report(id, slug, false, "(checkpoint advanced past a pending full run)") }
+        g.fullRunFinished(outcome: .success, exists: { _ in true })
+        return report(id, slug, g.checkpoint == 11 && !g.fullRequired, "(checkpoint after the full run: \(String(describing: g.checkpoint)))")
+    }
+
+    private static func testDirtySetObjectErrors() -> Bool {
+        let id = "AC-L92-S1e", slug = "dirtyset-object-errors"
+        var set = DirtySet()
+        for p in ["x.bin", "y.txt", "gone.txt"] { set.note(p, isDirEvent: false, gap: false, eventId: 1, now: 0) }
+        set.note("dir", isDirEvent: true, gap: false, eventId: 2, now: 0)
+        let exists: (String) -> Bool = { $0 != "gone.txt" }
+        let failed = RunOutcome.objectErrors(failedPaths: ["x.bin"], deletesSkipped: true)
+        set.finish(set.takeBatch(now: 10, limit: 10), outcome: failed, exists: exists)
+        guard set.entries["x.bin"]?.failures == 1, set.entries["y.txt"] == nil,
+              set.entries["dir"]?.failures == 0, set.entries["gone.txt"]?.failures == 0 else {
+            return report(id, slug, false, "(after one object error: \(set.entries.mapValues(\.failures)))")
+        }
+        for t in [20.0, 30.0] { set.finish(set.takeBatch(now: t, limit: 10), outcome: failed, exists: exists) }
+        guard set.entries["x.bin"] == nil, set.gaveUp == ["x.bin"] else {
+            return report(id, slug, false, "(x.bin not given up after 3 failures)")
+        }
+        // Once the bad path is gone the kept deletes go through.
+        set.finish(set.takeBatch(now: 40, limit: 10), outcome: .success, exists: exists)
+        guard set.entries.isEmpty else { return report(id, slug, false, "(kept deletes never finished)") }
+        // A failing file inside a subtree entry counts against the subtree.
+        set.note("s", isDirEvent: true, gap: false, eventId: 3, now: 50)
+        set.finish(set.takeBatch(now: 60, limit: 10), outcome: .objectErrors(failedPaths: ["s/bad"], deletesSkipped: true), exists: exists)
+        guard set.entries["s"]?.failures == 1 else { return report(id, slug, false, "(subtree carrying a failed path not counted)") }
+        // Full run with object errors: covering, but a skipped delete stays and the failed path is re-noted.
+        var f = DirtySet()
+        f.note("gone.txt", isDirEvent: false, gap: false, eventId: 1, now: 0)
+        f.note("done.txt", isDirEvent: false, gap: false, eventId: 2, now: 0)
+        f.fullRunStarted(at: 5)
+        f.fullRunFinished(outcome: .objectErrors(failedPaths: ["bad.txt"], deletesSkipped: true), exists: exists)
+        guard f.entries["gone.txt"] != nil, f.entries["done.txt"] == nil, f.entries["bad.txt"]?.failures == 1 else {
+            return report(id, slug, false, "(full run objectErrors: \(f.entries.mapValues(\.failures)))")
         }
         return report(id, slug, true)
     }
