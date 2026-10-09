@@ -98,7 +98,7 @@ final class ExcludeOracle {
     /// directory (a directory event), so the directory check applies to it
     /// too — `rm -rf build` reports `build`.
     func isExcluded(_ relativePath: String, isDir: Bool = false) -> Bool {
-        if relativePath.unicodeScalars.contains(where: { "\n\r\u{85}\u{2028}\u{2029}".unicodeScalars.contains($0) }) {
+        if relativePath.unicodeScalars.contains(where: { "\n\u{0B}\u{0C}\r\u{85}\u{2028}\u{2029}".unicodeScalars.contains($0) }) {
             return false  // ICU's `.` and `$` treat these unlike RE2
         }
         var ancestor = ""
@@ -197,13 +197,12 @@ struct DirtySet {
     private(set) var fullRequiredEventId: UInt64?
     var fullRequired: Bool { fullRequiredEventId != nil }
     private(set) var fullRunStartEventId: UInt64?
-    /// The highest event id noted (ids for collapsed entries).
-    private(set) var highestEventId: UInt64 = 0
     /// What an empty set's checkpoint may claim: raised only by `advance` and
     /// by a covering full run, never by `note` (an unsorted replay delivers
     /// higher ids before lower ones).
     private(set) var streamPosition: UInt64 = 0
-    /// Paths dropped after `giveUpFailures`; the watcher logs them once.
+    /// Paths given up (`giveUpFailures`, or `giveUpFailuresWhileChanging` for
+    /// one that kept changing); the watcher logs them once.
     private(set) var gaveUp: [String] = []
     private var childCount: [String: Int] = [:]
     /// Entries strictly below each directory, so a directory event scans the
@@ -236,7 +235,6 @@ struct DirtySet {
     /// itself). `gap`: MustScanSubDirs, UserDropped, KernelDropped,
     /// EventIdsWrapped or RootChanged — the event stream lost detail.
     mutating func note(_ path: String, isDirEvent: Bool, gap: Bool, eventId: UInt64, now: TimeInterval) {
-        highestEventId = max(highestEventId, eventId)
         if gap || path.isEmpty { return requireFullRun(eventId: eventId) }
         // A required full run that has not started yet starts after this
         // event, so it covers it; nothing to store.
@@ -322,19 +320,18 @@ struct DirtySet {
     }
 
     /// A full run must cover everything up to `eventId` (a gap, an overflow,
-    /// or a watcher start without a usable checkpoint). Idle file entries are
+    /// or a watcher start without a usable checkpoint). Idle entries are
     /// dropped: that run starts after them.
     mutating func requireFullRun(eventId: UInt64) {
         // Raised while a full run is in flight: that run never clears it,
         // whatever the id says (RootChanged carries id 0; replays are unsorted).
         let floor = fullRunStartEventId.map { $0 + 1 } ?? 0
         fullRequiredEventId = max(fullRequiredEventId ?? 0, eventId, floor)
-        highestEventId = max(highestEventId, eventId)
-        // Subtree entries stay: they carry directory deletes, which that run
-        // may skip (rclone skips every delete when any object fails). A skipped
-        // delete of a single missing file waits for the next full run, as with
-        // today's full sync.
-        for (path, e) in entries where !e.inFlight && !e.subtree { remove(path) }
+        // Every idle entry goes, so the set is back under the limits that
+        // raised this. Deletes the full run then skips (rclone skips them all
+        // when any object fails) wait for a full run that does not — exactly
+        // today's full sync; entries still live at its end are kept for batches.
+        for (path, e) in entries where !e.inFlight { remove(path) }
     }
 
     func isReady(_ e: Entry, now: TimeInterval) -> Bool {
@@ -401,7 +398,6 @@ struct DirtySet {
                     if changed {
                         // Restart the upload clock so maxDelay keeps throttling it.
                         e.firstSeen = e.notedInFlightAt ?? e.lastSeen
-                        e.firstEventId = min(e.firstEventId, e.notedInFlightEventId ?? e.firstEventId)
                     }
                     e.notedInFlightAt = nil
                     e.notedInFlightEventId = nil
@@ -430,7 +426,7 @@ struct DirtySet {
         fullRunStartEventId = startEventId
     }
 
-    mutating func fullRunFinished(outcome: RunOutcome, exists: (String) -> Bool) {
+    mutating func fullRunFinished(outcome: RunOutcome, now: TimeInterval, exists: (String) -> Bool) {
         guard let start = fullRunStartEventId else { return }
         fullRunStartEventId = nil
         guard outcome != .runFailed else { return }
@@ -457,7 +453,7 @@ struct DirtySet {
             // apply (a mass failure, e.g. an S4 block, becomes a full-run
             // requirement, not 6,000 entries).
             if entries[path] == nil && coveringSubtree(of: path) == nil {
-                note(path, isDirEvent: false, gap: false, eventId: start, now: 0)
+                note(path, isDirEvent: false, gap: false, eventId: start, now: now)
             }
             let carrier = entries[path] != nil ? path : coveringSubtree(of: path)
             if let carrier {

@@ -85,7 +85,7 @@ limpet/
 |------|---------|
 | `LimpetCLI.swift` | Headless `limpet` CLI — `CLICommand`, `parse`/`execute`/`run` (pure over `CLIEnvironment`), `doctorChecks`, `resolveProfile`, `applyProfileAssignment` (bounded `profile set` key set); mutating commands (`profile create`/`show`/`set`/`enable`/`disable`/`delete`, `sync`, `install`/`reinstall`) drive `ProfileStore.writeProfileFile` + `SyncSetupService`; dispatched from `LimpetApp.init` before SwiftUI/`SyncManager` |
 | `CLIShimInstaller.swift` | Writes/refreshes the `~/.local/bin/limpet` shim on every launch; marker-guarded so it never clobbers a non-limpet file |
-| `DirtySet.swift` | limpet-plan.md L9.2 S1, not wired yet: `ExcludeOracle` (the profile's exclude rules as rclone compiled them via `--dump filters`, walked in rclone's first-match order) and `DirtySet` (FSEvents paths coalesced by path: quiet 10 s / max 300 s readiness, collapse > 200 children into a subtree entry, > 5,000 entries or a gap flag → full run required, per-object failure give-up after 3, checkpoint from each entry's first event id). Pure; self-tests AC-L92-S1a–f |
+| `DirtySet.swift` | limpet-plan.md L9.2 S1, not wired yet: `ExcludeOracle` (the profile's exclude rules as rclone compiled them via `--dump filters`, walked in rclone's first-match order) and `DirtySet` (FSEvents paths coalesced by path: quiet 10 s / max 300 s readiness, collapse > 200 children into a subtree entry, > 5,000 entries or a gap flag → full run required, per-object failure give-up after 3 (5 for a path that kept changing), checkpoint from each entry's first event id, empty-set checkpoint only from `advance` or a covering full run). Pure; self-tests AC-L92-S1a–g |
 
 ### File-Backed Configuration
 

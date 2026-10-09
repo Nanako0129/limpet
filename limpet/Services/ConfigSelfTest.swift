@@ -6784,13 +6784,13 @@ enum ConfigSelfTest {
         guard set.entries.isEmpty else { return report(id, slug, false, "(note stored while a full run is pending)") }
         set.fullRunStarted(startEventId: 9000)
         set.note("during/f", isDirEvent: false, gap: false, eventId: 9001, now: 11)
-        set.fullRunFinished(outcome: .runFailed, exists: { _ in true })
+        set.fullRunFinished(outcome: .runFailed, now: 0, exists: { _ in true })
         guard set.fullRequired, set.entries["during/f"] != nil else {
             return report(id, slug, false, "(a failed full run cleared the requirement or the entries)")
         }
         set.fullRunStarted(startEventId: 9001)
         set.note("after/f", isDirEvent: false, gap: false, eventId: 9002, now: 11)
-        set.fullRunFinished(outcome: .success, exists: { _ in true })
+        set.fullRunFinished(outcome: .success, now: 0, exists: { _ in true })
         guard !set.fullRequired, set.entries["during/f"] == nil, set.entries["after/f"] != nil else {
             return report(id, slug, false, "(successful full run: full=\(set.fullRequired), entries \(set.entries.keys.sorted()))")
         }
@@ -6800,7 +6800,7 @@ enum ConfigSelfTest {
         late.requireFullRun(eventId: 10)
         late.fullRunStarted(startEventId: 20)
         late.note("", isDirEvent: true, gap: true, eventId: 21, now: 7)
-        late.fullRunFinished(outcome: .success, exists: { _ in true })
+        late.fullRunFinished(outcome: .success, now: 0, exists: { _ in true })
         guard late.fullRequired, late.checkpoint == nil else {
             return report(id, slug, false, "(a gap after the full run started was treated as covered)")
         }
@@ -6811,7 +6811,7 @@ enum ConfigSelfTest {
         zero.fullRunStarted(startEventId: 200)
         zero.note("a.txt", isDirEvent: false, gap: false, eventId: 201, now: 1)
         zero.note("", isDirEvent: true, gap: true, eventId: 0, now: 2)
-        zero.fullRunFinished(outcome: .success, exists: { _ in true })
+        zero.fullRunFinished(outcome: .success, now: 0, exists: { _ in true })
         guard zero.fullRequired, zero.checkpoint == nil else {
             return report(id, slug, false, "(a gap with id 0 during a full run was treated as covered)")
         }
@@ -6824,7 +6824,7 @@ enum ConfigSelfTest {
         g.advance(toEventId: 11)
         g.finish(g.takeBatch(now: 20, limit: 10), outcome: .success, exists: { _ in true })
         guard g.checkpoint == nil else { return report(id, slug, false, "(checkpoint advanced past a pending full run)") }
-        g.fullRunFinished(outcome: .success, exists: { _ in true })
+        g.fullRunFinished(outcome: .success, now: 0, exists: { _ in true })
         return report(id, slug, g.checkpoint == 11 && !g.fullRequired, "(checkpoint after the full run: \(String(describing: g.checkpoint)))")
     }
 
@@ -6875,7 +6875,7 @@ enum ConfigSelfTest {
         f.note("done.txt", isDirEvent: false, gap: false, eventId: 2, now: 0)
         f.fullRunStarted(startEventId: 10)
         f.note("busy.txt", isDirEvent: false, gap: false, eventId: 500, now: 1)
-        f.fullRunFinished(outcome: .objectErrors(failedPaths: ["bad.txt", "busy.txt"], deletesSkipped: true), exists: exists)
+        f.fullRunFinished(outcome: .objectErrors(failedPaths: ["bad.txt", "busy.txt"], deletesSkipped: true), now: 0, exists: exists)
         guard f.entries["gone.txt"] != nil, f.entries["done.txt"] == nil, f.entries["bad.txt"]?.failures == 1,
               f.entries["bad.txt"]?.firstEventId == 10, f.entries["busy.txt"]?.firstEventId == 10, f.checkpoint == nil else {
             return report(id, slug, false, "(full run objectErrors: \(f.entries.mapValues(\.firstEventId)), checkpoint \(String(describing: f.checkpoint)))")
@@ -6884,14 +6884,14 @@ enum ConfigSelfTest {
         var u = DirtySet()
         u.advance(toEventId: 1)
         u.fullRunStarted(startEventId: 900)
-        u.fullRunFinished(outcome: .objectErrors(failedPaths: ["bad.bin"], deletesSkipped: false), exists: { _ in true })
+        u.fullRunFinished(outcome: .objectErrors(failedPaths: ["bad.bin"], deletesSkipped: false), now: 0, exists: { _ in true })
         guard u.checkpoint == nil else { return report(id, slug, false, "(checkpoint saved while a full run's failure is pending)") }
         u.finish(u.takeBatch(now: 100, limit: 10), outcome: .success, exists: { _ in true })
         guard u.checkpoint == 900 else { return report(id, slug, false, "(checkpoint after the failed path succeeded: \(String(describing: u.checkpoint)))") }
         // A mass failure (every PUT failing) becomes a full-run requirement, not 6,000 entries.
         var m = DirtySet()
         m.fullRunStarted(startEventId: 50)
-        m.fullRunFinished(outcome: .objectErrors(failedPaths: Set((0..<6000).map { "d\($0)/f" }), deletesSkipped: true), exists: { _ in true })
+        m.fullRunFinished(outcome: .objectErrors(failedPaths: Set((0..<6000).map { "d\($0)/f" }), deletesSkipped: true), now: 0, exists: { _ in true })
         guard m.fullRequired, m.entries.count <= DirtySet.fullRunThreshold else {
             return report(id, slug, false, "(mass failure: \(m.entries.count) entries, full=\(m.fullRequired))")
         }
@@ -6905,7 +6905,7 @@ enum ConfigSelfTest {
         guard q.entries["log.txt"]?.firstEventId == 1005 else { return report(id, slug, false, "(kept entry still pins its first event)") }
         q.fullRunStarted(startEventId: 2801)
         q.note("log.txt", isDirEvent: false, gap: false, eventId: 3000, now: 20)
-        q.fullRunFinished(outcome: .success, exists: { _ in true })
+        q.fullRunFinished(outcome: .success, now: 0, exists: { _ in true })
         guard q.checkpoint == 2801 else { return report(id, slug, false, "(checkpoint after a covering full run: \(String(describing: q.checkpoint)))") }
         return report(id, slug, true)
     }
@@ -6933,16 +6933,21 @@ enum ConfigSelfTest {
               lastAttemptAt >= 4 * (DirtySet.maxDelay - 10) else {
             return report(id, slug, false, "(changing+failing file: \(attempts) attempts, last at \(lastAttemptAt) s, gaveUp \(busy.gaveUp))")
         }
-        // A full-run requirement keeps subtree entries (directory deletes), and a
-        // full run that skipped deletes keeps them with their first event.
+        // A full-run requirement empties the set, so it cannot re-trigger itself
+        // during the run (round 4: kept subtrees looped full runs forever).
+        var r = DirtySet()
+        for i in 0...DirtySet.collapseChildren { r.note("top\(i)", isDirEvent: true, gap: false, eventId: UInt64(i + 1), now: 0) }
+        guard r.fullRequired, r.entries.isEmpty else { return report(id, slug, false, "(root overflow left \(r.entries.count) entries)") }
+        r.fullRunStarted(startEventId: 500)
+        r.note("README.md", isDirEvent: false, gap: false, eventId: 501, now: 1)
+        r.fullRunFinished(outcome: .objectErrors(failedPaths: ["bad.txt"], deletesSkipped: true), now: 2, exists: { _ in true })
+        guard !r.fullRequired else { return report(id, slug, false, "(a full run kept re-requiring itself)") }
+        // A full run that skipped deletes keeps live delete carriers with their first event.
         var d = DirtySet()
         d.note("old", isDirEvent: true, gap: false, eventId: 5, now: 0)
-        d.note("x.txt", isDirEvent: false, gap: false, eventId: 6, now: 0)
-        d.requireFullRun(eventId: 7)
-        guard d.entries.keys.sorted() == ["old"] else { return report(id, slug, false, "(requireFullRun dropped a subtree entry: \(d.entries.keys.sorted()))") }
         d.fullRunStarted(startEventId: 10)
         d.note("old/new.txt", isDirEvent: false, gap: false, eventId: 20, now: 1)
-        d.fullRunFinished(outcome: .objectErrors(failedPaths: ["bad.txt"], deletesSkipped: true), exists: { _ in true })
+        d.fullRunFinished(outcome: .objectErrors(failedPaths: ["bad.txt"], deletesSkipped: true), now: 2, exists: { _ in true })
         guard d.entries["old"]?.firstEventId == 5 else {
             return report(id, slug, false, "(skipped-delete subtree lost its first event: \(String(describing: d.entries["old"]?.firstEventId)))")
         }
@@ -6950,19 +6955,27 @@ enum ConfigSelfTest {
         var w = DirtySet()
         w.fullRunStarted(startEventId: 100)
         w.note("busy.log", isDirEvent: false, gap: false, eventId: 150, now: 5000)
-        w.fullRunFinished(outcome: .objectErrors(failedPaths: ["busy.log"], deletesSkipped: false), exists: { _ in true })
+        w.fullRunFinished(outcome: .objectErrors(failedPaths: ["busy.log"], deletesSkipped: false), now: 5000, exists: { _ in true })
         guard w.entries["busy.log"]?.lastSeen == 5000, w.takeBatch(now: 5001, limit: 10).isEmpty else {
             return report(id, slug, false, "(a full run's failure made a file being written ready at once)")
+        }
+        // …nor through a collapse of new failed paths into a directory with live children.
+        var ph = DirtySet()
+        ph.fullRunStarted(startEventId: 1000)
+        for i in 0..<150 { ph.note("photos/p\(i).jpg", isDirEvent: false, gap: false, eventId: UInt64(1001 + i), now: 5000) }
+        ph.fullRunFinished(outcome: .objectErrors(failedPaths: Set((0..<60).map { "photos/f\($0).jpg" }), deletesSkipped: false), now: 5000, exists: { _ in true })
+        guard ph.entries["photos"]?.subtree == true, ph.takeBatch(now: 5001, limit: 10).isEmpty else {
+            return report(id, slug, false, "(collapse of failed paths made files being written ready at once)")
         }
         // The stream position moves only with advance() and a covering full run.
         var e = DirtySet()
         e.advance(toEventId: 50)
         e.fullRunStarted(startEventId: 1000)
         guard e.checkpoint == 50 else { return report(id, slug, false, "(checkpoint moved when a full run started)") }
-        e.fullRunFinished(outcome: .runFailed, exists: { _ in true })
+        e.fullRunFinished(outcome: .runFailed, now: 0, exists: { _ in true })
         guard e.checkpoint == 50 else { return report(id, slug, false, "(checkpoint moved by a failed full run)") }
         e.fullRunStarted(startEventId: 1000)
-        e.fullRunFinished(outcome: .success, exists: { _ in true })
+        e.fullRunFinished(outcome: .success, now: 0, exists: { _ in true })
         guard e.checkpoint == 1000 else { return report(id, slug, false, "(checkpoint after a covering full run: \(String(describing: e.checkpoint)))") }
         e.note("late.txt", isDirEvent: false, gap: false, eventId: 5000, now: 0)
         e.finish(e.takeBatch(now: 20, limit: 10), outcome: .success, exists: { _ in true })
@@ -6991,7 +7004,8 @@ enum ConfigSelfTest {
             return report(id, slug, false, "(metadata section changed path verdicts)")
         }
         // A line terminator in a name: ICU and RE2 disagree, so never "excluded".
-        guard let oracle = ExcludeOracle(dump: l92FilterDump), !oracle.isExcluded("x.tmp\r"), oracle.isExcluded("x.tmp") else {
+        guard let oracle = ExcludeOracle(dump: l92FilterDump), !oracle.isExcluded("x.tmp\r"), !oracle.isExcluded("a.tmp\u{0B}"),
+              !oracle.isExcluded("a.tmp\u{0C}"), oracle.isExcluded("x.tmp") else {
             return report(id, slug, false, "(line-terminator name called excluded)")
         }
         let reWrapped = { (rule: String) in "--- start filters ---\n--- File filter rules ---\n\(rule)\n--- end filters ---" }
