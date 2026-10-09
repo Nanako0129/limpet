@@ -263,14 +263,28 @@ struct SyncProfile: Identifiable, Codable, Equatable {
 
     /// Flags a batch must not run with: include rules or a file list widen or
     /// replace the batch's own `- **`; --delete-excluded would delete everything
-    /// outside it; age filters and --exclude-if-present change a path's verdict
-    /// without any FSEvent; --error-on-no-transfer fails every no-op batch.
-    /// The generated script refuses a batch carrying any of them as well.
+    /// outside it; age filters, --hash-filter and --exclude-if-present change a
+    /// path's verdict without any FSEvent; --local-encoding and
+    /// --local-unicode-normalization change the names rclone filters on;
+    /// --error-on-no-transfer fails every no-op batch; a bare `--` would turn the
+    /// batch's own trailing flags into arguments. A single-dash token whose
+    /// letters include `f` (`-f`, `-vf…`) is the short --filter. The generated
+    /// script refuses a batch carrying any of them as well (same list).
     static let batchRefusedFlags: Set<String> = [
-        "--include", "--include-from", "--filter", "-f", "--filter-from", "--files-from",
+        "--include", "--include-from", "--filter", "--filter-from", "--files-from",
         "--files-from-raw", "--files-from0", "--delete-excluded", "--min-age", "--max-age",
-        "--exclude-if-present", "--error-on-no-transfer",
+        "--hash-filter", "--exclude-if-present", "--local-encoding",
+        "--local-unicode-normalization", "--error-on-no-transfer", "--",
     ]
+
+    /// Whether one additionalRcloneFlags token makes a batch unsafe.
+    static func refusesBatch(_ token: String) -> Bool {
+        let name = String(token.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false).first ?? "")
+            .replacingOccurrences(of: "_", with: "-")
+        if token.hasPrefix("-") && !token.hasPrefix("--") { return name.dropFirst().contains("f") }
+        if name == "--delete-excluded" { return !token.hasSuffix("=false") }
+        return batchRefusedFlags.contains(name)
+    }
 
     /// Why this profile must use full syncs although `incrementalSync` is on,
     /// or nil when batches may run (limpet-plan.md L9.2 S2). A batch adds its
@@ -281,11 +295,7 @@ struct SyncProfile: Identifiable, Codable, Equatable {
     var incrementalIneligibility: String? {
         guard incrementalSync else { return "incrementalSync is off" }
         guard syncDirection == .localToRemote else { return "incremental sync needs localToRemote" }
-        for token in additionalRcloneFlags.split(whereSeparator: \.isWhitespace).map(String.init) {
-            let name = String(token.split(separator: "=", maxSplits: 1).first ?? "").replacingOccurrences(of: "_", with: "-")
-            let short = token.hasPrefix("-f") && !token.hasPrefix("--") ? "-f" : name
-            guard Self.batchRefusedFlags.contains(name) || Self.batchRefusedFlags.contains(short) else { continue }
-            if name == "--delete-excluded", token.hasSuffix("=false") { continue }
+        for token in additionalRcloneFlags.split(whereSeparator: \.isWhitespace).map(String.init) where Self.refusesBatch(token) {
             return "additionalRcloneFlags \(token) changes what a batch would sync"
         }
         return nil

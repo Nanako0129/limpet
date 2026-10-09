@@ -448,6 +448,13 @@ final class SyncSetupService {
         // environment exists only for the self-test's stub rclone. A shipped
         // script must never run whatever binary an environment variable names,
         // so outside Debug builds the variable is cleared before the search.
+        // limpet-plan.md L9.2: the batch flag check and the RCLONE_* unset list
+        // come from SyncProfile.batchRefusedFlags, the list the watcher uses.
+        let batchRefusedCasePattern = SyncProfile.batchRefusedFlags
+            .subtracting(["--delete-excluded"]).sorted().joined(separator: "|")
+        let batchUnsetVariables = (SyncProfile.batchRefusedFlags.subtracting(["--"]).sorted()
+            .map { "RCLONE_" + $0.dropFirst(2).uppercased().replacingOccurrences(of: "-", with: "_") }
+            + ["RCLONE_FAST_LIST", "RCLONE_TPSLIMIT", "RCLONE_TPSLIMIT_BURST"]).joined(separator: " ")
         let rcloneBinSelection = honorRcloneBinOverride
             ? #"if [[ -z "${RCLONE_BIN:-}" || ! -x "$RCLONE_BIN" ]]; then"#
             : #"RCLONE_BIN=""; if true; then"#
@@ -570,12 +577,12 @@ final class SyncSetupService {
                     flag_name="${flag_token%%=*}"
                     flag_name="${flag_name//_/-}"
                     case "$flag_name" in
-                        --include|--include-from|--filter|--filter-from|--files-from|--files-from-raw|--files-from0|--min-age|--max-age|--exclude-if-present|--error-on-no-transfer)
-                            batch_refused="$flag_token" ;;
                         --delete-excluded)
                             [[ "$flag_token" == *=false ]] || batch_refused="$flag_token" ;;
+                        \(batchRefusedCasePattern))
+                            batch_refused="$flag_token" ;;
                         --*) ;;
-                        -f*)
+                        -*f*)
                             batch_refused="$flag_token" ;;
                     esac
                     if [[ -n "${batch_refused:-}" ]]; then
@@ -584,9 +591,7 @@ final class SyncSetupService {
                     fi
                 done
                 # rclone also reads any flag from an RCLONE_<FLAG> environment variable.
-                unset RCLONE_INCLUDE RCLONE_INCLUDE_FROM RCLONE_FILTER RCLONE_FILTER_FROM RCLONE_FILES_FROM \
-                    RCLONE_FILES_FROM_RAW RCLONE_FILES_FROM0 RCLONE_DELETE_EXCLUDED RCLONE_MIN_AGE RCLONE_MAX_AGE \
-                    RCLONE_EXCLUDE_IF_PRESENT RCLONE_ERROR_ON_NO_TRANSFER RCLONE_FAST_LIST RCLONE_TPSLIMIT
+                unset \(batchUnsetVariables)
             fi
 
             # Find rclone binary. Cover the common package-manager locations,
@@ -833,7 +838,7 @@ final class SyncSetupService {
                 cmd+=("${ADDITIONAL_FLAGS_ARRAY[@]}")
             fi
             if [[ -n "$DIRTY_FILTER" ]]; then
-                cmd+=(--tpslimit 4)
+                cmd+=(--tpslimit 4 --tpslimit-burst 1)
             fi
 
             # The max-delete lines of THIS run only (never an older run's lines in

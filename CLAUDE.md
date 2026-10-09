@@ -480,28 +480,33 @@ yet).** Profile field `incrementalSync` (default false; `profile set`, schema,
 reinstall trigger). `SyncProfile.incrementalIneligibility` keeps a profile on full
 syncs when it is off, not localToRemote, or `additionalRcloneFlags` holds a
 flag in `SyncProfile.batchRefusedFlags` (include/filter/files-from rules incl.
-`-f` and `--files-from0`, `--delete-excluded` unless `=false`, `--min-age`,
-`--max-age`, `--exclude-if-present`, `--error-on-no-transfer`; `_` read as `-`).
+`--files-from0`, `--delete-excluded` unless `=false`, `--min-age`, `--max-age`,
+`--hash-filter`, `--exclude-if-present`, `--local-encoding`,
+`--local-unicode-normalization`, `--error-on-no-transfer`, a bare `--`, and any
+single-dash token whose letters include `f`; `_` read as `-`).
 The generated script runs a batch when given a second argument, a filter file.
 Before the lock it refuses (exit 64) a batch for remoteToLocal, an unreadable
 file, or any of those flags (a newer config can reach an older watcher's
 batch), and unsets the matching `RCLONE_*` environment variables (rclone reads
-every flag from one). It logs `Starting sync (local → remote, N changed
+every flag from one); the case pattern and the unset list are generated from
+`batchRefusedFlags`. It logs `Starting sync (local → remote, N changed
 paths)` (N from `LIMPET_BATCH_ITEMS`) and runs `rclone sync` with
 `--filter-from <profile exclude file> --filter-from <batch file>`, no
 `--fast-list` (also removed from additionalFlags: with it rclone walks the
-whole remote prefix and ignores directory filters), and `--tpslimit 4`
-appended last so a profile's own value cannot raise it. Exit-code mapping (76,
+whole remote prefix and ignores directory filters), and `--tpslimit 4
+--tpslimit-burst 1` appended last so a profile's own values cannot raise them. Exit-code mapping (76,
 77) is unchanged. `DirtySet.filterRules(for:exists:)` writes the batch file
 (`+ /p`, `+ /p.rclonelink`, `+ /p/**` for a subtree or gone path, then `- **`):
-`\ * ? [ ]` escaped, `{` `}` written as `?` (rclone gives up on directory
-filters for brace patterns even when escaped), trailing whitespace bracketed
-(rclone TrimSpaces filter lines), and a path holding a scalar rclone re-encodes
-in its Standard name (control characters, DEL, U+2400–U+2421, U+201B, U+FF0E,
-U+FF0F) synced through its nearest clean ancestor as a subtree.
+`\ * ? [ ]` escaped, `{` `}` written as `?` (rclone's directory-filter
+derivation gives up on `{{`, `}}`, `{…{` and `{…/…}` even when escaped,
+measured), trailing whitespace bracketed (rclone TrimSpaces filter lines), and a
+path holding a scalar rclone filters in a different form (control characters,
+DEL, U+2401–U+241F, U+2421, U+201B; measured: raw rules for U+2400, U+2420,
+U+FF0E, U+FF0F do match) synced through its nearest clean ancestor as a subtree
+(`DirtySet.scope`, also used to attribute failures).
 `RunOutcome.classify(exitCode:runLog:)` turns a run into `.success` (exit 0 AND
 the script's `Sync completed successfully` line — an unmounted drive exits 0
-without it), `.objectErrors` (exit 1/6 with only per-object failures, taken from
+without it), `.objectErrors` (exit 1/5/6 with only per-object failures, taken from
 the last attempt, and known rclone follow-up lines) or `.runFailed`. Verified end
 to end with real rclone 1.75.1 local→local (excluded, unlisted, deleted, new,
 symlink, tab-named and `{{…}}` paths). Self-tests AC-L92-S2a1–4.

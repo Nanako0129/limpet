@@ -7152,11 +7152,12 @@ enum ConfigSelfTest {
             q.additionalRcloneFlags = flags
             return q.incrementalIneligibility
         }
-        let eligible = ["", "--s3-no-head --update", "--exclude=build/** --fast-list", "--delete-excluded=false", "--files-from-x"]
+        let eligible = ["", "--s3-no-head --update", "--exclude=build/** --fast-list", "--delete-excluded=false", "--files-from-x", "-v", "-P"]
         let ineligible = ["--include=*.txt", "--include-from=f", "--filter=+_x", "-f", "-f+x", "--filter-from=f",
                           "--files-from=f", "--files-from-raw=f", "--delete-excluded", "--delete-excluded=true",
                           "--delete_excluded", "--include_from=f", "--min-age=2m", "--max-age=1d",
-                          "--exclude-if-present=.nosync", "--files-from0=f", "--error-on-no-transfer"]
+                          "--exclude-if-present=.nosync", "--files-from0=f", "--error-on-no-transfer",
+                          "--local-encoding=Slash", "--local-unicode-normalization", "--hash-filter=@/4", "--", "-vf!"]
         for f in eligible where reason(f) != nil { return report(id, slug, false, "(\(f) refused: \(reason(f)!))") }
         for f in ineligible where reason(f) == nil { return report(id, slug, false, "(\(f) accepted)") }
         guard reason("", enabled: false) != nil, reason("", direction: .remoteToLocal) != nil else {
@@ -7180,7 +7181,8 @@ enum ConfigSelfTest {
         let filterFroms = a.indices.filter { a[$0] == "--filter-from" && $0 + 1 < a.count }.map { a[$0 + 1] }
         guard batch.status == 0, filterFroms.count == 2, filterFroms[0].hasSuffix("exclude.txt"), filterFroms[1] == dirty,
               !a.contains(where: { $0.hasPrefix("--fast-list") }), a.contains("--s3-no-head"),
-              let t = a.lastIndex(where: { $0.hasPrefix("--tpslimit") }), a[t] == "--tpslimit", a.indices.contains(t + 1), a[t + 1] == "4",
+              let t = a.lastIndex(of: "--tpslimit"), a.indices.contains(t + 1), a[t + 1] == "4",
+              !a[(t + 1)...].contains(where: { $0.hasPrefix("--tpslimit=") }),
               a.contains("ENV=unset"),
               batch.log.contains("Starting sync (local → remote, 3 changed paths)") else {
             return report(id, slug, false, "(batch argv/log wrong: \(a))")
@@ -7194,7 +7196,7 @@ enum ConfigSelfTest {
               reverse.status == 64, !reverse.stubRan, missing.status == 64, !missing.stubRan else {
             return report(id, slug, false, "(a remoteToLocal or unreadable batch was not refused)")
         }
-        for flags in ["--delete-excluded", "--include=*.txt", "-f", "--min-age=2m"] {
+        for flags in ["--delete-excluded", "--include=*.txt", "-f", "--min-age=2m", "--hash-filter=@/4", "--", "-vf!"] {
             guard let refused = runScriptFixture(name: "ac-l92-s2a2-ref", overrides: ["additionalFlags": flags], extraArgs: [dirty]),
                   refused.status == 64, !refused.stubRan, refused.log.contains("changes what a batch would sync") else {
                 return report(id, slug, false, "(a batch with \(flags) was not refused by the script)")
@@ -7216,6 +7218,7 @@ enum ConfigSelfTest {
             DirtySet.BatchItem(path: "x/trail \u{A0}", subtree: false, generation: 0),
             DirtySet.BatchItem(path: "y/line\nbreak/f", subtree: false, generation: 0),
             DirtySet.BatchItem(path: "tab\there.txt", subtree: false, generation: 0),
+            DirtySet.BatchItem(path: "2026\u{FF0E}10/n.txt", subtree: false, generation: 0),
         ]
         let text = DirtySet.filterRules(for: items, exists: { $0 != "old.txt" })
         let expected = [
@@ -7226,9 +7229,19 @@ enum ConfigSelfTest {
             "+ /x/trail[ ][\u{A0}]", "+ /x/trail \u{A0}.rclonelink",
             "+ /y", "+ /y.rclonelink", "+ /y/**",
             "+ /**",
+            "+ /2026\u{FF0E}10/n.txt", "+ /2026\u{FF0E}10/n.txt.rclonelink",
             "- **",
         ].joined(separator: "\n") + "\n"
-        return report(id, slug, text == expected, "(got:\n\(text))")
+        guard text == expected else { return report(id, slug, false, "(got:\n\(text))") }
+        // Failures of a widened item are reported under rclone's encoded name
+        // below the scope: they are still this item's (counted, not unattributed).
+        var set = DirtySet()
+        set.note("a/tab\tfile.txt", isDirEvent: false, gap: false, eventId: 1, now: 0)
+        set.finish(set.takeBatch(now: 10, limit: 10), outcome: .objectErrors(failedPaths: ["a/tab\u{2409}file.txt"], deletesSkipped: false), exists: { _ in true })
+        guard set.entries["a/tab\tfile.txt"]?.failures == 1, !set.fullRunOwed else {
+            return report(id, slug, false, "(a widened item's failure was not attributed to it)")
+        }
+        return report(id, slug, true)
     }
 
     private static func testRunClassifier() -> Bool {
@@ -7260,6 +7273,7 @@ enum ConfigSelfTest {
             (1, [objectError, other].joined(separator: "\n"), .runFailed),
             (1, [notDeleting, attempt].joined(separator: "\n"), .runFailed),
             (1, [objectError, notDeleting, attempt, succeeded].joined(separator: "\n"), .runFailed),
+            (5, [objectError, attempt].joined(separator: "\n"), .objectErrors(failedPaths: ["shanjie-s5p/r.jsonl"], deletesSkipped: false)),
             (7, log, .runFailed), (77, log, .runFailed), (75, "", .runFailed),
         ]
         for (code, text, expected) in cases where RunOutcome.classify(exitCode: code, runLog: text) != expected {
