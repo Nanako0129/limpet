@@ -7069,6 +7069,15 @@ enum ConfigSelfTest {
         guard un.entries["a.txt"]?.failures == 0, pf.entries["p"] != nil else {
             return report(id, slug, false, "(an unattributed failure settled or blamed an item)")
         }
+        // …but it cannot pin the same items forever: the fifth such batch in a
+        // row gives them up to the owed full run.
+        io.finish(io.takeBatch(now: 50, limit: 10), outcome: .objectErrors(failedPaths: [], deletesSkipped: true), exists: { $0 != "gone" })
+        guard io.entries.isEmpty, io.gaveUp.sorted() == ["gone", "ok.txt"], io.fullRunOwed else {
+            return report(id, slug, false, "(unattributed failures not bounded: entries \(io.entries.keys.sorted()), gaveUp \(io.gaveUp))")
+        }
+        var empty = DirtySet()
+        empty.finish([], outcome: .objectErrors(failedPaths: [], deletesSkipped: false), exists: { _ in true })
+        guard !empty.fullRunOwed else { return report(id, slug, false, "(an empty batch owed a full run)") }
         // An owe raised while a full run is in flight survives that run's success.
         var od = DirtySet()
         od.note("x.bin", isDirEvent: false, gap: false, eventId: 1, now: 0)
