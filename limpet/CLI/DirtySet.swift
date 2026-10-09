@@ -4,39 +4,54 @@ import Foundation
 /// (build output, worktrees) never reaches `DirtySet` (limpet-plan.md L9.2 S1).
 /// Built from `rclone lsf --dump filters <the profile's rule sources> <empty dir>`:
 /// rclone turns the globs into regexes; this type only walks rclone's first-match
-/// order (fs/filter/rules.go `include`, filter.go `IncludeDirectory`). A wrongly
-/// dropped included path waits for the next full run; a wrongly kept excluded
-/// path costs a no-op batch, never an upload, because every batch applies the
-/// real filters in rclone.
-struct ExcludeOracle {
+/// order (fs/filter/rules.go `include`, filter.go `IncludeDirectory`).
+///
+/// It may only err towards "included": rclone's regexes are Go RE2 and are
+/// re-compiled here with ICU, so a dump using syntax whose meaning differs
+/// between the two is refused (nil), and a path holding a line terminator is
+/// never called excluded. A wrongly dropped included path would wait for the
+/// next full run. A wrongly kept excluded path is meant to cost only a no-op
+/// batch, because batches apply the real filters in rclone — unverified until
+/// L9.2 S2's batch fixture.
+final class ExcludeOracle {
     struct Rule {
         let include: Bool
         let regex: NSRegularExpression
 
-        func matches(_ s: String) -> Bool {
-            regex.firstMatch(in: s, range: NSRange(s.startIndex..., in: s)) != nil
+        func matches(_ s: NSString) -> Bool {
+            regex.firstMatch(in: s as String, range: NSRange(location: 0, length: s.length)) != nil
         }
     }
 
     let fileRules: [Rule]
     let dirRules: [Rule]
+    /// Directory verdicts by "a/b/": one burst of events shares its ancestors,
+    /// so each is matched once (an uncached walk measured ~320 µs per event).
+    private var dirVerdicts: [String: Bool] = [:]
 
     /// Parses rclone's `--- start filters ---` … `--- end filters ---` block.
-    /// nil when the block is missing or a regex does not compile, so the caller
-    /// drops nothing rather than guessing.
+    /// Only the file and directory sections are rules for paths; any other
+    /// section (e.g. `--- Metadata filter rules ---`) is skipped. nil when the
+    /// end marker is missing, a regex does not compile, or a regex uses syntax
+    /// that RE2 and ICU read differently — the caller then drops nothing.
     init?(dump: String) {
         var file: [Rule] = [], dir: [Rule] = []
-        var section: Int?  // 0 = file rules, 1 = directory rules
+        var section: Int?  // 0 = file rules, 1 = directory rules, nil = skip
         var sawEnd = false
         for line in dump.split(separator: "\n", omittingEmptySubsequences: false).map(String.init) {
-            switch line {
-            case "--- File filter rules ---": section = 0; continue
-            case "--- Directory filter rules ---": section = 1; continue
-            case "--- end filters ---": sawEnd = true; section = nil; continue
-            default: break
+            if line.hasPrefix("--- ") && line.hasSuffix(" ---") {
+                switch line {
+                case "--- File filter rules ---": section = 0
+                case "--- Directory filter rules ---": section = 1
+                case "--- end filters ---": sawEnd = true; section = nil
+                default: section = nil
+                }
+                continue
             }
             guard let section, line.count > 2, line.hasPrefix("+ ") || line.hasPrefix("- ") else { continue }
-            guard let regex = try? NSRegularExpression(pattern: String(line.dropFirst(2))) else { return nil }
+            let pattern = String(line.dropFirst(2))
+            guard !Self.readsDifferently(pattern),
+                  let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
             let rule = Rule(include: line.hasPrefix("+ "), regex: regex)
             if section == 0 { file.append(rule) } else { dir.append(rule) }
         }
@@ -45,23 +60,53 @@ struct ExcludeOracle {
         dirRules = dir
     }
 
+    /// RE2-only group syntax, or `&&` / `--` / a nested `[` inside a bracket
+    /// expression (ICU set operations, literal in RE2).
+    static func readsDifferently(_ pattern: String) -> Bool {
+        if pattern.contains("(?P") || pattern.contains("(?U") { return true }
+        var inBracket = false, escaped = false
+        var previous: Character = " "
+        for c in pattern {
+            defer { previous = escaped ? " " : c }
+            if escaped { escaped = false; continue }
+            if c == "\\" { escaped = true; continue }
+            if inBracket {
+                if c == "]" { inBracket = false }
+                else if c == "[" || (c == "&" && previous == "&") || (c == "-" && previous == "-") { return true }
+            } else if c == "[" {
+                inBracket = true
+            }
+        }
+        return false
+    }
+
     /// rclone's verdict for a root-relative path: skipped when an ancestor
     /// directory ("a/", "a/b/") is excluded by the directory rules (rclone never
     /// walks into it), or when the first matching file rule excludes it. No
-    /// matching rule means included, as in rclone.
-    /// `isDir`: the path is a directory (a directory event), so rclone's own
-    /// directory check applies to it too — `rm -rf build` reports `build`.
+    /// matching rule means included, as in rclone. `isDir`: the path is a
+    /// directory (a directory event), so the directory check applies to it
+    /// too — `rm -rf build` reports `build`.
     func isExcluded(_ relativePath: String, isDir: Bool = false) -> Bool {
+        if relativePath.unicodeScalars.contains(where: { "\n\r\u{85}\u{2028}\u{2029}".unicodeScalars.contains($0) }) {
+            return false  // ICU's `.` and `$` treat these unlike RE2
+        }
         var ancestor = ""
         let components = relativePath.split(separator: "/")
         for component in isDir ? components[...] : components.dropLast() {
             ancestor += component + "/"
-            if Self.firstMatch(dirRules, ancestor) == false { return true }
+            if !dirIncluded(ancestor) { return true }
         }
-        return !isDir && Self.firstMatch(fileRules, relativePath) == false
+        return !isDir && Self.firstMatch(fileRules, relativePath as NSString) == false
     }
 
-    private static func firstMatch(_ rules: [Rule], _ s: String) -> Bool? {
+    private func dirIncluded(_ dir: String) -> Bool {
+        if let cached = dirVerdicts[dir] { return cached }
+        let included = Self.firstMatch(dirRules, dir as NSString) ?? true
+        dirVerdicts[dir] = included
+        return included
+    }
+
+    private static func firstMatch(_ rules: [Rule], _ s: NSString) -> Bool? {
         rules.first { $0.matches(s) }?.include
     }
 }
@@ -81,13 +126,15 @@ enum RunOutcome: Equatable {
 /// Paths that changed and are not yet on the remote, coalesced by path
 /// (limpet-plan.md L9.2 S1). N events for one path are one entry; the watcher
 /// hands ready entries to rclone in batches. Pure: no clock, no I/O — the
-/// caller passes `now` and an `exists` check.
+/// caller passes `now`, FSEvents ids and an `exists` check. Coverage by a full
+/// run is decided by event id (an event with an id at or below the id taken
+/// when the run started happened before it), never by wall-clock time.
 struct DirtySet {
     /// A path must be quiet this long before it is uploaded, so a file being
     /// written is not uploaded once per write (and mostly not mid-write, L9.1).
     static let quiet: TimeInterval = 10
     /// …but a file that never goes quiet (an appended log) is still uploaded
-    /// at least this often.
+    /// at least this often — and at most about this often.
     static let maxDelay: TimeInterval = 300
     /// More dirty entries than this under one directory become one subtree
     /// entry for the directory: one rclone rule instead of hundreds.
@@ -103,12 +150,17 @@ struct DirtySet {
         var firstSeen: TimeInterval
         var lastSeen: TimeInterval
         var firstEventId: UInt64
-        /// `+ /p/**` rather than `+ /p`: a directory event (a moved directory
-        /// reports only itself, S0 E4) or a collapsed directory.
+        var lastEventId: UInt64
+        /// A directory event (a moved directory reports only itself, S0 E4) or
+        /// a collapsed directory. The batch then needs both `+ /p` and
+        /// `+ /p/**` (the path may be a file again by then).
         var subtree: Bool
         var generation = 0
         var failures = 0
         var inFlight = false
+        /// The first note while in flight: the next upload's clock starts here,
+        /// so `maxDelay` keeps throttling a file that never goes quiet.
+        var notedInFlightAt: TimeInterval?
     }
 
     struct BatchItem: Equatable {
@@ -119,16 +171,34 @@ struct DirtySet {
 
     private(set) var entries: [String: Entry] = [:]
     private(set) var fullRequired = false
-    private(set) var fullRequiredSince: TimeInterval?
-    private(set) var fullRunStartedAt: TimeInterval?
+    /// The event id at which the pending full run became required.
+    private(set) var fullRequiredEventId: UInt64?
+    private(set) var fullRunStartEventId: UInt64?
     private(set) var highestEventId: UInt64 = 0
     /// Paths dropped after `giveUpFailures`; the watcher logs them once.
     private(set) var gaveUp: [String] = []
     private var childCount: [String: Int] = [:]
+    /// Entries strictly below each directory, so a directory event scans the
+    /// set only when it has something to absorb.
+    private var descendantCount: [String: Int] = [:]
 
     static func parent(of path: String) -> String {
         guard let slash = path.lastIndex(of: "/") else { return "" }
         return String(path[..<slash])
+    }
+
+    private static func ancestors(of path: String) -> [String] {
+        var out: [String] = []
+        var p = parent(of: path)
+        while !p.isEmpty { out.append(p); p = parent(of: p) }
+        return out
+    }
+
+    /// Raises the stream position the checkpoint may advance to when no entry
+    /// is live: the id current when the FSEvents stream started (everything
+    /// before it is covered by that start's catch-up run or a resume).
+    mutating func advance(toEventId id: UInt64) {
+        highestEventId = max(highestEventId, id)
     }
 
     /// Records one FSEvents event for a root-relative path ("" = the root
@@ -136,10 +206,10 @@ struct DirtySet {
     /// EventIdsWrapped or RootChanged — the event stream lost detail.
     mutating func note(_ path: String, isDirEvent: Bool, gap: Bool, eventId: UInt64, now: TimeInterval) {
         highestEventId = max(highestEventId, eventId)
-        if gap || path.isEmpty { return requireFullRun(now: now) }
+        if gap || path.isEmpty { return requireFullRun(eventId: eventId) }
         // A required full run that has not started yet starts after this
         // event, so it covers it; nothing to store.
-        if fullRequired && fullRunStartedAt == nil { return }
+        if fullRequired && fullRunStartEventId == nil { return }
 
         if let covering = coveringSubtree(of: path) {
             touch(covering, eventId: eventId, now: now, subtree: false)
@@ -148,35 +218,25 @@ struct DirtySet {
         if entries[path] != nil {
             touch(path, eventId: eventId, now: now, subtree: isDirEvent)
         } else {
-            entries[path] = Entry(firstSeen: now, lastSeen: now, firstEventId: eventId, subtree: isDirEvent)
-            childCount[Self.parent(of: path), default: 0] += 1
+            insert(path, Entry(firstSeen: now, lastSeen: now, firstEventId: eventId, lastEventId: eventId, subtree: isDirEvent))
         }
         if isDirEvent { absorbDescendants(of: path) }
         let parent = Self.parent(of: path)
-        if !parent.isEmpty, childCount[parent, default: 0] > Self.collapseChildren {
-            collapse(into: parent, now: now)
-        } else if parent.isEmpty, childCount[""] ?? 0 > Self.collapseChildren {
-            return requireFullRun(now: now)
+        if childCount[parent, default: 0] > Self.collapseChildren {
+            if parent.isEmpty { return requireFullRun(eventId: eventId) }
+            collapse(into: parent, now: now, eventId: eventId)
         }
-        if entries.count > Self.fullRunThreshold { requireFullRun(now: now) }
+        if entries.count > Self.fullRunThreshold { requireFullRun(eventId: eventId) }
     }
 
     private func coveringSubtree(of path: String) -> String? {
-        var p = Self.parent(of: path)
-        while !p.isEmpty {
-            if entries[p]?.subtree == true { return p }
-            p = Self.parent(of: p)
-        }
-        return nil
+        Self.ancestors(of: path).first { entries[$0]?.subtree == true }
     }
 
-    private mutating func touch(_ path: String, eventId: UInt64, now: TimeInterval, subtree: Bool) {
-        guard var e = entries[path] else { return }
-        e.lastSeen = now
-        e.firstEventId = min(e.firstEventId, eventId)
-        e.generation += 1
-        e.subtree = e.subtree || subtree
-        entries[path] = e
+    private mutating func insert(_ path: String, _ entry: Entry) {
+        entries[path] = entry
+        childCount[Self.parent(of: path), default: 0] += 1
+        for a in Self.ancestors(of: path) { descendantCount[a, default: 0] += 1 }
     }
 
     private mutating func remove(_ path: String) {
@@ -184,34 +244,53 @@ struct DirtySet {
         let parent = Self.parent(of: path)
         childCount[parent, default: 1] -= 1
         if childCount[parent] == 0 { childCount.removeValue(forKey: parent) }
+        for a in Self.ancestors(of: path) {
+            descendantCount[a, default: 1] -= 1
+            if descendantCount[a] == 0 { descendantCount.removeValue(forKey: a) }
+        }
+    }
+
+    private mutating func touch(_ path: String, eventId: UInt64, now: TimeInterval, subtree: Bool) {
+        guard var e = entries[path] else { return }
+        e.lastSeen = now
+        e.firstEventId = min(e.firstEventId, eventId)
+        e.lastEventId = max(e.lastEventId, eventId)
+        e.generation += 1
+        e.subtree = e.subtree || subtree
+        if e.inFlight && e.notedInFlightAt == nil { e.notedInFlightAt = now }
+        entries[path] = e
     }
 
     /// Folds every idle entry below `dir` into `dir`'s entry (which must exist).
     /// In-flight entries finish on their own; the subtree re-covers them.
     private mutating func absorbDescendants(of dir: String) {
+        guard descendantCount[dir, default: 0] > 0 else { return }
         let prefix = dir + "/"
-        for (path, e) in entries where path.hasPrefix(prefix) && !e.inFlight {
+        let absorbed = entries.filter { $0.key.hasPrefix(prefix) && !$0.value.inFlight }
+        for (path, e) in absorbed {
             entries[dir]!.firstSeen = min(entries[dir]!.firstSeen, e.firstSeen)
             entries[dir]!.firstEventId = min(entries[dir]!.firstEventId, e.firstEventId)
+            entries[dir]!.lastEventId = max(entries[dir]!.lastEventId, e.lastEventId)
             remove(path)
         }
     }
 
-    private mutating func collapse(into dir: String, now: TimeInterval) {
+    private mutating func collapse(into dir: String, now: TimeInterval, eventId: UInt64) {
         if entries[dir] == nil {
-            entries[dir] = Entry(firstSeen: now, lastSeen: now, firstEventId: highestEventId, subtree: true)
-            childCount[Self.parent(of: dir), default: 0] += 1
+            insert(dir, Entry(firstSeen: now, lastSeen: now, firstEventId: eventId, lastEventId: eventId, subtree: true))
         } else {
-            entries[dir]!.subtree = true
-            entries[dir]!.lastSeen = now
-            entries[dir]!.generation += 1
+            touch(dir, eventId: eventId, now: now, subtree: true)
         }
         absorbDescendants(of: dir)
     }
 
-    private mutating func requireFullRun(now: TimeInterval) {
+    /// A full run must cover everything up to `eventId` (a gap, an overflow,
+    /// or a watcher start without a usable checkpoint). Idle entries are
+    /// dropped: that run starts after them.
+    mutating func requireFullRun(eventId: UInt64) {
         fullRequired = true
-        fullRequiredSince = now
+        fullRequiredEventId = max(fullRequiredEventId ?? 0, eventId)
+        highestEventId = max(highestEventId, eventId)
         for (path, e) in entries where !e.inFlight { remove(path) }
     }
 
@@ -233,65 +312,88 @@ struct DirtySet {
             .prefix(limit)
         return ready.map { path, e in
             entries[path]!.inFlight = true
+            entries[path]!.notedInFlightAt = nil
             return BatchItem(path: path, subtree: e.subtree, generation: e.generation)
         }
     }
 
-    /// Whether `path` (an entry) carries one of the failed paths.
-    private static func carries(_ path: String, subtree: Bool, of failed: Set<String>) -> Bool {
-        failed.contains(path) || (subtree && failed.contains { $0.hasPrefix(path + "/") })
+    /// Whether an entry covers one of the failed paths. A subtree entry, and a
+    /// file entry whose path is gone (the batch also sends `+ /p/**`), cover
+    /// everything below them.
+    private static func carries(_ path: String, coversBelow: Bool, of failed: Set<String>) -> Bool {
+        failed.contains(path) || (coversBelow && failed.contains { $0.hasPrefix(path + "/") })
+    }
+
+    /// An entry this run may have finished: dropped if nothing new arrived
+    /// while it was in flight, else kept with a fresh upload clock.
+    private mutating func settle(_ path: String, generation: Int) {
+        guard var e = entries[path] else { return }
+        if e.generation == generation { return remove(path) }
+        e.failures = 0
+        e.firstSeen = e.notedInFlightAt ?? e.lastSeen
+        e.notedInFlightAt = nil
+        entries[path] = e
     }
 
     mutating func finish(_ batch: [BatchItem], outcome: RunOutcome, exists: (String) -> Bool) {
         for item in batch {
-            guard var e = entries[item.path] else { continue }
-            e.inFlight = false
-            entries[item.path] = e
+            guard entries[item.path] != nil else { continue }
+            entries[item.path]!.inFlight = false
             switch outcome {
             case .runFailed:
-                continue
+                entries[item.path]!.notedInFlightAt = nil
             case .success:
-                if e.generation == item.generation { remove(item.path) }
+                settle(item.path, generation: item.generation)
             case .objectErrors(let failed, let deletesSkipped):
-                if Self.carries(item.path, subtree: e.subtree, of: failed) {
+                var e = entries[item.path]!
+                let gone = !exists(item.path)
+                if Self.carries(item.path, coversBelow: e.subtree || gone, of: failed) {
                     e.failures += 1
+                    e.notedInFlightAt = nil
                     entries[item.path] = e
-                    if e.failures >= Self.giveUpFailures {
+                    // New content noted during the run was never tried: keep it.
+                    if e.failures >= Self.giveUpFailures && e.generation == item.generation {
                         gaveUp.append(item.path)
                         remove(item.path)
                     }
-                } else if deletesSkipped && (e.subtree || !exists(item.path)) {
-                    continue  // its delete was skipped: retry, no failure counted
-                } else if e.generation == item.generation {
-                    remove(item.path)
+                } else if deletesSkipped && (e.subtree || gone) {
+                    // Its delete was skipped: retry, no failure counted.
+                    e.failures = 0
+                    e.notedInFlightAt = nil
+                    entries[item.path] = e
+                } else {
+                    settle(item.path, generation: item.generation)
                 }
             }
         }
     }
 
-    mutating func fullRunStarted(at time: TimeInterval) {
-        fullRunStartedAt = time
+    /// `startEventId`: FSEvents' current id when the full run started.
+    mutating func fullRunStarted(startEventId: UInt64) {
+        fullRunStartEventId = startEventId
+        highestEventId = max(highestEventId, startEventId)
     }
 
     mutating func fullRunFinished(outcome: RunOutcome, exists: (String) -> Bool) {
-        guard let startedAt = fullRunStartedAt else { return }
-        fullRunStartedAt = nil
+        guard let start = fullRunStartEventId else { return }
+        fullRunStartEventId = nil
         guard outcome != .runFailed else { return }
-        if let since = fullRequiredSince, since <= startedAt {
+        if let required = fullRequiredEventId, required <= start {
             fullRequired = false
-            fullRequiredSince = nil
+            fullRequiredEventId = nil
         }
         var failed: Set<String> = []
         var deletesSkipped = false
         if case .objectErrors(let f, let d) = outcome { failed = f; deletesSkipped = d }
-        for (path, e) in entries where !e.inFlight && e.lastSeen < startedAt {
+        for (path, e) in entries where !e.inFlight && e.lastEventId <= start {
             if deletesSkipped && (e.subtree || !exists(path)) { continue }
             remove(path)
         }
         for path in failed where coveringSubtree(of: path) == nil {
             if entries[path] == nil {
-                entries[path] = Entry(firstSeen: startedAt, lastSeen: startedAt, firstEventId: highestEventId, subtree: false)
-                childCount[Self.parent(of: path), default: 0] += 1
+                insert(path, Entry(firstSeen: 0, lastSeen: 0, firstEventId: start, lastEventId: start, subtree: false))
+            } else {
+                entries[path]!.firstEventId = min(entries[path]!.firstEventId, start)
             }
             entries[path]!.failures = max(entries[path]!.failures, 1)
         }
@@ -299,7 +401,7 @@ struct DirtySet {
 
     /// The FSEvents id up to which everything is on the remote: nil while a
     /// full run is required (a restart must run it), else one below the
-    /// oldest event any live entry still carries.
+    /// oldest event any live entry still carries, else the stream position.
     var checkpoint: UInt64? {
         if fullRequired { return nil }
         guard let oldest = entries.values.map(\.firstEventId).min() else { return highestEventId }

@@ -190,6 +190,7 @@ enum ConfigSelfTest {
             testDirtySetCollapseAndCheckpoint,
             testDirtySetFullRunRules,
             testDirtySetObjectErrors,
+            testExcludeOracleRefusals,
             testLogWatcherSplitMultibyteLine,
             testStalledLineIsAFailureMarker,
             testStalledSyncWatchdogEndToEnd,
@@ -6715,19 +6716,29 @@ enum ConfigSelfTest {
         guard set.takeBatch(now: 10, limit: 10).map(\.path) == ["a/f.txt"] else {
             return report(id, slug, false, "(not ready after 10 s quiet)")
         }
-        // Never quiet: noted every 5 s, still taken once 300 s have passed since the first note.
+        // A file appended every 2 s, each upload taking 4 s and re-noted while in
+        // flight: maxDelay must keep throttling — about one upload per 300 s, not
+        // one per batch once 300 s have passed (code review, PR #21).
         var busy = DirtySet()
-        var t: TimeInterval = 0
-        while t < 300 { busy.note("log.txt", isDirEvent: false, gap: false, eventId: 1, now: t); t += 5 }
-        guard busy.takeBatch(now: 299, limit: 10).isEmpty, busy.takeBatch(now: 300, limit: 10).count == 1 else {
-            return report(id, slug, false, "(maxDelay not honoured)")
+        var t: TimeInterval = 0, uploads = 0
+        var inFlight: [DirtySet.BatchItem] = [], finishAt: TimeInterval = -1
+        while t <= 1000 {
+            busy.note("log.txt", isDirEvent: false, gap: false, eventId: UInt64(t) + 1, now: t)
+            if !inFlight.isEmpty, t >= finishAt { busy.finish(inFlight, outcome: .success, exists: { _ in true }); inFlight = [] }
+            if inFlight.isEmpty {
+                let b = busy.takeBatch(now: t, limit: 10)
+                if !b.isEmpty { inFlight = b; finishAt = t + 4; uploads += 1 }
+            }
+            t += 2
         }
+        guard (3...4).contains(uploads) else { return report(id, slug, false, "(never-quiet file uploaded \(uploads)× in 1,000 s)") }
         return report(id, slug, true)
     }
 
     private static func testDirtySetCollapseAndCheckpoint() -> Bool {
         let id = "AC-L92-S1c", slug = "dirtyset-collapse-checkpoint"
         var set = DirtySet()
+        set.advance(toEventId: 0)
         for i in 1...201 { set.note("d/f\(i)", isDirEvent: false, gap: false, eventId: UInt64(i), now: 0) }
         guard set.entries.count == 1, set.entries["d"]?.subtree == true, set.checkpoint == 0 else {
             return report(id, slug, false, "(201 children: \(set.entries.count) entries, checkpoint \(String(describing: set.checkpoint)))")
@@ -6737,6 +6748,11 @@ enum ConfigSelfTest {
         guard set.entries.isEmpty, set.checkpoint == 201 else {
             return report(id, slug, false, "(after the subtree succeeded: checkpoint \(String(describing: set.checkpoint)))")
         }
+        // No live entry and no included event yet: the checkpoint is the stream
+        // position, never 0 (sinceWhen 0 would replay the whole volume).
+        var fresh = DirtySet()
+        fresh.advance(toEventId: 5_000_000)
+        guard fresh.checkpoint == 5_000_000 else { return report(id, slug, false, "(empty set checkpoint \(String(describing: fresh.checkpoint)))") }
         // A note under a subtree entry folds into it.
         set.note("e", isDirEvent: true, gap: false, eventId: 300, now: 20)
         set.note("e/x/y.txt", isDirEvent: false, gap: false, eventId: 301, now: 21)
@@ -6747,8 +6763,8 @@ enum ConfigSelfTest {
         let b2 = set.takeBatch(now: 40, limit: 500)
         set.note("e", isDirEvent: true, gap: false, eventId: 302, now: 41)
         set.finish(b2, outcome: .success, exists: { _ in true })
-        guard set.entries["e"] != nil, set.entries["e"]?.inFlight == false else {
-            return report(id, slug, false, "(re-noted in-flight entry dropped)")
+        guard set.entries["e"] != nil, set.entries["e"]?.inFlight == false, set.entries["e"]?.firstSeen == 41 else {
+            return report(id, slug, false, "(re-noted in-flight entry dropped or its clock not restarted)")
         }
         let b3 = set.takeBatch(now: 60, limit: 500)
         set.finish(b3, outcome: .runFailed, exists: { _ in true })
@@ -6764,23 +6780,33 @@ enum ConfigSelfTest {
         }
         set.note("late/f", isDirEvent: false, gap: false, eventId: 9000, now: 5)
         guard set.entries.isEmpty else { return report(id, slug, false, "(note stored while a full run is pending)") }
-        set.fullRunStarted(at: 10)
+        set.fullRunStarted(startEventId: 9000)
         set.note("during/f", isDirEvent: false, gap: false, eventId: 9001, now: 11)
         set.fullRunFinished(outcome: .runFailed, exists: { _ in true })
         guard set.fullRequired, set.entries["during/f"] != nil else {
             return report(id, slug, false, "(a failed full run cleared the requirement or the entries)")
         }
-        set.fullRunStarted(at: 20)
-        set.note("after/f", isDirEvent: false, gap: false, eventId: 9002, now: 21)
+        set.fullRunStarted(startEventId: 9001)
+        set.note("after/f", isDirEvent: false, gap: false, eventId: 9002, now: 11)
         set.fullRunFinished(outcome: .success, exists: { _ in true })
         guard !set.fullRequired, set.entries["during/f"] == nil, set.entries["after/f"] != nil else {
             return report(id, slug, false, "(successful full run: full=\(set.fullRequired), entries \(set.entries.keys.sorted()))")
+        }
+        // A gap after the run started stays pending even at the same wall-clock
+        // time: coverage is by event id (code review, PR #21).
+        var late = DirtySet()
+        late.requireFullRun(eventId: 10)
+        late.fullRunStarted(startEventId: 20)
+        late.note("", isDirEvent: true, gap: true, eventId: 21, now: 7)
+        late.fullRunFinished(outcome: .success, exists: { _ in true })
+        guard late.fullRequired, late.checkpoint == nil else {
+            return report(id, slug, false, "(a gap after the full run started was treated as covered)")
         }
         // A gap at id N: no checkpoint until a full run succeeds, whatever batches do meanwhile.
         var g = DirtySet()
         g.note("a", isDirEvent: false, gap: false, eventId: 5, now: 0)
         g.note("", isDirEvent: true, gap: true, eventId: 10, now: 1)
-        g.fullRunStarted(at: 2)
+        g.fullRunStarted(startEventId: 10)
         g.note("b", isDirEvent: false, gap: false, eventId: 11, now: 3)
         g.finish(g.takeBatch(now: 20, limit: 10), outcome: .success, exists: { _ in true })
         guard g.checkpoint == nil else { return report(id, slug, false, "(checkpoint advanced past a pending full run)") }
@@ -6793,32 +6819,73 @@ enum ConfigSelfTest {
         var set = DirtySet()
         for p in ["x.bin", "y.txt", "gone.txt"] { set.note(p, isDirEvent: false, gap: false, eventId: 1, now: 0) }
         set.note("dir", isDirEvent: true, gap: false, eventId: 2, now: 0)
-        let exists: (String) -> Bool = { $0 != "gone.txt" }
+        let exists: (String) -> Bool = { $0 != "gone.txt" && $0 != "gonedir" }
         let failed = RunOutcome.objectErrors(failedPaths: ["x.bin"], deletesSkipped: true)
         set.finish(set.takeBatch(now: 10, limit: 10), outcome: failed, exists: exists)
         guard set.entries["x.bin"]?.failures == 1, set.entries["y.txt"] == nil,
               set.entries["dir"]?.failures == 0, set.entries["gone.txt"]?.failures == 0 else {
             return report(id, slug, false, "(after one object error: \(set.entries.mapValues(\.failures)))")
         }
-        for t in [20.0, 30.0] { set.finish(set.takeBatch(now: t, limit: 10), outcome: failed, exists: exists) }
+        // Third failure, but X was saved again during that run: count it, keep it.
+        _ = set.takeBatch(now: 20, limit: 10)
+        set.finish(set.entries.keys.sorted().map { DirtySet.BatchItem(path: $0, subtree: set.entries[$0]!.subtree, generation: set.entries[$0]!.generation) }, outcome: failed, exists: exists)
+        let b3 = set.takeBatch(now: 30, limit: 10)
+        set.note("x.bin", isDirEvent: false, gap: false, eventId: 3, now: 31)
+        set.finish(b3, outcome: failed, exists: exists)
+        guard set.entries["x.bin"] != nil, set.gaveUp.isEmpty else {
+            return report(id, slug, false, "(x.bin given up although new content arrived during the run)")
+        }
+        set.finish(set.takeBatch(now: 45, limit: 10), outcome: failed, exists: exists)
         guard set.entries["x.bin"] == nil, set.gaveUp == ["x.bin"] else {
-            return report(id, slug, false, "(x.bin not given up after 3 failures)")
+            return report(id, slug, false, "(x.bin not given up after its failures)")
         }
         // Once the bad path is gone the kept deletes go through.
-        set.finish(set.takeBatch(now: 40, limit: 10), outcome: .success, exists: exists)
+        set.finish(set.takeBatch(now: 60, limit: 10), outcome: .success, exists: exists)
         guard set.entries.isEmpty else { return report(id, slug, false, "(kept deletes never finished)") }
-        // A failing file inside a subtree entry counts against the subtree.
-        set.note("s", isDirEvent: true, gap: false, eventId: 3, now: 50)
-        set.finish(set.takeBatch(now: 60, limit: 10), outcome: .objectErrors(failedPaths: ["s/bad"], deletesSkipped: true), exists: exists)
-        guard set.entries["s"]?.failures == 1 else { return report(id, slug, false, "(subtree carrying a failed path not counted)") }
-        // Full run with object errors: covering, but a skipped delete stays and the failed path is re-noted.
+        // A failure below a subtree entry, or below a vanished path, counts against it.
+        set.note("s", isDirEvent: true, gap: false, eventId: 4, now: 70)
+        set.note("gonedir", isDirEvent: false, gap: false, eventId: 5, now: 70)
+        set.finish(set.takeBatch(now: 80, limit: 10), outcome: .objectErrors(failedPaths: ["s/bad", "gonedir/x"], deletesSkipped: false), exists: exists)
+        guard set.entries["s"]?.failures == 1, set.entries["gonedir"]?.failures == 1 else {
+            return report(id, slug, false, "(failure below an entry not counted: \(set.entries.mapValues(\.failures)))")
+        }
+        // A success that keeps a re-noted entry resets its failure count.
+        let b4 = set.takeBatch(now: 90, limit: 10)
+        set.note("s", isDirEvent: true, gap: false, eventId: 6, now: 91)
+        set.finish(b4, outcome: .success, exists: exists)
+        guard set.entries["s"]?.failures == 0 else { return report(id, slug, false, "(failures survived a success)") }
+        // Full run with object errors: covering, a skipped delete stays, the failed
+        // path is re-noted no later than the run's start id.
         var f = DirtySet()
         f.note("gone.txt", isDirEvent: false, gap: false, eventId: 1, now: 0)
         f.note("done.txt", isDirEvent: false, gap: false, eventId: 2, now: 0)
-        f.fullRunStarted(at: 5)
-        f.fullRunFinished(outcome: .objectErrors(failedPaths: ["bad.txt"], deletesSkipped: true), exists: exists)
-        guard f.entries["gone.txt"] != nil, f.entries["done.txt"] == nil, f.entries["bad.txt"]?.failures == 1 else {
-            return report(id, slug, false, "(full run objectErrors: \(f.entries.mapValues(\.failures)))")
+        f.fullRunStarted(startEventId: 10)
+        f.note("busy.txt", isDirEvent: false, gap: false, eventId: 500, now: 1)
+        f.fullRunFinished(outcome: .objectErrors(failedPaths: ["bad.txt", "busy.txt"], deletesSkipped: true), exists: exists)
+        guard f.entries["gone.txt"] != nil, f.entries["done.txt"] == nil, f.entries["bad.txt"]?.failures == 1,
+              f.entries["bad.txt"]?.firstEventId == 10, f.entries["busy.txt"]?.firstEventId == 10, f.checkpoint == 0 else {
+            return report(id, slug, false, "(full run objectErrors: \(f.entries.mapValues(\.firstEventId)), checkpoint \(String(describing: f.checkpoint)))")
+        }
+        return report(id, slug, true)
+    }
+
+    private static func testExcludeOracleRefusals() -> Bool {
+        let id = "AC-L92-S1f", slug = "exclude-oracle-refusals"
+        // rclone 1.75.1 with --metadata-include appends a metadata section ending
+        // in `- ^.*$` (code review, PR #21): it must not be read as directory rules.
+        let withMetadata = l92FilterDump.replacingOccurrences(of: "--- end filters ---",
+            with: "--- Metadata filter rules ---\n+ (^|/)tier=STANDARD$\n- ^.*$\n--- end filters ---")
+        guard let meta = ExcludeOracle(dump: withMetadata), !meta.isExcluded("src/main.swift"), meta.isExcluded("build/x") else {
+            return report(id, slug, false, "(metadata section changed path verdicts)")
+        }
+        // A line terminator in a name: ICU and RE2 disagree, so never "excluded".
+        guard let oracle = ExcludeOracle(dump: l92FilterDump), !oracle.isExcluded("x.tmp\r"), oracle.isExcluded("x.tmp") else {
+            return report(id, slug, false, "(line-terminator name called excluded)")
+        }
+        let reWrapped = { (rule: String) in "--- start filters ---\n--- File filter rules ---\n\(rule)\n--- end filters ---" }
+        guard ExcludeOracle(dump: reWrapped("- (?P<n>a)$")) == nil, ExcludeOracle(dump: reWrapped("- ^[a&&b]$")) == nil,
+              ExcludeOracle(dump: reWrapped("- ^[a--b]$")) == nil, ExcludeOracle(dump: reWrapped("- ^a--b$")) != nil else {
+            return report(id, slug, false, "(RE2/ICU-divergent syntax not refused, or a plain -- refused)")
         }
         return report(id, slug, true)
     }
