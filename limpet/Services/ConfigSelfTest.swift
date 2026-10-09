@@ -6732,7 +6732,7 @@ enum ConfigSelfTest {
         var inFlight: [DirtySet.BatchItem] = [], finishAt: TimeInterval = -1
         while t <= 1000 {
             busy.note("log.txt", isDirEvent: false, gap: false, eventId: UInt64(t) + 1, now: t)
-            if !inFlight.isEmpty, t >= finishAt { busy.finish(inFlight, outcome: .success, exists: { _ in true }); inFlight = [] }
+            if !inFlight.isEmpty, t >= finishAt { busy.finish(inFlight, outcome: .success, now: 0, exists: { _ in true }); inFlight = [] }
             if inFlight.isEmpty {
                 let b = busy.takeBatch(now: t, limit: 10)
                 if !b.isEmpty { inFlight = b; finishAt = t + 4; uploads += 1 }
@@ -6753,7 +6753,7 @@ enum ConfigSelfTest {
             return report(id, slug, false, "(201 children: \(set.entries.count) entries, checkpoint \(String(describing: set.checkpoint)))")
         }
         let batch = set.takeBatch(now: 10, limit: 500)
-        set.finish(batch, outcome: .success, exists: { _ in true })
+        set.finish(batch, outcome: .success, now: 0, exists: { _ in true })
         guard set.entries.isEmpty, set.checkpoint == 201 else {
             return report(id, slug, false, "(after the subtree succeeded: checkpoint \(String(describing: set.checkpoint)))")
         }
@@ -6771,12 +6771,12 @@ enum ConfigSelfTest {
         // In flight, re-noted: a successful finish keeps it; a failed run keeps everything.
         let b2 = set.takeBatch(now: 40, limit: 500)
         set.note("e", isDirEvent: true, gap: false, eventId: 302, now: 41)
-        set.finish(b2, outcome: .success, exists: { _ in true })
+        set.finish(b2, outcome: .success, now: 0, exists: { _ in true })
         guard set.entries["e"] != nil, set.entries["e"]?.inFlight == false, set.entries["e"]?.firstSeen == 41 else {
             return report(id, slug, false, "(re-noted in-flight entry dropped or its clock not restarted)")
         }
         let b3 = set.takeBatch(now: 60, limit: 500)
-        set.finish(b3, outcome: .runFailed, exists: { _ in true })
+        set.finish(b3, outcome: .runFailed, now: 0, exists: { _ in true })
         return report(id, slug, set.entries["e"] != nil, "(runFailed dropped an entry)")
     }
 
@@ -6833,7 +6833,7 @@ enum ConfigSelfTest {
         h.note("a", isDirEvent: false, gap: false, eventId: 5, now: 0)
         let hb = h.takeBatch(now: 10, limit: 10)
         h.note("", isDirEvent: true, gap: true, eventId: 6, now: 11)
-        h.finish(hb, outcome: .success, exists: { _ in true })
+        h.finish(hb, outcome: .success, now: 0, exists: { _ in true })
         guard h.checkpoint == nil, h.entries.isEmpty else { return report(id, slug, false, "(a batch finishing during a pending full run moved the checkpoint)") }
         h.fullRunStarted(startEventId: 7)
         h.fullRunFinished(outcome: .success, exists: { _ in true })
@@ -6853,38 +6853,38 @@ enum ConfigSelfTest {
         set.note("dir", isDirEvent: true, gap: false, eventId: 2, now: 0)
         let exists: (String) -> Bool = { $0 != "gone.txt" && $0 != "gonedir" }
         let failed = RunOutcome.objectErrors(failedPaths: ["x.bin"], deletesSkipped: true)
-        set.finish(set.takeBatch(now: 10, limit: 10), outcome: failed, exists: exists)
+        set.finish(set.takeBatch(now: 10, limit: 10), outcome: failed, now: 0, exists: exists)
         guard set.entries["x.bin"]?.failures == 1, set.entries["y.txt"] == nil,
               set.entries["dir"]?.failures == 0, set.entries["gone.txt"]?.failures == 0, !set.fullRunOwed else {
             return report(id, slug, false, "(after one object error: \(set.entries.mapValues(\.failures)))")
         }
         // Third failure, but X was saved again during that run: count it, keep it.
         _ = set.takeBatch(now: 20, limit: 10)
-        set.finish(set.entries.keys.sorted().map { DirtySet.BatchItem(path: $0, subtree: set.entries[$0]!.subtree, generation: set.entries[$0]!.generation) }, outcome: failed, exists: exists)
+        set.finish(set.entries.keys.sorted().map { DirtySet.BatchItem(path: $0, subtree: set.entries[$0]!.subtree, generation: set.entries[$0]!.generation) }, outcome: failed, now: 0, exists: exists)
         let b3 = set.takeBatch(now: 30, limit: 10)
         set.note("x.bin", isDirEvent: false, gap: false, eventId: 3, now: 31)
-        set.finish(b3, outcome: failed, exists: exists)
+        set.finish(b3, outcome: failed, now: 0, exists: exists)
         guard set.entries["x.bin"] != nil, set.gaveUp.isEmpty else {
             return report(id, slug, false, "(x.bin given up although new content arrived during the run)")
         }
-        set.finish(set.takeBatch(now: 45, limit: 10), outcome: failed, exists: exists)
+        set.finish(set.takeBatch(now: 45, limit: 10), outcome: failed, now: 0, exists: exists)
         guard set.entries["x.bin"] == nil, set.gaveUp == ["x.bin"], set.fullRunOwed, set.checkpoint == nil else {
             return report(id, slug, false, "(x.bin not given up after its failures, or no full run owed)")
         }
         // Once the bad path is gone the kept deletes go through.
-        set.finish(set.takeBatch(now: 60, limit: 10), outcome: .success, exists: exists)
+        set.finish(set.takeBatch(now: 60, limit: 10), outcome: .success, now: 0, exists: exists)
         guard set.entries.isEmpty else { return report(id, slug, false, "(kept deletes never finished)") }
         // A failure below a subtree entry, or below a vanished path, counts against it.
         set.note("s", isDirEvent: true, gap: false, eventId: 4, now: 70)
         set.note("gonedir", isDirEvent: false, gap: false, eventId: 5, now: 70)
-        set.finish(set.takeBatch(now: 80, limit: 10), outcome: .objectErrors(failedPaths: ["s/bad", "gonedir/x"], deletesSkipped: false), exists: exists)
+        set.finish(set.takeBatch(now: 80, limit: 10), outcome: .objectErrors(failedPaths: ["s/bad", "gonedir/x"], deletesSkipped: false), now: 0, exists: exists)
         guard set.entries["s"]?.failures == 1, set.entries["gonedir"]?.failures == 1 else {
             return report(id, slug, false, "(failure below an entry not counted: \(set.entries.mapValues(\.failures)))")
         }
         // A success that keeps a re-noted entry resets its failure count.
         let b4 = set.takeBatch(now: 90, limit: 10)
         set.note("s", isDirEvent: true, gap: false, eventId: 6, now: 91)
-        set.finish(b4, outcome: .success, exists: exists)
+        set.finish(b4, outcome: .success, now: 0, exists: exists)
         guard set.entries["s"]?.failures == 0 else { return report(id, slug, false, "(failures survived a success)") }
         // Full run with object errors: it covers what came before it; failed
         // objects and skipped deletes are owed to the next full run (no
@@ -6916,7 +6916,7 @@ enum ConfigSelfTest {
         q.note("log.txt", isDirEvent: false, gap: false, eventId: 1000, now: 0)
         let qb = q.takeBatch(now: 10, limit: 10)
         q.note("log.txt", isDirEvent: false, gap: false, eventId: 1005, now: 11)
-        q.finish(qb, outcome: .success, exists: { _ in true })
+        q.finish(qb, outcome: .success, now: 0, exists: { _ in true })
         guard q.entries["log.txt"]?.firstEventId == 1005 else { return report(id, slug, false, "(kept entry still pins its first event)") }
         q.fullRunStarted(startEventId: 2801)
         q.note("log.txt", isDirEvent: false, gap: false, eventId: 3000, now: 20)
@@ -6936,7 +6936,7 @@ enum ConfigSelfTest {
         let fail = RunOutcome.objectErrors(failedPaths: ["log.txt"], deletesSkipped: false)
         while t <= 4000 {
             if busy.gaveUp.isEmpty { busy.note("log.txt", isDirEvent: false, gap: false, eventId: UInt64(t) + 1, now: t) }
-            if !inFlight.isEmpty, t >= finishAt { busy.finish(inFlight, outcome: fail, exists: { _ in true }); inFlight = [] }
+            if !inFlight.isEmpty, t >= finishAt { busy.finish(inFlight, outcome: fail, now: 0, exists: { _ in true }); inFlight = [] }
             if inFlight.isEmpty {
                 let b = busy.takeBatch(now: t, limit: 10)
                 if !b.isEmpty { inFlight = b; finishAt = t + 4; attempts += 1; lastAttemptAt = t }
@@ -6992,14 +6992,14 @@ enum ConfigSelfTest {
         e.fullRunFinished(outcome: .success, exists: { _ in true })
         guard e.checkpoint == 1000 else { return report(id, slug, false, "(checkpoint after a covering full run: \(String(describing: e.checkpoint)))") }
         e.note("late.txt", isDirEvent: false, gap: false, eventId: 5000, now: 0)
-        e.finish(e.takeBatch(now: 20, limit: 10), outcome: .success, exists: { _ in true })
+        e.finish(e.takeBatch(now: 20, limit: 10), outcome: .success, now: 0, exists: { _ in true })
         guard e.checkpoint == 1000 else { return report(id, slug, false, "(a note moved the empty-set checkpoint: \(String(describing: e.checkpoint)))") }
         // Lower ids folded into an in-flight entry survive a successful finish.
         var c = DirtySet()
         c.note("d", isDirEvent: false, gap: false, eventId: 10, now: 0)
         let cb = c.takeBatch(now: 10, limit: 10)
         for i in 101...301 { c.note("d/f\(i)", isDirEvent: false, gap: false, eventId: UInt64(i), now: 11) }
-        c.finish(cb, outcome: .success, exists: { _ in true })
+        c.finish(cb, outcome: .success, now: 0, exists: { _ in true })
         guard c.entries["d"]?.firstEventId == 101 else {
             return report(id, slug, false, "(absorbed ids lost: firstEventId \(String(describing: c.entries["d"]?.firstEventId)))")
         }
@@ -7008,7 +7008,7 @@ enum ConfigSelfTest {
         rf.note("grow.db", isDirEvent: false, gap: false, eventId: 1, now: 0)
         let rfb = rf.takeBatch(now: 400, limit: 10)
         rf.note("grow.db", isDirEvent: false, gap: false, eventId: 2, now: 401)
-        rf.finish(rfb, outcome: .runFailed, exists: { _ in true })
+        rf.finish(rfb, outcome: .runFailed, now: 0, exists: { _ in true })
         guard rf.entries["grow.db"]?.firstSeen == 401 else { return report(id, slug, false, "(runFailed kept an old upload clock)") }
         // An id at UInt64.max (kFSEventStreamEventIdSinceNow passed by mistake) must not trap.
         var mx = DirtySet()
@@ -7020,7 +7020,7 @@ enum ConfigSelfTest {
         // rclone names a failed symlink `<p>.rclonelink`: it counts against p.
         var sl = DirtySet()
         sl.note("sub/link", isDirEvent: false, gap: false, eventId: 100, now: 0)
-        sl.finish(sl.takeBatch(now: 10, limit: 10), outcome: .objectErrors(failedPaths: ["sub/link.rclonelink"], deletesSkipped: true), exists: { _ in true })
+        sl.finish(sl.takeBatch(now: 10, limit: 10), outcome: .objectErrors(failedPaths: ["sub/link.rclonelink"], deletesSkipped: true), now: 0, exists: { _ in true })
         guard sl.entries["sub/link"]?.failures == 1, !sl.fullRunOwed else { return report(id, slug, false, "(a failed symlink was settled as done, or owed a full run)") }
         // A delete kept because deletes were skipped also restarts its upload clock.
         var lg = DirtySet()
@@ -7028,7 +7028,7 @@ enum ConfigSelfTest {
         lg.note("other.bin", isDirEvent: false, gap: false, eventId: 1, now: 0)  // the item that fails
         let lgb = lg.takeBatch(now: 400, limit: 10)
         lg.note("logs/app.log", isDirEvent: false, gap: false, eventId: 2, now: 401)
-        lg.finish(lgb, outcome: .objectErrors(failedPaths: ["other.bin"], deletesSkipped: true), exists: { _ in true })
+        lg.finish(lgb, outcome: .objectErrors(failedPaths: ["other.bin"], deletesSkipped: true), now: 0, exists: { _ in true })
         guard lg.entries["logs"]?.firstSeen == 401, lg.entries["logs"]?.firstEventId == 1,
               lg.entries["logs"]?.failures == 0, lg.entries["other.bin"]?.failures == 1, !lg.fullRunOwed else {
             return report(id, slug, false, "(kept delete: clock not restarted, first event moved, or owed)")
@@ -7039,20 +7039,20 @@ enum ConfigSelfTest {
         pb.note("logs", isDirEvent: true, gap: false, eventId: 100, now: 0)
         let pbb = pb.takeBatch(now: 10, limit: 10)
         pb.note("logs/app.log", isDirEvent: false, gap: false, eventId: 200, now: 11)
-        pb.finish(pbb, outcome: .objectErrors(failedPaths: ["logs/x"], deletesSkipped: true), exists: { _ in true })
+        pb.finish(pbb, outcome: .objectErrors(failedPaths: ["logs/x"], deletesSkipped: true), now: 0, exists: { _ in true })
         pb.advance(toEventId: 200)
         guard pb.entries["logs"]?.firstEventId == 100, pb.entries["logs"]?.failures == 1, !pb.fullRunOwed else {
             return report(id, slug, false, "(a failed entry's first event moved: \(String(describing: pb.entries["logs"]?.firstEventId)))")
         }
         var un = DirtySet()
         un.note("a.txt", isDirEvent: false, gap: false, eventId: 1, now: 0)
-        un.finish(un.takeBatch(now: 10, limit: 10), outcome: .objectErrors(failedPaths: ["elsewhere"], deletesSkipped: false), exists: { _ in true })
+        un.finish(un.takeBatch(now: 10, limit: 10), outcome: .objectErrors(failedPaths: ["elsewhere"], deletesSkipped: false), now: 0, exists: { _ in true })
         guard un.fullRunOwed else { return report(id, slug, false, "(a failure no item carries did not owe a full run)") }
         // A failure below a file entry that exists at finish is not that entry's
         // (carries needs subtree or gone), so it is unattributed: owed.
         var pf = DirtySet()
         pf.note("p", isDirEvent: false, gap: false, eventId: 1, now: 0)
-        pf.finish(pf.takeBatch(now: 10, limit: 10), outcome: .objectErrors(failedPaths: ["p/x"], deletesSkipped: false), exists: { _ in true })
+        pf.finish(pf.takeBatch(now: 10, limit: 10), outcome: .objectErrors(failedPaths: ["p/x"], deletesSkipped: false), now: 0, exists: { _ in true })
         guard pf.fullRunOwed else { return report(id, slug, false, "(a failure below an existing file entry was ignored)") }
         // `.objectErrors` naming nothing, or a failure no item carries: the batch
         // counts as failed for every item (kept, nothing counted, nobody blamed)
@@ -7061,7 +7061,7 @@ enum ConfigSelfTest {
         io.note("gone", isDirEvent: false, gap: false, eventId: 1, now: 0)
         io.note("ok.txt", isDirEvent: false, gap: false, eventId: 2, now: 0)
         for t in [10.0, 20.0, 30.0, 40.0] {
-            io.finish(io.takeBatch(now: t, limit: 10), outcome: .objectErrors(failedPaths: [], deletesSkipped: true), exists: { $0 != "gone" })
+            io.finish(io.takeBatch(now: t, limit: 10), outcome: .objectErrors(failedPaths: [], deletesSkipped: true), now: 0, exists: { $0 != "gone" })
         }
         guard io.fullRunOwed, io.gaveUp.isEmpty, io.entries["gone"]?.failures == 0, io.entries["ok.txt"] != nil else {
             return report(id, slug, false, "(unnamed error: owed \(io.fullRunOwed), gaveUp \(io.gaveUp), entries \(io.entries.keys.sorted()))")
@@ -7069,21 +7069,26 @@ enum ConfigSelfTest {
         guard un.entries["a.txt"]?.failures == 0, pf.entries["p"] != nil else {
             return report(id, slug, false, "(an unattributed failure settled or blamed an item)")
         }
-        // …but it cannot pin the same items forever: the fifth such batch in a
-        // row gives them up to the owed full run.
-        io.finish(io.takeBatch(now: 50, limit: 10), outcome: .objectErrors(failedPaths: [], deletesSkipped: true), exists: { $0 != "gone" })
-        guard io.entries.isEmpty, io.gaveUp.sorted() == ["gone", "ok.txt"], io.fullRunOwed else {
-            return report(id, slug, false, "(unattributed failures not bounded: entries \(io.entries.keys.sorted()), gaveUp \(io.gaveUp))")
+        // …but they go to the back of the queue: a newer entry is taken first,
+        // and the kept ones wait out the quiet time again.
+        io.note("new.txt", isDirEvent: false, gap: false, eventId: 3, now: 45)
+        let head = io.takeBatch(now: 55, limit: 2)  // the two old ones
+        io.finish(head, outcome: .objectErrors(failedPaths: [], deletesSkipped: true), now: 60, exists: { $0 != "gone" })
+        guard head.map(\.path).sorted() == ["gone", "ok.txt"], io.entries["gone"]?.firstSeen == 60,
+              io.takeBatch(now: 70, limit: 1).map(\.path) == ["new.txt"], io.gaveUp.isEmpty else {
+            return report(id, slug, false, "(unattributed failure kept items at the head of the queue, or gave them up)")
         }
         var empty = DirtySet()
-        empty.finish([], outcome: .objectErrors(failedPaths: [], deletesSkipped: false), exists: { _ in true })
+        empty.finish([], outcome: .objectErrors(failedPaths: [], deletesSkipped: false), now: 0, exists: { _ in true })
         guard !empty.fullRunOwed else { return report(id, slug, false, "(an empty batch owed a full run)") }
+        empty.finish([], outcome: .objectErrors(failedPaths: ["x"], deletesSkipped: false), now: 0, exists: { _ in true })
+        guard empty.fullRunOwed else { return report(id, slug, false, "(a named failure with no batch item owed nothing)") }
         // An owe raised while a full run is in flight survives that run's success.
         var od = DirtySet()
         od.note("x.bin", isDirEvent: false, gap: false, eventId: 1, now: 0)
         let odb = od.takeBatch(now: 10, limit: 10)
         od.fullRunStarted(startEventId: 5)
-        od.finish(odb, outcome: .objectErrors(failedPaths: ["nobody"], deletesSkipped: false), exists: { _ in true })
+        od.finish(odb, outcome: .objectErrors(failedPaths: ["nobody"], deletesSkipped: false), now: 0, exists: { _ in true })
         od.fullRunFinished(outcome: .success, exists: { _ in true })
         guard od.fullRunOwed, od.checkpoint == nil else {
             return report(id, slug, false, "(an owe raised during a full run was cleared by it)")

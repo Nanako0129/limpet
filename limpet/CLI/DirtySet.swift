@@ -165,17 +165,13 @@ struct DirtySet {
     /// everything (today's behaviour for a mass change).
     static let fullRunThreshold = 5000
     /// A path that failed in this many batches is dropped; the next full run
-    /// retries it. Keeps one bad file from pinning every batch (a failure no
-    /// item carries is bounded by `giveUpUnattributed` instead).
+    /// retries it. Keeps one bad file from pinning every batch (after a failure
+    /// no item carries, items go to the back of the queue instead).
     static let giveUpFailures = 3
     /// A failing path that keeps changing gets this many extra tries (its new
     /// content was never tried), then is given up anyway, so it cannot pin
     /// every batch.
     static let giveUpFailuresWhileChanging = 5
-    /// Batches in a row that failed with a failure no item carries: past this
-    /// the entry is given up to the owed full run, so a recurring unpinnable
-    /// failure cannot hold the same items at the head of the queue forever.
-    static let giveUpUnattributed = 5
 
     struct Entry: Equatable {
         var firstSeen: TimeInterval
@@ -188,8 +184,6 @@ struct DirtySet {
         var subtree: Bool
         var generation = 0
         var failures = 0
-        /// Consecutive batches this entry was in that failed unattributed.
-        var unattributedFailures = 0
         var inFlight = false
         /// The first note while in flight: the next upload's clock and the
         /// entry's first event start here when it is kept, so `maxDelay` keeps
@@ -418,11 +412,15 @@ struct DirtySet {
 
     /// `exists` must not follow symlinks (lstat): a dangling link still exists.
     /// A failure that no item of this batch carries (or `.objectErrors` naming
-    /// nothing) cannot be pinned on anyone: every item is kept uncounted, as
-    /// for `.runFailed`, a full run is owed, and an item in `giveUpUnattributed`
-    /// such batches in a row is given up to that full run.
-    mutating func finish(_ batch: [BatchItem], outcome: RunOutcome, exists: (String) -> Bool) {
-        guard !batch.isEmpty else { return }
+    /// nothing) cannot be pinned on anyone: a full run is owed (it settles the
+    /// unchanged items) and every item is kept uncounted but sent to the back
+    /// of the queue as if noted at `now`, so a recurring unpinnable failure
+    /// cannot keep the same items at its head; delete carriers are never lost.
+    mutating func finish(_ batch: [BatchItem], outcome: RunOutcome, now: TimeInterval, exists: (String) -> Bool) {
+        if batch.isEmpty {
+            if case .objectErrors(let failed, _) = outcome, !failed.isEmpty { raiseOwed() }
+            return
+        }
         var outcome = outcome
         var gone: Set<String> = [], carriers: Set<String> = []
         var unattributed = false
@@ -443,15 +441,13 @@ struct DirtySet {
         for item in batch {
             guard let e = entries[item.path] else { continue }
             entries[item.path]!.inFlight = false
-            entries[item.path]!.unattributedFailures = unattributed ? e.unattributedFailures + 1 : 0
             let changed = e.generation != item.generation
             switch outcome {
             case .runFailed:
-                if unattributed && entries[item.path]!.unattributedFailures >= Self.giveUpUnattributed {
-                    gaveUp.append(item.path)
-                    remove(item.path)
-                } else {
-                    requeue(item.path, changed: changed, uploaded: false)
+                requeue(item.path, changed: changed, uploaded: false)
+                if unattributed {
+                    entries[item.path]!.firstSeen = max(entries[item.path]!.firstSeen, now)
+                    entries[item.path]!.lastSeen = max(entries[item.path]!.lastSeen, now)
                 }
             case .success:
                 done(item.path, changed: changed)
