@@ -165,8 +165,8 @@ struct DirtySet {
     /// everything (today's behaviour for a mass change).
     static let fullRunThreshold = 5000
     /// A path that failed in this many batches is dropped; the next full run
-    /// retries it. Keeps one bad file from pinning every batch (after a failure
-    /// no item carries, items go to the back of the queue instead).
+    /// retries it. Keeps one bad file from pinning every batch (a failure no
+    /// item carries is not counted against anyone; see `finish`).
     static let giveUpFailures = 3
     /// A failing path that keeps changing gets this many extra tries (its new
     /// content was never tried), then is given up anyway, so it cannot pin
@@ -412,18 +412,13 @@ struct DirtySet {
 
     /// `exists` must not follow symlinks (lstat): a dangling link still exists.
     /// A failure that no item of this batch carries (or `.objectErrors` naming
-    /// nothing) cannot be pinned on anyone: a full run is owed (it settles the
-    /// unchanged items) and every item is kept uncounted but sent to the back
-    /// of the queue as if noted at `now`, so a recurring unpinnable failure
-    /// cannot keep the same items at its head; delete carriers are never lost.
-    mutating func finish(_ batch: [BatchItem], outcome: RunOutcome, now: TimeInterval, exists: (String) -> Bool) {
-        if batch.isEmpty {
-            if case .objectErrors(let failed, _) = outcome, !failed.isEmpty { raiseOwed() }
-            return
-        }
+    /// nothing) cannot be pinned on anyone: the batch is handled as `.runFailed`
+    /// (every item kept, nothing counted) and a full run is owed. S2's
+    /// classifier maps unattributable error lines to `.runFailed` itself; this
+    /// is DirtySet's guard for the same.
+    mutating func finish(_ batch: [BatchItem], outcome: RunOutcome, exists: (String) -> Bool) {
         var outcome = outcome
         var gone: Set<String> = [], carriers: Set<String> = []
-        var unattributed = false
         if case .objectErrors(let failed, _) = outcome {
             var carriedFailures: Set<String> = []
             for item in batch {
@@ -433,7 +428,6 @@ struct DirtySet {
                 if !mine.isEmpty { carriers.insert(item.path); carriedFailures.formUnion(mine) }
             }
             if failed.isEmpty || !failed.isSubset(of: carriedFailures) {
-                unattributed = true
                 raiseOwed()
                 outcome = .runFailed
             }
@@ -445,10 +439,6 @@ struct DirtySet {
             switch outcome {
             case .runFailed:
                 requeue(item.path, changed: changed, uploaded: false)
-                if unattributed {
-                    entries[item.path]!.firstSeen = max(entries[item.path]!.firstSeen, now)
-                    entries[item.path]!.lastSeen = max(entries[item.path]!.lastSeen, now)
-                }
             case .success:
                 done(item.path, changed: changed)
             case .objectErrors(_, let deletesSkipped):
