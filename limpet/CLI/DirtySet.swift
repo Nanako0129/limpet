@@ -13,6 +13,8 @@ import Foundation
 /// next full run. A wrongly kept excluded path is meant to cost only a no-op
 /// batch, because batches apply the real filters in rclone — unverified until
 /// L9.2 S2's batch fixture.
+///
+/// Confined to the watcher's main queue (its cache is unsynchronized).
 final class ExcludeOracle {
     struct Rule {
         let include: Bool
@@ -97,17 +99,24 @@ final class ExcludeOracle {
     /// matching rule means included, as in rclone. `isDir`: the path is a
     /// directory (a directory event), so the directory check applies to it
     /// too — `rm -rf build` reports `build`.
-    func isExcluded(_ relativePath: String, isDir: Bool = false) -> Bool {
+    ///
+    /// `maybeSymlink`: the sync runs with `--links`, under which rclone filters
+    /// a symlink as `<name>.rclonelink` (measured, rclone 1.75.1), so the path
+    /// counts as excluded only if that name is excluded too. Pass false only
+    /// when FSEvents says the item is a regular file or directory.
+    func isExcluded(_ relativePath: String, isDir: Bool = false, maybeSymlink: Bool = true) -> Bool {
         if relativePath.unicodeScalars.contains(where: { "\n\u{0B}\u{0C}\r\u{85}\u{2028}\u{2029}".unicodeScalars.contains($0) }) {
             return false  // ICU's `.` and `$` treat these unlike RE2
         }
         var ancestor = ""
         let components = relativePath.split(separator: "/")
-        for component in isDir ? components[...] : components.dropLast() {
+        for component in components.dropLast() {
             ancestor += component + "/"
             if !dirIncluded(ancestor) { return true }
         }
-        return !isDir && Self.firstMatch(fileRules, relativePath as NSString) == false
+        let asLink = !maybeSymlink || Self.firstMatch(fileRules, (relativePath + ".rclonelink") as NSString) == false
+        if isDir { return !dirIncluded(ancestor + (components.last.map(String.init) ?? "") + "/") && asLink }
+        return Self.firstMatch(fileRules, relativePath as NSString) == false && asLink
     }
 
     private func dirIncluded(_ dir: String) -> Bool {
@@ -141,6 +150,7 @@ enum RunOutcome: Equatable {
 /// caller passes `now`, FSEvents ids and an `exists` check. Coverage by a full
 /// run is decided by event id (an event with an id at or below the id taken
 /// when the run started happened before it), never by wall-clock time.
+/// Used from the watcher's main queue only.
 struct DirtySet {
     /// A path must be quiet this long before it is uploaded, so a file being
     /// written is not uploaded once per write (and mostly not mid-write, L9.1).
@@ -181,11 +191,10 @@ struct DirtySet {
         /// The lowest event id folded in while in flight (notes, absorbed
         /// descendants): the entry's first event if it is kept.
         var notedInFlightEventId: UInt64?
-        /// Re-noted from a full run's failure: its change has no event a resume
-        /// would replay, so no checkpoint may be saved while it is live.
-        var unreplayable = false
     }
 
+    /// S2 turns each item into `+ /p` and `+ /p.rclonelink` (a symlink under
+    /// `--links`), plus `+ /p/**` for a subtree entry or a path that is gone.
     struct BatchItem: Equatable {
         let path: String
         let subtree: Bool
@@ -196,6 +205,15 @@ struct DirtySet {
     /// The event id at which the pending full run became required.
     private(set) var fullRequiredEventId: UInt64?
     var fullRequired: Bool { fullRequiredEventId != nil }
+    /// Raised while a full run was in flight: that run never clears it,
+    /// whatever the ids say (RootChanged carries id 0; replays are unsorted).
+    private var requiredDuringRun = false
+    /// A full run is owed but not urgent: a full run reported failed objects
+    /// or skipped deletes, or a batch gave up on a path. The watcher runs it on
+    /// its retry delay (never back to back), and a restart runs it first (no
+    /// checkpoint meanwhile). Cleared only by a full run without errors —
+    /// today's full sync retried those at the next change.
+    private(set) var fullRunOwed = false
     private(set) var fullRunStartEventId: UInt64?
     /// What an empty set's checkpoint may claim: raised only by `advance` and
     /// by a covering full run, never by `note` (an unsorted replay delivers
@@ -232,8 +250,10 @@ struct DirtySet {
     }
 
     /// Records one FSEvents event for a root-relative path ("" = the root
-    /// itself). `gap`: MustScanSubDirs, UserDropped, KernelDropped,
-    /// EventIdsWrapped or RootChanged — the event stream lost detail.
+    /// itself). `gap`: UserDropped, KernelDropped, EventIdsWrapped or
+    /// RootChanged — the stream lost detail for everything. MustScanSubDirs for
+    /// a path is passed as a directory event for that path (a subtree entry),
+    /// or as a gap when the path is the root.
     mutating func note(_ path: String, isDirEvent: Bool, gap: Bool, eventId: UInt64, now: TimeInterval) {
         if gap || path.isEmpty { return requireFullRun(eventId: eventId) }
         // A required full run that has not started yet starts after this
@@ -323,14 +343,11 @@ struct DirtySet {
     /// or a watcher start without a usable checkpoint). Idle entries are
     /// dropped: that run starts after them.
     mutating func requireFullRun(eventId: UInt64) {
-        // Raised while a full run is in flight: that run never clears it,
-        // whatever the id says (RootChanged carries id 0; replays are unsorted).
-        let floor = fullRunStartEventId.map { $0 + 1 } ?? 0
-        fullRequiredEventId = max(fullRequiredEventId ?? 0, eventId, floor)
+        if fullRunStartEventId != nil { requiredDuringRun = true }
+        fullRequiredEventId = max(fullRequiredEventId ?? 0, eventId)
         // Every idle entry goes, so the set is back under the limits that
-        // raised this. Deletes the full run then skips (rclone skips them all
-        // when any object fails) wait for a full run that does not — exactly
-        // today's full sync; entries still live at its end are kept for batches.
+        // raised this. If that run skips deletes (rclone skips them all when any
+        // object fails), `fullRunOwed` retries them.
         for (path, e) in entries where !e.inFlight { remove(path) }
     }
 
@@ -371,7 +388,6 @@ struct DirtySet {
         guard var e = entries[path] else { return }
         if e.generation == generation { return remove(path) }
         e.failures = 0
-        e.unreplayable = false
         e.firstSeen = e.notedInFlightAt ?? e.lastSeen
         e.firstEventId = e.notedInFlightEventId ?? e.firstEventId
         e.notedInFlightAt = nil
@@ -385,6 +401,7 @@ struct DirtySet {
             entries[item.path]!.inFlight = false
             switch outcome {
             case .runFailed:
+                if let at = entries[item.path]!.notedInFlightAt { entries[item.path]!.firstSeen = at }
                 entries[item.path]!.notedInFlightAt = nil
                 entries[item.path]!.notedInFlightEventId = nil
             case .success:
@@ -406,6 +423,7 @@ struct DirtySet {
                     // up to `giveUpFailuresWhileChanging`.
                     if e.failures >= (changed ? Self.giveUpFailuresWhileChanging : Self.giveUpFailures) {
                         gaveUp.append(item.path)
+                        fullRunOwed = true
                         remove(item.path)
                     }
                 } else if deletesSkipped && (e.subtree || gone) {
@@ -426,50 +444,35 @@ struct DirtySet {
         fullRunStartEventId = startEventId
     }
 
-    mutating func fullRunFinished(outcome: RunOutcome, now: TimeInterval, exists: (String) -> Bool) {
+    /// `.success` and `.objectErrors` both cover every change made before the
+    /// run started; failed objects and skipped deletes are left to the owed
+    /// full run rather than tracked path by path.
+    mutating func fullRunFinished(outcome: RunOutcome) {
         guard let start = fullRunStartEventId else { return }
         fullRunStartEventId = nil
+        defer { requiredDuringRun = false }  // the next run starts after it
         guard outcome != .runFailed else { return }
-        if let required = fullRequiredEventId, required <= start {
+        if let required = fullRequiredEventId, required <= start, !requiredDuringRun {
             fullRequiredEventId = nil
         }
-        var failed: Set<String> = []
-        var deletesSkipped = false
-        if case .objectErrors(let f, let d) = outcome { failed = f; deletesSkipped = d }
+        fullRunOwed = outcome != .success
         streamPosition = max(streamPosition, start)
         for (path, e) in entries where !e.inFlight {
-            // A delete this run skipped keeps the entry and its first event.
-            if deletesSkipped && (e.subtree || !exists(path)) { continue }
             if e.lastEventId <= start {
                 remove(path)
             } else {
                 // Its events up to `start` are covered; only later ones are not.
-                entries[path]!.firstEventId = max(e.firstEventId, start + 1)
-            }
-        }
-        for path in failed {
-            // An existing entry keeps its clock (it may still be being written);
-            // a new one goes through `note`, so collapse and the size limit
-            // apply (a mass failure, e.g. an S4 block, becomes a full-run
-            // requirement, not 6,000 entries).
-            if entries[path] == nil && coveringSubtree(of: path) == nil {
-                note(path, isDirEvent: false, gap: false, eventId: start, now: now)
-            }
-            let carrier = entries[path] != nil ? path : coveringSubtree(of: path)
-            if let carrier {
-                entries[carrier]!.firstEventId = min(entries[carrier]!.firstEventId, start)
-                entries[carrier]!.failures = max(entries[carrier]!.failures, 1)
-                entries[carrier]!.unreplayable = true
+                entries[path]!.firstEventId = max(e.firstEventId, start == .max ? start : start + 1)
             }
         }
     }
 
     /// The FSEvents id up to which everything is on the remote: nil while a
-    /// full run is required or a full run's failure is pending (a restart must
-    /// run a full run), else one below the oldest event any live entry still
+    /// full run is required or owed (a restart must run one first; S3 deletes
+    /// its file then), else one below the oldest event any live entry still
     /// carries, else the stream position.
     var checkpoint: UInt64? {
-        if fullRequired || entries.values.contains(where: \.unreplayable) { return nil }
+        if fullRequired || fullRunOwed { return nil }
         guard let oldest = entries.values.map(\.firstEventId).min() else { return streamPosition }
         return oldest == 0 ? 0 : oldest - 1
     }
