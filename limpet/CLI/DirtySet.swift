@@ -64,8 +64,8 @@ final class ExcludeOracle {
     /// RE2 and ICU: any `(?` group or flag (`(?i)` from --ignore-case folds
     /// case differently), a backslash before a letter or digit (`\w \d \s \b`
     /// are ASCII in RE2, Unicode in ICU; rclone only escapes punctuation), and
-    /// `&&` / `--` / a nested `[` inside a bracket expression (ICU set
-    /// operations and POSIX classes, literal or ASCII in RE2).
+    /// `&&` / `--` / a nested `[` / a leading `:` inside a bracket expression
+    /// (ICU set operations and property classes, literal or ASCII in RE2).
     static func readsDifferently(_ pattern: String) -> Bool {
         if pattern.contains("(?") { return true }
         var inBracket = false, escaped = false
@@ -83,7 +83,10 @@ final class ExcludeOracle {
                 else if c == "[" || (c == "&" && previous == "&") || (c == "-" && previous == "-") { return true }
             } else if c == "[" {
                 inBracket = true
+                previous = "["
+                continue
             }
+            if inBracket && previous == "[" && c == ":" { return true }  // [:alpha:] is a Unicode property in ICU
         }
         return false
     }
@@ -154,6 +157,10 @@ struct DirtySet {
     /// A path that failed in this many batches is dropped; the next full run
     /// retries it. Keeps one bad file from pinning every batch.
     static let giveUpFailures = 3
+    /// A failing path that keeps changing gets this many extra tries (its new
+    /// content was never tried), then is given up anyway, so it cannot pin
+    /// every batch.
+    static let giveUpFailuresWhileChanging = 5
 
     struct Entry: Equatable {
         var firstSeen: TimeInterval
@@ -171,6 +178,8 @@ struct DirtySet {
         /// entry's first event start here when it is kept, so `maxDelay` keeps
         /// throttling a never-quiet file and it does not pin the checkpoint.
         var notedInFlightAt: TimeInterval?
+        /// The lowest event id folded in while in flight (notes, absorbed
+        /// descendants): the entry's first event if it is kept.
         var notedInFlightEventId: UInt64?
         /// Re-noted from a full run's failure: its change has no event a resume
         /// would replay, so no checkpoint may be saved while it is live.
@@ -188,7 +197,12 @@ struct DirtySet {
     private(set) var fullRequiredEventId: UInt64?
     var fullRequired: Bool { fullRequiredEventId != nil }
     private(set) var fullRunStartEventId: UInt64?
+    /// The highest event id noted (ids for collapsed entries).
     private(set) var highestEventId: UInt64 = 0
+    /// What an empty set's checkpoint may claim: raised only by `advance` and
+    /// by a covering full run, never by `note` (an unsorted replay delivers
+    /// higher ids before lower ones).
+    private(set) var streamPosition: UInt64 = 0
     /// Paths dropped after `giveUpFailures`; the watcher logs them once.
     private(set) var gaveUp: [String] = []
     private var childCount: [String: Int] = [:]
@@ -215,7 +229,7 @@ struct DirtySet {
     /// a callback's highest id after noting every event of that callback
     /// (excluded ones included) — during a replay only after `HistoryDone`.
     mutating func advance(toEventId id: UInt64) {
-        highestEventId = max(highestEventId, id)
+        streamPosition = max(streamPosition, id)
     }
 
     /// Records one FSEvents event for a root-relative path ("" = the root
@@ -274,7 +288,10 @@ struct DirtySet {
         e.lastEventId = max(e.lastEventId, eventId)
         e.generation += 1
         e.subtree = e.subtree || subtree
-        if e.inFlight && e.notedInFlightAt == nil { e.notedInFlightAt = now; e.notedInFlightEventId = eventId }
+        if e.inFlight {
+            if e.notedInFlightAt == nil { e.notedInFlightAt = now }
+            e.notedInFlightEventId = min(e.notedInFlightEventId ?? eventId, eventId)
+        }
         entries[path] = e
     }
 
@@ -288,6 +305,9 @@ struct DirtySet {
             entries[dir]!.firstSeen = min(entries[dir]!.firstSeen, e.firstSeen)
             entries[dir]!.firstEventId = min(entries[dir]!.firstEventId, e.firstEventId)
             entries[dir]!.lastEventId = max(entries[dir]!.lastEventId, e.lastEventId)
+            if entries[dir]!.inFlight {
+                entries[dir]!.notedInFlightEventId = min(entries[dir]!.notedInFlightEventId ?? e.firstEventId, e.firstEventId)
+            }
             remove(path)
         }
     }
@@ -302,7 +322,7 @@ struct DirtySet {
     }
 
     /// A full run must cover everything up to `eventId` (a gap, an overflow,
-    /// or a watcher start without a usable checkpoint). Idle entries are
+    /// or a watcher start without a usable checkpoint). Idle file entries are
     /// dropped: that run starts after them.
     mutating func requireFullRun(eventId: UInt64) {
         // Raised while a full run is in flight: that run never clears it,
@@ -310,7 +330,11 @@ struct DirtySet {
         let floor = fullRunStartEventId.map { $0 + 1 } ?? 0
         fullRequiredEventId = max(fullRequiredEventId ?? 0, eventId, floor)
         highestEventId = max(highestEventId, eventId)
-        for (path, e) in entries where !e.inFlight { remove(path) }
+        // Subtree entries stay: they carry directory deletes, which that run
+        // may skip (rclone skips every delete when any object fails). A skipped
+        // delete of a single missing file waits for the next full run, as with
+        // today's full sync.
+        for (path, e) in entries where !e.inFlight && !e.subtree { remove(path) }
     }
 
     func isReady(_ e: Entry, now: TimeInterval) -> Bool {
@@ -373,11 +397,18 @@ struct DirtySet {
                 let gone = !exists(item.path)
                 if Self.carries(item.path, coversBelow: e.subtree || gone, of: failed) {
                     e.failures += 1
+                    let changed = e.generation != item.generation
+                    if changed {
+                        // Restart the upload clock so maxDelay keeps throttling it.
+                        e.firstSeen = e.notedInFlightAt ?? e.lastSeen
+                        e.firstEventId = min(e.firstEventId, e.notedInFlightEventId ?? e.firstEventId)
+                    }
                     e.notedInFlightAt = nil
                     e.notedInFlightEventId = nil
                     entries[item.path] = e
-                    // New content noted during the run was never tried: keep it.
-                    if e.failures >= Self.giveUpFailures && e.generation == item.generation {
+                    // New content noted during the run was never tried: keep it,
+                    // up to `giveUpFailuresWhileChanging`.
+                    if e.failures >= (changed ? Self.giveUpFailuresWhileChanging : Self.giveUpFailures) {
                         gaveUp.append(item.path)
                         remove(item.path)
                     }
@@ -397,7 +428,6 @@ struct DirtySet {
     /// `startEventId`: FSEvents' current id when the full run started.
     mutating func fullRunStarted(startEventId: UInt64) {
         fullRunStartEventId = startEventId
-        highestEventId = max(highestEventId, startEventId)
     }
 
     mutating func fullRunFinished(outcome: RunOutcome, exists: (String) -> Bool) {
@@ -410,21 +440,28 @@ struct DirtySet {
         var failed: Set<String> = []
         var deletesSkipped = false
         if case .objectErrors(let f, let d) = outcome { failed = f; deletesSkipped = d }
+        streamPosition = max(streamPosition, start)
         for (path, e) in entries where !e.inFlight {
+            // A delete this run skipped keeps the entry and its first event.
+            if deletesSkipped && (e.subtree || !exists(path)) { continue }
             if e.lastEventId <= start {
-                if deletesSkipped && (e.subtree || !exists(path)) { continue }
                 remove(path)
             } else {
                 // Its events up to `start` are covered; only later ones are not.
                 entries[path]!.firstEventId = max(e.firstEventId, start + 1)
             }
         }
-        // Through `note`, so collapse and the size limit apply (a mass failure,
-        // e.g. an S4 block, becomes a full-run requirement, not 6,000 entries).
         for path in failed {
-            note(path, isDirEvent: false, gap: false, eventId: start, now: 0)
+            // An existing entry keeps its clock (it may still be being written);
+            // a new one goes through `note`, so collapse and the size limit
+            // apply (a mass failure, e.g. an S4 block, becomes a full-run
+            // requirement, not 6,000 entries).
+            if entries[path] == nil && coveringSubtree(of: path) == nil {
+                note(path, isDirEvent: false, gap: false, eventId: start, now: 0)
+            }
             let carrier = entries[path] != nil ? path : coveringSubtree(of: path)
             if let carrier {
+                entries[carrier]!.firstEventId = min(entries[carrier]!.firstEventId, start)
                 entries[carrier]!.failures = max(entries[carrier]!.failures, 1)
                 entries[carrier]!.unreplayable = true
             }
@@ -437,7 +474,7 @@ struct DirtySet {
     /// carries, else the stream position.
     var checkpoint: UInt64? {
         if fullRequired || entries.values.contains(where: \.unreplayable) { return nil }
-        guard let oldest = entries.values.map(\.firstEventId).min() else { return highestEventId }
+        guard let oldest = entries.values.map(\.firstEventId).min() else { return streamPosition }
         return oldest == 0 ? 0 : oldest - 1
     }
 

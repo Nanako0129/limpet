@@ -191,6 +191,7 @@ enum ConfigSelfTest {
             testDirtySetFullRunRules,
             testDirtySetObjectErrors,
             testExcludeOracleRefusals,
+            testDirtySetRoundThree,
             testLogWatcherSplitMultibyteLine,
             testStalledLineIsAFailureMarker,
             testStalledSyncWatchdogEndToEnd,
@@ -6740,6 +6741,7 @@ enum ConfigSelfTest {
         var set = DirtySet()
         set.advance(toEventId: 0)
         for i in 1...201 { set.note("d/f\(i)", isDirEvent: false, gap: false, eventId: UInt64(i), now: 0) }
+        set.advance(toEventId: 201)  // the watcher, after noting the whole callback
         guard set.entries.count == 1, set.entries["d"]?.subtree == true, set.checkpoint == 0 else {
             return report(id, slug, false, "(201 children: \(set.entries.count) entries, checkpoint \(String(describing: set.checkpoint)))")
         }
@@ -6819,6 +6821,7 @@ enum ConfigSelfTest {
         g.note("", isDirEvent: true, gap: true, eventId: 10, now: 1)
         g.fullRunStarted(startEventId: 10)
         g.note("b", isDirEvent: false, gap: false, eventId: 11, now: 3)
+        g.advance(toEventId: 11)
         g.finish(g.takeBatch(now: 20, limit: 10), outcome: .success, exists: { _ in true })
         guard g.checkpoint == nil else { return report(id, slug, false, "(checkpoint advanced past a pending full run)") }
         g.fullRunFinished(outcome: .success, exists: { _ in true })
@@ -6905,6 +6908,77 @@ enum ConfigSelfTest {
         q.fullRunFinished(outcome: .success, exists: { _ in true })
         guard q.checkpoint == 2801 else { return report(id, slug, false, "(checkpoint after a covering full run: \(String(describing: q.checkpoint)))") }
         return report(id, slug, true)
+    }
+
+    /// Third /code-review round of PR #21: interactions between the earlier fixes.
+    private static func testDirtySetRoundThree() -> Bool {
+        let id = "AC-L92-S1g", slug = "dirtyset-review-round-three"
+        // A file that keeps changing AND keeps failing is still given up, and
+        // maxDelay still throttles its attempts.
+        var busy = DirtySet()
+        var t: TimeInterval = 0, attempts = 0, lastAttemptAt: TimeInterval = 0
+        var inFlight: [DirtySet.BatchItem] = [], finishAt: TimeInterval = -1
+        let fail = RunOutcome.objectErrors(failedPaths: ["log.txt"], deletesSkipped: false)
+        while t <= 4000 {
+            if busy.gaveUp.isEmpty { busy.note("log.txt", isDirEvent: false, gap: false, eventId: UInt64(t) + 1, now: t) }
+            if !inFlight.isEmpty, t >= finishAt { busy.finish(inFlight, outcome: fail, exists: { _ in true }); inFlight = [] }
+            if inFlight.isEmpty {
+                let b = busy.takeBatch(now: t, limit: 10)
+                if !b.isEmpty { inFlight = b; finishAt = t + 4; attempts += 1; lastAttemptAt = t }
+            }
+            t += 2
+        }
+        // Attempts 2…5 each wait out maxDelay from the previous attempt's in-flight note.
+        guard busy.gaveUp == ["log.txt"], attempts <= DirtySet.giveUpFailuresWhileChanging,
+              lastAttemptAt >= 4 * (DirtySet.maxDelay - 10) else {
+            return report(id, slug, false, "(changing+failing file: \(attempts) attempts, last at \(lastAttemptAt) s, gaveUp \(busy.gaveUp))")
+        }
+        // A full-run requirement keeps subtree entries (directory deletes), and a
+        // full run that skipped deletes keeps them with their first event.
+        var d = DirtySet()
+        d.note("old", isDirEvent: true, gap: false, eventId: 5, now: 0)
+        d.note("x.txt", isDirEvent: false, gap: false, eventId: 6, now: 0)
+        d.requireFullRun(eventId: 7)
+        guard d.entries.keys.sorted() == ["old"] else { return report(id, slug, false, "(requireFullRun dropped a subtree entry: \(d.entries.keys.sorted()))") }
+        d.fullRunStarted(startEventId: 10)
+        d.note("old/new.txt", isDirEvent: false, gap: false, eventId: 20, now: 1)
+        d.fullRunFinished(outcome: .objectErrors(failedPaths: ["bad.txt"], deletesSkipped: true), exists: { _ in true })
+        guard d.entries["old"]?.firstEventId == 5 else {
+            return report(id, slug, false, "(skipped-delete subtree lost its first event: \(String(describing: d.entries["old"]?.firstEventId)))")
+        }
+        // A full run's failure on an existing entry does not move its clock back.
+        var w = DirtySet()
+        w.fullRunStarted(startEventId: 100)
+        w.note("busy.log", isDirEvent: false, gap: false, eventId: 150, now: 5000)
+        w.fullRunFinished(outcome: .objectErrors(failedPaths: ["busy.log"], deletesSkipped: false), exists: { _ in true })
+        guard w.entries["busy.log"]?.lastSeen == 5000, w.takeBatch(now: 5001, limit: 10).isEmpty else {
+            return report(id, slug, false, "(a full run's failure made a file being written ready at once)")
+        }
+        // The stream position moves only with advance() and a covering full run.
+        var e = DirtySet()
+        e.advance(toEventId: 50)
+        e.fullRunStarted(startEventId: 1000)
+        guard e.checkpoint == 50 else { return report(id, slug, false, "(checkpoint moved when a full run started)") }
+        e.fullRunFinished(outcome: .runFailed, exists: { _ in true })
+        guard e.checkpoint == 50 else { return report(id, slug, false, "(checkpoint moved by a failed full run)") }
+        e.fullRunStarted(startEventId: 1000)
+        e.fullRunFinished(outcome: .success, exists: { _ in true })
+        guard e.checkpoint == 1000 else { return report(id, slug, false, "(checkpoint after a covering full run: \(String(describing: e.checkpoint)))") }
+        e.note("late.txt", isDirEvent: false, gap: false, eventId: 5000, now: 0)
+        e.finish(e.takeBatch(now: 20, limit: 10), outcome: .success, exists: { _ in true })
+        guard e.checkpoint == 1000 else { return report(id, slug, false, "(a note moved the empty-set checkpoint: \(String(describing: e.checkpoint)))") }
+        // Lower ids folded into an in-flight entry survive a successful finish.
+        var c = DirtySet()
+        c.note("d", isDirEvent: false, gap: false, eventId: 10, now: 0)
+        let cb = c.takeBatch(now: 10, limit: 10)
+        for i in 101...301 { c.note("d/f\(i)", isDirEvent: false, gap: false, eventId: UInt64(i), now: 11) }
+        c.finish(cb, outcome: .success, exists: { _ in true })
+        guard c.entries["d"]?.firstEventId == 101 else {
+            return report(id, slug, false, "(absorbed ids lost: firstEventId \(String(describing: c.entries["d"]?.firstEventId)))")
+        }
+        // A top-level POSIX class reads as a Unicode property in ICU.
+        let wrapped = "--- start filters ---\n--- File filter rules ---\n- (^|/)[^/]*[:digit:][^/]*$\n--- end filters ---"
+        return report(id, slug, ExcludeOracle(dump: wrapped) == nil, "(top-level [:digit:] not refused)")
     }
 
     private static func testExcludeOracleRefusals() -> Bool {
