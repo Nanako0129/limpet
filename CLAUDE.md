@@ -518,7 +518,7 @@ U+FF0E, U+FF0F do match) synced through its nearest clean ancestor as a subtree
 (`DirtySet.scope`, also used to attribute failures).
 `RunOutcome.classify(exitCode:runLog:)` turns a run into `.success` (exit 0 AND
 the script's `Sync completed successfully` line — an unmounted drive exits 0
-without it), `.objectErrors` (exit 1/5/6 with only per-object failures, taken from
+without it), `.objectErrors` (exit 1/5/6, or the script's 77, with only per-object failures, taken from
 the last attempt, and known rclone follow-up lines) or `.runFailed`. Verified end
 to end with real rclone 1.75.1 local→local (excluded, unlisted, deleted, new,
 symlink, tab-named and `{{…}}` paths). Self-tests AC-L92-S2a1–4.
@@ -538,9 +538,11 @@ ignored unless a gap; MustScanSubDirs below the root = a subtree), excluded path
 are dropped, a path whose first component rclone re-encodes becomes a full run.
 The scheduler asks `prepareRun` before spawning (nothing due = stay idle) and
 tells `refused` on every gate refusal; the planner runs a requested, required or
-owed full run before a batch (limit min(500, maxDelete)), delays a batch 30 s
-doubling to 30 min after a failure and both after a refusal, and serves the owed
-run on its own backoff (`owedDelay`). A batch passes its filter file
+owed full run before a batch (limit min(500, maxDelete)). Only a run that failed
+as a whole delays the next batch (or full run) 30 s doubling to 30 min; object
+errors are charged to their paths; a refusal only spaces out the wake timer; an
+explicit request ("Sync now", source back, periodic, a refused batch) runs at once;
+the owed run waits `owedDelay` and the full-run failure delay. A batch passes its filter file
 (`~/.local/state/limpet/<shortId>-batch.filter`) and `LIMPET_BATCH_ITEMS` to the
 script; the run's own log segment (from the size before the spawn, or from 0
 after a rotation) is classified, exit 0 included. A batch the script refuses

@@ -7359,7 +7359,7 @@ enum ConfigSelfTest {
             (1, [objectError, notDeleting, attempt, succeeded].joined(separator: "\n"), .runFailed),
             (5, [objectError, attempt].joined(separator: "\n"), .objectErrors(failedPaths: ["shanjie-s5p/r.jsonl"], deletesSkipped: false)),
             (5, [objectError, other].joined(separator: "\n"), .runFailed),
-            (7, log, .runFailed), (77, log, .runFailed), (75, "", .runFailed),
+            (7, log, .runFailed), (77, log, .objectErrors(failedPaths: ["shanjie-s5p/r.jsonl"], deletesSkipped: true)), (75, "", .runFailed),
         ]
         for (code, text, expected) in cases where RunOutcome.classify(exitCode: code, runLog: text) != expected {
             return report(id, slug, false, "(exit \(code): \(RunOutcome.classify(exitCode: code, runLog: text)), expected \(expected))")
@@ -7409,6 +7409,10 @@ enum ConfigSelfTest {
         guard p.next(now: 259, currentEventId: current) == nil, p.next(now: 260, currentEventId: current) == .full else {
             return report(id, slug, false, "(failed full run not retried after 30 s)")
         }
+        // An explicit request ("Sync now") runs at once, even inside a failure delay.
+        p.finished(.runFailed, now: 265, exists: yes)
+        p.requestFull()
+        guard p.next(now: 266, currentEventId: current) == .full else { return report(id, slug, false, "(Sync now waited out the failure delay)") }
         // The owed backoff formula itself (limpet-plan.md contract).
         guard IncrementalPlanner.owedDelay(0) == 30, IncrementalPlanner.owedDelay(1) == 30, IncrementalPlanner.owedDelay(2) == 60,
               IncrementalPlanner.owedDelay(3) == 120, IncrementalPlanner.owedDelay(6) == 960, IncrementalPlanner.owedDelay(7) == 1800,
@@ -7433,13 +7437,41 @@ enum ConfigSelfTest {
         guard p.next(now: t + 100_001, currentEventId: current) == .full else { return report(id, slug, false, "(periodic full run did not serve the owe)") }
         p.finished(.success, now: t + 100_010, exists: yes)
         guard !p.dirty.fullRunOwed, p.dirty.checkpoint != nil else { return report(id, slug, false, "(clean full run did not settle the owe)") }
-        // A gate refusal delays everything: 30 s, then 60 s.
+        // A gate refusal spaces out the wake timer (30 s, then 60 s) but blocks no
+        // run once the gates pass.
         var r = IncrementalPlanner(batchLimit: 500)
         r.refused(now: 0)
-        guard r.next(now: 29, currentEventId: current) == nil, r.nextWake(now: 1) == 30 else { return report(id, slug, false, "(refusal not delayed 30 s)") }
+        guard r.nextWake(now: 1) == 30 else { return report(id, slug, false, "(refusal did not space the wake 30 s)") }
         r.refused(now: 30)
-        guard r.next(now: 89, currentEventId: current) == nil, r.next(now: 90, currentEventId: current) == .full else {
-            return report(id, slug, false, "(second refusal not delayed 60 s)")
+        guard r.nextWake(now: 31) == 90, r.next(now: 31, currentEventId: current) == .full else {
+            return report(id, slug, false, "(second refusal: wake not 60 s, or the run was blocked)")
+        }
+        // An owed full run that fails as a whole (offline) backs off like any failed full run.
+        var q = IncrementalPlanner(batchLimit: 500)
+        _ = q.next(now: 0, currentEventId: current)
+        q.finished(.objectErrors(failedPaths: ["bad.bin"], deletesSkipped: false), now: 10, exists: yes)
+        guard q.next(now: 40, currentEventId: current) == .full else { return report(id, slug, false, "(owed run not started)") }
+        q.finished(.runFailed, now: 45, exists: yes)
+        guard q.next(now: 75, currentEventId: current) == .full else { return report(id, slug, false, "(owed run not retried after 30 s)") }
+        q.finished(.runFailed, now: 80, exists: yes)
+        guard q.next(now: 139, currentEventId: current) == nil, q.next(now: 140, currentEventId: current) == .full else {
+            return report(id, slug, false, "(failing owed run ignored the 60 s failure delay)")
+        }
+        // Object errors in a batch (exit 77: a file changing during upload) charge
+        // that file only: the other paths' next batch is not delayed.
+        let changing = #"{"level":"error","msg":"Failed to copy: can't copy - source file is being updated","object":"x.log","objectType":"*local.Object"}"#
+        guard RunOutcome.classify(exitCode: 77, runLog: changing + "\n") == .objectErrors(failedPaths: ["x.log"], deletesSkipped: false) else {
+            return report(id, slug, false, "(exit 77 not read per object)")
+        }
+        var w = IncrementalPlanner(batchLimit: 500)
+        _ = w.next(now: 0, currentEventId: current)
+        w.finished(.success, now: 1, exists: yes)
+        w.dirty.note("x.log", isDirEvent: false, gap: false, eventId: 1001, now: 10)
+        guard case .batch? = w.next(now: 20, currentEventId: current) else { return report(id, slug, false, "(x.log not batched)") }
+        w.finished(.objectErrors(failedPaths: ["x.log"], deletesSkipped: false), now: 25, exists: yes)
+        w.dirty.note("y.txt", isDirEvent: false, gap: false, eventId: 1002, now: 26)
+        guard w.batchNotBefore == 0, case .batch(let next)? = w.next(now: 36, currentEventId: current), next.map(\.path).contains("y.txt") else {
+            return report(id, slug, false, "(an object error delayed the other paths' batch)")
         }
         return report(id, slug, true)
     }

@@ -640,14 +640,14 @@ extension RunOutcome {
     /// profile log (rclone 1.75.1 `--use-json-log` lines).
     /// - Exit 0 is success only if the script logged `Sync completed
     ///   successfully` (an unmounted drive exits 0 without running rclone).
-    /// - Exit 1, 5 or 6 whose error/critical lines are all per-object failures
+    /// - Exit 1, 5, 6 or 77 whose error/critical lines are all per-object failures
     ///   (`objectType` ending `.Object`) or rclone's own follow-ups is
     ///   `.objectErrors`, with the failures of the LAST attempt only (a path
     ///   that failed in attempt 1 and succeeded in attempt 2 is fine).
     ///   Follow-ups: `Attempt …` and `Can't retry any of the errors …` with no
     ///   object; `not deleting files|directories as there were IO errors`
     ///   (an `.Fs` objectType), which sets `deletesSkipped`.
-    /// - Everything else — any other code (75/76/77/78/79 …), any other error
+    /// - Everything else — any other code (75/76/78/79 …), any other error
     ///   line, a `{` line that is not JSON, or no named object — is `.runFailed`.
     static func classify(exitCode: Int32, runLog: String) -> RunOutcome {
         if exitCode == 0 {
@@ -658,7 +658,9 @@ extension RunOutcome {
         // must be countable and given up. Accepted (not measured): an outage
         // that starts mid-transfer also names the in-flight objects, so they
         // can be given up to the owed full run, which retries them.
-        guard exitCode == 1 || exitCode == 5 || exitCode == 6 else { return .runFailed }
+        // 77 is the script's "only files changing during upload" (L9.1): its
+        // lines name those files, so they are charged like any object error.
+        guard exitCode == 1 || exitCode == 5 || exitCode == 6 || exitCode == 77 else { return .runFailed }
         var attempt: Set<String> = [], lastFailedAttempt: Set<String> = []
         var attemptSkipped = false, lastSkipped = false
         for line in runLog.split(separator: "\n") where line.hasPrefix("{") {
@@ -714,6 +716,9 @@ struct IncrementalPlanner {
     private var batchFailures = 0
     private var fullFailures = 0
     private var refusals = 0
+    /// A gate refusal only spaces out the wake timer (no polling while a gate
+    /// keeps refusing); a trigger whose gates pass may still run.
+    private var wakeNotBefore: TimeInterval = 0
     private(set) var batchNotBefore: TimeInterval = 0
     private(set) var fullNotBefore: TimeInterval = 0
     /// When the current owe began or its last failed full run ended.
@@ -735,13 +740,18 @@ struct IncrementalPlanner {
         n > 7 ? nil : min(30 * pow(2, Double(max(n - 1, 0))), 1800)
     }
 
-    mutating func requestFull() { fullRequested = true }
+    /// An explicit request ("Sync now", source back, periodic, a refused batch)
+    /// runs at once; if it fails, the failure delay doubles from where it was.
+    mutating func requestFull() {
+        fullRequested = true
+        fullNotBefore = 0
+    }
 
     private var fullWanted: Bool { fullRequested || dirty.fullRequired }
 
     private func owedDue(_ now: TimeInterval) -> Bool {
         guard dirty.fullRunOwed, let since = owedSince, let wait = Self.owedDelay(dirty.owedFullRunFailures) else { return false }
-        return now >= since + wait
+        return now >= max(since + wait, fullNotBefore)
     }
 
     /// The run to start now, or nil. `currentEventId` is FSEvents' current id,
@@ -752,12 +762,14 @@ struct IncrementalPlanner {
         if (fullWanted && now >= fullNotBefore) || owedDue(now) {
             dirty.fullRunStarted(startEventId: currentEventId())
             inFlight = .full
+            refusals = 0
             return .full
         }
         guard now >= batchNotBefore else { return nil }
         let items = dirty.takeBatch(now: now, limit: batchLimit)
         guard !items.isEmpty else { return nil }
         inFlight = .batch(items)
+        refusals = 0
         return .batch(items)
     }
 
@@ -767,9 +779,11 @@ struct IncrementalPlanner {
         guard inFlight == nil else { return nil }
         var times: [TimeInterval] = []
         if fullWanted { times.append(fullNotBefore) }
-        if dirty.fullRunOwed, let wait = Self.owedDelay(dirty.owedFullRunFailures) { times.append((owedSince ?? now) + wait) }
+        if dirty.fullRunOwed, let wait = Self.owedDelay(dirty.owedFullRunFailures) {
+            times.append(max((owedSince ?? now) + wait, fullNotBefore))
+        }
         if let ready = dirty.nextWakeup(now: now) { times.append(max(ready, batchNotBefore)) }
-        return times.min().map { max($0, now) }
+        return times.min().map { max($0, now, wakeNotBefore) }
     }
 
     /// The started run ended. `exists`: lstat relative to the root.
@@ -786,30 +800,28 @@ struct IncrementalPlanner {
                 fullFailures = 0
                 fullNotBefore = 0
                 fullRequested = false
-                refusals = 0
             }
             owedSince = dirty.fullRunOwed ? now : nil
         case .batch(let items):
             dirty.finish(items, outcome: outcome, exists: exists)
-            if outcome == .success {
-                batchFailures = 0
-                batchNotBefore = 0
-                refusals = 0
-            } else {
+            // Object errors are charged to their paths (given up after a few);
+            // only a run that failed as a whole delays every batch.
+            if outcome == .runFailed {
                 batchFailures += 1
                 batchNotBefore = now + Self.retryDelay(batchFailures)
+            } else {
+                batchFailures = 0
+                batchNotBefore = 0
             }
             if dirty.fullRunOwed && owedSince == nil { owedSince = now }
         }
     }
 
     /// A gate refused to start anything (source missing, delete limit,
-    /// overlap, lingering group): nothing runs again before the delay.
+    /// overlap, lingering group): the wake timer waits 30 s doubling to 30 min.
     mutating func refused(now: TimeInterval) {
         refusals += 1
-        let until = now + Self.retryDelay(refusals)
-        batchNotBefore = max(batchNotBefore, until)
-        fullNotBefore = max(fullNotBefore, until)
+        wakeNotBefore = now + Self.retryDelay(refusals)
     }
 }
 
