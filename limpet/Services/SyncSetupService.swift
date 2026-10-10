@@ -452,9 +452,7 @@ final class SyncSetupService {
         // come from SyncProfile.batchRefusedFlags, the list the watcher uses.
         let batchRefusedCasePattern = SyncProfile.batchRefusedFlags
             .subtracting(["--delete-excluded"]).sorted().joined(separator: "|")
-        let batchUnsetVariables = (SyncProfile.batchRefusedFlags.subtracting(["--"]).sorted()
-            .map { "RCLONE_" + $0.dropFirst(2).uppercased().replacingOccurrences(of: "-", with: "_") }
-            + ["RCLONE_FAST_LIST", "RCLONE_TPSLIMIT", "RCLONE_TPSLIMIT_BURST"]).joined(separator: " ")
+        let batchRefusedEnvironment = SyncProfile.batchRefusedEnvironment.joined(separator: " ")
         let rcloneBinSelection = honorRcloneBinOverride
             ? #"if [[ -z "${RCLONE_BIN:-}" || ! -x "$RCLONE_BIN" ]]; then"#
             : #"RCLONE_BIN=""; if true; then"#
@@ -581,6 +579,9 @@ final class SyncSetupService {
                             [[ "$flag_token" == *=false ]] || batch_refused="$flag_token" ;;
                         \(batchRefusedCasePattern))
                             batch_refused="$flag_token" ;;
+                    esac
+                    # A single-dash token is judged raw (`_drafts/**` is a value).
+                    case "${flag_token%%=*}" in
                         --*) ;;
                         -*f*)
                             batch_refused="$flag_token" ;;
@@ -590,8 +591,15 @@ final class SyncSetupService {
                         exit 64
                     fi
                 done
-                # rclone also reads any flag from an RCLONE_<FLAG> environment variable.
-                unset \(batchUnsetVariables)
+                # rclone also reads any flag from an RCLONE_<FLAG> environment variable:
+                # a batch refuses those like the flags, and drops the ones it overrides.
+                for env_name in \(batchRefusedEnvironment); do
+                    if [[ -n "${!env_name:-}" ]]; then
+                        echo "$(date '+%Y-%m-%d %H:%M:%S') - Refusing to sync: environment variable $env_name changes what a batch would sync" >> "$LOG_FILE"
+                        exit 64
+                    fi
+                done
+                unset RCLONE_FAST_LIST RCLONE_TPSLIMIT RCLONE_TPSLIMIT_BURST
             fi
 
             # Find rclone binary. Cover the common package-manager locations,
@@ -792,8 +800,9 @@ final class SyncSetupService {
                 # include; rclone puts every --exclude flag before both files).
                 # No --fast-list: with it rclone walks the whole remote prefix
                 # and ignores directory filters (march.go/walk.go, 1.75.1).
-                # --tpslimit 4 (appended after additionalFlags below, so a profile's own
-                # value cannot raise it) keeps two busy profiles far below the S4 IP block.
+                # --tpslimit 4 --tpslimit-burst 1 (appended after additionalFlags below,
+                # so a profile's own values cannot raise them) keep two busy profiles
+                # far below the S4 IP block.
                 BATCH_ITEMS="${LIMPET_BATCH_ITEMS:-}"
                 [[ "$BATCH_ITEMS" =~ ^[0-9]+$ ]] || BATCH_ITEMS="?"
                 echo "$(date '+%Y-%m-%d %H:%M:%S') - Starting sync (local → remote, $BATCH_ITEMS changed paths)" >> "$LOG_FILE"

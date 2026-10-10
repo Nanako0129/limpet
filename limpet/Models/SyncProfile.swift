@@ -277,11 +277,21 @@ struct SyncProfile: Identifiable, Codable, Equatable {
         "--local-unicode-normalization", "--error-on-no-transfer", "--",
     ]
 
-    /// Whether one additionalRcloneFlags token makes a batch unsafe.
+    /// The RCLONE_<FLAG> environment variables for `batchRefusedFlags` (rclone
+    /// reads any flag from one). A batch refuses to run while one is set, the
+    /// same as for the flag; the script and the watcher both check this list.
+    static var batchRefusedEnvironment: [String] {
+        batchRefusedFlags.subtracting(["--"]).sorted()
+            .map { "RCLONE_" + $0.dropFirst(2).uppercased().replacingOccurrences(of: "-", with: "_") }
+    }
+
+    /// Whether one additionalRcloneFlags token makes a batch unsafe. A single
+    /// dash is judged on the raw token (a value such as `_drafts/**` is no
+    /// flag); a long flag on its name with `_` read as `-`, as rclone does.
     static func refusesBatch(_ token: String) -> Bool {
-        let name = String(token.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false).first ?? "")
-            .replacingOccurrences(of: "_", with: "-")
-        if token.hasPrefix("-") && !token.hasPrefix("--") { return name.dropFirst().contains("f") }
+        let raw = String(token.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false).first ?? "")
+        if raw.hasPrefix("-") && !raw.hasPrefix("--") { return raw.dropFirst().contains("f") }
+        let name = raw.replacingOccurrences(of: "_", with: "-")
         if name == "--delete-excluded" { return !token.hasSuffix("=false") }
         return batchRefusedFlags.contains(name)
     }

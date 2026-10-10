@@ -7152,7 +7152,8 @@ enum ConfigSelfTest {
             q.additionalRcloneFlags = flags
             return q.incrementalIneligibility
         }
-        let eligible = ["", "--s3-no-head --update", "--exclude=build/** --fast-list", "--delete-excluded=false", "--files-from-x", "-v", "-P"]
+        let eligible = ["", "--s3-no-head --update", "--exclude=build/** --fast-list", "--delete-excluded=false", "--files-from-x", "-v", "-P",
+                        "--exclude _drafts/**"]
         let ineligible = ["--include=*.txt", "--include-from=f", "--filter=+_x", "-f", "-f+x", "--filter-from=f",
                           "--files-from=f", "--files-from-raw=f", "--delete-excluded", "--delete-excluded=true",
                           "--delete_excluded", "--include_from=f", "--min-age=2m", "--max-age=1d",
@@ -7170,10 +7171,10 @@ enum ConfigSelfTest {
         let id = "AC-L92-S2a2", slug = "batch-script-argv"
         let dirty = "\(selfTestRoot)/ac-l92-s2a2.filter"
         try? "+ /a.txt\n- **\n".write(toFile: dirty, atomically: true, encoding: .utf8)
-        let envProbe = "echo \"ENV=${RCLONE_DELETE_EXCLUDED:-unset}\" >> \"\(selfTestRoot)/ac-l92-s2a2/stub-argv\"\nexit 0\n"
+        let envProbe = "echo \"ENV=${RCLONE_FAST_LIST:-unset}\" >> \"\(selfTestRoot)/ac-l92-s2a2/stub-argv\"\nexit 0\n"
         guard let batch = runScriptFixture(name: "ac-l92-s2a2", overrides: ["additionalFlags": "--fast-list --s3-no-head --fast-list=true --tpslimit=20"],
                                            stubTail: envProbe,
-                                           extraEnvironment: ["LIMPET_BATCH_ITEMS": "3", "RCLONE_DELETE_EXCLUDED": "true"], extraArgs: [dirty]),
+                                           extraEnvironment: ["LIMPET_BATCH_ITEMS": "3", "RCLONE_FAST_LIST": "true"], extraArgs: [dirty]),
               let full = runScriptFixture(name: "ac-l92-s2a2-full", overrides: ["additionalFlags": "--s3-no-head"]) else {
             return report(id, slug, false, "(fixture setup failed)")
         }
@@ -7183,6 +7184,7 @@ enum ConfigSelfTest {
               !a.contains(where: { $0.hasPrefix("--fast-list") }), a.contains("--s3-no-head"),
               let t = a.lastIndex(of: "--tpslimit"), a.indices.contains(t + 1), a[t + 1] == "4",
               !a[(t + 1)...].contains(where: { $0.hasPrefix("--tpslimit=") }),
+              let tb = a.lastIndex(of: "--tpslimit-burst"), tb > t, a.indices.contains(tb + 1), a[tb + 1] == "1",
               a.contains("ENV=unset"),
               batch.log.contains("Starting sync (local → remote, 3 changed paths)") else {
             return report(id, slug, false, "(batch argv/log wrong: \(a))")
@@ -7201,6 +7203,17 @@ enum ConfigSelfTest {
                   refused.status == 64, !refused.stubRan, refused.log.contains("changes what a batch would sync") else {
                 return report(id, slug, false, "(a batch with \(flags) was not refused by the script)")
             }
+        }
+        // A value token starting with `_` is no single-dash flag (both checks agree).
+        guard let value = runScriptFixture(name: "ac-l92-s2a2-val", overrides: ["additionalFlags": "--exclude _drafts/**"], extraArgs: [dirty]),
+              value.status == 0, value.stubRan else {
+            return report(id, slug, false, "(--exclude _drafts/** was refused by the script)")
+        }
+        // An RCLONE_* variable for a refused flag refuses the batch like the flag.
+        guard let envRefused = runScriptFixture(name: "ac-l92-s2a2-env", overrides: [:],
+                                                extraEnvironment: ["RCLONE_HASH_FILTER": "@/4"], extraArgs: [dirty]),
+              envRefused.status == 64, !envRefused.stubRan, envRefused.log.contains("RCLONE_HASH_FILTER") else {
+            return report(id, slug, false, "(RCLONE_HASH_FILTER did not refuse the batch)")
         }
         guard let fullOK = runScriptFixture(name: "ac-l92-s2a2-full2", overrides: ["additionalFlags": "--delete-excluded"]), fullOK.status == 0 else {
             return report(id, slug, false, "(the batch flag check also refused a full run)")
@@ -7273,7 +7286,7 @@ enum ConfigSelfTest {
             (1, [objectError, other].joined(separator: "\n"), .runFailed),
             (1, [notDeleting, attempt].joined(separator: "\n"), .runFailed),
             (1, [objectError, notDeleting, attempt, succeeded].joined(separator: "\n"), .runFailed),
-            (5, [objectError, attempt].joined(separator: "\n"), .objectErrors(failedPaths: ["shanjie-s5p/r.jsonl"], deletesSkipped: false)),
+            (5, [objectError, attempt].joined(separator: "\n"), .runFailed),
             (7, log, .runFailed), (77, log, .runFailed), (75, "", .runFailed),
         ]
         for (code, text, expected) in cases where RunOutcome.classify(exitCode: code, runLog: text) != expected {

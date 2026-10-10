@@ -552,8 +552,10 @@ extension DirtySet {
 
     /// What a batch item actually covers: the item, or — for a path rclone
     /// re-encodes — its nearest clean ancestor as a subtree. Used both to write
-    /// the filter and to attribute failures, so they always agree. An empty
-    /// path means the root: the watcher turns such a path into a full run.
+    /// the filter and to attribute failures (each with its own lstat of a gone
+    /// path, so a path recreated mid-run can make a failure unattributed,
+    /// which only costs a full run). An empty path means the root; the watcher
+    /// is to turn such a path into a full run instead (limpet-plan.md L9.2 S2b).
     static func scope(of path: String, subtree: Bool) -> (path: String, subtree: Bool) {
         var p = path
         var sub = subtree
@@ -597,7 +599,8 @@ extension DirtySet {
     /// `+ /p/**` too for a subtree entry or a path that is gone (lstat), and a
     /// final `- **`. A path rclone re-encodes is replaced by its nearest
     /// ancestor without such a scalar, as a subtree (`scope`); `+ /**` only as
-    /// a fallback the watcher avoids by asking for a full run instead.
+    /// a fallback for a root scope, which the watcher is to replace with a full
+    /// run (L9.2 S2b).
     static func filterRules(for batch: [BatchItem], exists: (String) -> Bool) -> String {
         var lines: [String] = []
         for item in batch {
@@ -621,7 +624,7 @@ extension RunOutcome {
     /// profile log (rclone 1.75.1 `--use-json-log` lines).
     /// - Exit 0 is success only if the script logged `Sync completed
     ///   successfully` (an unmounted drive exits 0 without running rclone).
-    /// - Exit 1, 5 or 6 whose error/critical lines are all per-object failures
+    /// - Exit 1 or 6 whose error/critical lines are all per-object failures
     ///   (`objectType` ending `.Object`) or rclone's own follow-ups is
     ///   `.objectErrors`, with the failures of the LAST attempt only (a path
     ///   that failed in attempt 1 and succeeded in attempt 2 is fine).
@@ -634,8 +637,10 @@ extension RunOutcome {
         if exitCode == 0 {
             return runLog.contains(" - Sync completed successfully") ? .success : .runFailed
         }
-        // 5: rclone's "temporary error" exit when the last error was retryable.
-        guard exitCode == 1 || exitCode == 5 || exitCode == 6 else { return .runFailed }
+        // 5 (rclone's "temporary error": the last error was retryable — a 503,
+        // a reset) stays .runFailed: a transient outage is no item's fault and
+        // must not count toward giving paths up.
+        guard exitCode == 1 || exitCode == 6 else { return .runFailed }
         var attempt: Set<String> = [], lastFailedAttempt: Set<String> = []
         var attemptSkipped = false, lastSkipped = false
         for line in runLog.split(separator: "\n") where line.hasPrefix("{") {
