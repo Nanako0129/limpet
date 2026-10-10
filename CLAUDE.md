@@ -768,7 +768,7 @@ is the separate, fail-closed schema-drift gate.
 ### Versioning, Sparkle updates and the watcher self-restart (limpet-plan.md L7.1)
 
 **Version wiring.** `Info.plist` carries `CFBundleShortVersionString = $(MARKETING_VERSION)` and
-`CFBundleVersion = $(CURRENT_PROJECT_VERSION)`. `project.pbxproj` sets `MARKETING_VERSION = 1.0.1`
+`CFBundleVersion = $(CURRENT_PROJECT_VERSION)`. `project.pbxproj` sets `MARKETING_VERSION = 1.0.2`
 (Debug and Release) and leaves `CURRENT_PROJECT_VERSION = 1` locally; CI overrides it in L7.2 (commit count).
 
 **Sparkle (SwiftPM, `upToNextMajor` from 2.9.0, pinned in the committed
