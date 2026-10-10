@@ -624,7 +624,7 @@ extension RunOutcome {
     /// profile log (rclone 1.75.1 `--use-json-log` lines).
     /// - Exit 0 is success only if the script logged `Sync completed
     ///   successfully` (an unmounted drive exits 0 without running rclone).
-    /// - Exit 1 or 6 whose error/critical lines are all per-object failures
+    /// - Exit 1, 5 or 6 whose error/critical lines are all per-object failures
     ///   (`objectType` ending `.Object`) or rclone's own follow-ups is
     ///   `.objectErrors`, with the failures of the LAST attempt only (a path
     ///   that failed in attempt 1 and succeeded in attempt 2 is fine).
@@ -637,10 +637,10 @@ extension RunOutcome {
         if exitCode == 0 {
             return runLog.contains(" - Sync completed successfully") ? .success : .runFailed
         }
-        // 5 (rclone's "temporary error": the last error was retryable — a 503,
-        // a reset) stays .runFailed: a transient outage is no item's fault and
-        // must not count toward giving paths up.
-        guard exitCode == 1 || exitCode == 6 else { return .runFailed }
+        // 5 is rclone's exit when the last error was retryable: an outage logs
+        // object-less or `.Fs` lines (-> .runFailed below), while one object
+        // that keeps failing names itself and must be countable and given up.
+        guard exitCode == 1 || exitCode == 5 || exitCode == 6 else { return .runFailed }
         var attempt: Set<String> = [], lastFailedAttempt: Set<String> = []
         var attemptSkipped = false, lastSkipped = false
         for line in runLog.split(separator: "\n") where line.hasPrefix("{") {

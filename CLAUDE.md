@@ -482,16 +482,20 @@ syncs when it is off, not localToRemote, or `additionalRcloneFlags` holds a
 flag in `SyncProfile.batchRefusedFlags` (include/filter/files-from rules incl.
 `--files-from0`, `--delete-excluded` unless `=false`, `--min-age`, `--max-age`,
 `--hash-filter`, `--exclude-if-present`, `--local-encoding`,
-`--local-unicode-normalization`, `--error-on-no-transfer`, a bare `--`, and any
-single-dash token whose letters include `f`; `_` read as `-`).
+`--local-unicode-normalization`, `--error-on-no-transfer`, `--log-file`,
+`--log-level`, `--use-json-log`, `--syslog` (they take rclone's JSON error lines
+out of the profile log the watcher classifies), a bare `--`, and any single-dash
+token whose letters include `f`; long flags read `_` as `-`).
 The generated script runs a batch when given a second argument, a filter file.
 Before the lock it refuses (exit 64) a batch for remoteToLocal, an unreadable
 file, or any of those flags (a newer config can reach an older watcher's
-batch) or the matching `RCLONE_*` environment variable is set (rclone reads
-every flag from one; `SyncProfile.batchRefusedEnvironment`), and unsets
-`RCLONE_FAST_LIST`/`RCLONE_TPSLIMIT`/`RCLONE_TPSLIMIT_BURST`, which it overrides.
-The case pattern and the variable list are generated from `batchRefusedFlags`;
-a single-dash token is judged raw (a value like `_drafts/**` is no flag). It logs `Starting sync (local → remote, N changed
+batch) or the matching `RCLONE_*` environment variable is set, even empty, to
+anything but `false` (rclone reads every flag from one;
+`SyncProfile.batchRefusedEnvironment`), and unsets `RCLONE_FAST_LIST`. The case
+pattern and the variable list are generated from `batchRefusedFlags`; a
+single-dash token is judged raw (a value like `_drafts/**` is no flag), exactly
+as `SyncProfile.refusesBatch` does (AC-L92-S2a1 runs every listed token through
+both). It logs `Starting sync (local → remote, N changed
 paths)` (N from `LIMPET_BATCH_ITEMS`) and runs `rclone sync` with
 `--filter-from <profile exclude file> --filter-from <batch file>`, no
 `--fast-list` (also removed from additionalFlags: with it rclone walks the
@@ -508,7 +512,7 @@ U+FF0E, U+FF0F do match) synced through its nearest clean ancestor as a subtree
 (`DirtySet.scope`, also used to attribute failures).
 `RunOutcome.classify(exitCode:runLog:)` turns a run into `.success` (exit 0 AND
 the script's `Sync completed successfully` line — an unmounted drive exits 0
-without it), `.objectErrors` (exit 1/6 with only per-object failures, taken from
+without it), `.objectErrors` (exit 1/5/6 with only per-object failures, taken from
 the last attempt, and known rclone follow-up lines) or `.runFailed`. Verified end
 to end with real rclone 1.75.1 local→local (excluded, unlisted, deleted, new,
 symlink, tab-named and `{{…}}` paths). Self-tests AC-L92-S2a1–4.

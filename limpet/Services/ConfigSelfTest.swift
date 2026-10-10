@@ -7158,11 +7158,24 @@ enum ConfigSelfTest {
                           "--files-from=f", "--files-from-raw=f", "--delete-excluded", "--delete-excluded=true",
                           "--delete_excluded", "--include_from=f", "--min-age=2m", "--max-age=1d",
                           "--exclude-if-present=.nosync", "--files-from0=f", "--error-on-no-transfer",
-                          "--local-encoding=Slash", "--local-unicode-normalization", "--hash-filter=@/4", "--", "-vf!"]
+                          "--local-encoding=Slash", "--local-unicode-normalization", "--hash-filter=@/4", "--", "-vf!",
+                          "--log-file=/tmp/x", "--log-level=CRITICAL", "--use-json-log=false", "--syslog", "__include=x"]
         for f in eligible where reason(f) != nil { return report(id, slug, false, "(\(f) refused: \(reason(f)!))") }
         for f in ineligible where reason(f) == nil { return report(id, slug, false, "(\(f) accepted)") }
         guard reason("", enabled: false) != nil, reason("", direction: .remoteToLocal) != nil else {
             return report(id, slug, false, "(off or remoteToLocal accepted)")
+        }
+        // Parity: the script refuses a batch exactly when Swift calls the flags ineligible.
+        let dirty = "\(selfTestRoot)/ac-l92-s2a1.filter"
+        try? "+ /a.txt\n- **\n".write(toFile: dirty, atomically: true, encoding: .utf8)
+        for (i, flags) in (eligible + ineligible + ["-_include=x"]).enumerated() {
+            guard let run = runScriptFixture(name: "ac-l92-s2a1-\(i)", overrides: ["additionalFlags": flags], extraArgs: [dirty]) else {
+                return report(id, slug, false, "(fixture setup failed)")
+            }
+            let scriptRefused = run.status == 64 && run.log.contains("changes what a batch would sync")
+            if scriptRefused != (reason(flags) != nil) {
+                return report(id, slug, false, "(Swift and the script disagree on \(flags): script refused \(scriptRefused))")
+            }
         }
         return report(id, slug, true)
     }
@@ -7208,6 +7221,13 @@ enum ConfigSelfTest {
         guard let value = runScriptFixture(name: "ac-l92-s2a2-val", overrides: ["additionalFlags": "--exclude _drafts/**"], extraArgs: [dirty]),
               value.status == 0, value.stubRan else {
             return report(id, slug, false, "(--exclude _drafts/** was refused by the script)")
+        }
+        // Set-but-empty counts (rclone applies it); `false` passes like --flag=false.
+        guard let emptyEnv = runScriptFixture(name: "ac-l92-s2a2-env0", overrides: [:], extraEnvironment: ["RCLONE_INCLUDE": ""], extraArgs: [dirty]),
+              emptyEnv.status == 64,
+              let falseEnv = runScriptFixture(name: "ac-l92-s2a2-envf", overrides: [:], extraEnvironment: ["RCLONE_DELETE_EXCLUDED": "false"], extraArgs: [dirty]),
+              falseEnv.status == 0, falseEnv.stubRan else {
+            return report(id, slug, false, "(empty or false RCLONE_* variable handled wrong)")
         }
         // An RCLONE_* variable for a refused flag refuses the batch like the flag.
         guard let envRefused = runScriptFixture(name: "ac-l92-s2a2-env", overrides: [:],
@@ -7286,7 +7306,8 @@ enum ConfigSelfTest {
             (1, [objectError, other].joined(separator: "\n"), .runFailed),
             (1, [notDeleting, attempt].joined(separator: "\n"), .runFailed),
             (1, [objectError, notDeleting, attempt, succeeded].joined(separator: "\n"), .runFailed),
-            (5, [objectError, attempt].joined(separator: "\n"), .runFailed),
+            (5, [objectError, attempt].joined(separator: "\n"), .objectErrors(failedPaths: ["shanjie-s5p/r.jsonl"], deletesSkipped: false)),
+            (5, [objectError, other].joined(separator: "\n"), .runFailed),
             (7, log, .runFailed), (77, log, .runFailed), (75, "", .runFailed),
         ]
         for (code, text, expected) in cases where RunOutcome.classify(exitCode: code, runLog: text) != expected {

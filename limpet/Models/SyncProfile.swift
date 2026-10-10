@@ -267,7 +267,8 @@ struct SyncProfile: Identifiable, Codable, Equatable {
     /// path's verdict without any FSEvent; --local-encoding and
     /// --local-unicode-normalization change the names rclone filters on;
     /// --error-on-no-transfer fails every no-op batch; a bare `--` would turn the
-    /// batch's own trailing flags into arguments. A single-dash token whose
+    /// batch's own trailing flags into arguments; the log flags would take
+    /// rclone's JSON error lines out of the profile log the watcher classifies. A single-dash token whose
     /// letters include `f` (`-f`, `-vf…`) is the short --filter. The generated
     /// script refuses a batch carrying any of them as well (same list).
     static let batchRefusedFlags: Set<String> = [
@@ -275,11 +276,13 @@ struct SyncProfile: Identifiable, Codable, Equatable {
         "--files-from-raw", "--files-from0", "--delete-excluded", "--min-age", "--max-age",
         "--hash-filter", "--exclude-if-present", "--local-encoding",
         "--local-unicode-normalization", "--error-on-no-transfer", "--",
+        "--log-file", "--log-level", "--use-json-log", "--syslog",
     ]
 
     /// The RCLONE_<FLAG> environment variables for `batchRefusedFlags` (rclone
-    /// reads any flag from one). A batch refuses to run while one is set, the
-    /// same as for the flag; the script and the watcher both check this list.
+    /// reads any flag from one, even an empty one). A batch refuses to run while
+    /// one is set to anything but `false` (as `--flag=false` passes): the script
+    /// checks this list, and the watcher (L9.2 S2b) checks it before batching.
     static var batchRefusedEnvironment: [String] {
         batchRefusedFlags.subtracting(["--"]).sorted()
             .map { "RCLONE_" + $0.dropFirst(2).uppercased().replacingOccurrences(of: "-", with: "_") }

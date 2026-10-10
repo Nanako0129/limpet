@@ -448,8 +448,8 @@ final class SyncSetupService {
         // environment exists only for the self-test's stub rclone. A shipped
         // script must never run whatever binary an environment variable names,
         // so outside Debug builds the variable is cleared before the search.
-        // limpet-plan.md L9.2: the batch flag check and the RCLONE_* unset list
-        // come from SyncProfile.batchRefusedFlags, the list the watcher uses.
+        // limpet-plan.md L9.2: the batch flag check and the refused RCLONE_*
+        // variables come from SyncProfile.batchRefusedFlags (the watcher's list).
         let batchRefusedCasePattern = SyncProfile.batchRefusedFlags
             .subtracting(["--delete-excluded"]).sorted().joined(separator: "|")
         let batchRefusedEnvironment = SyncProfile.batchRefusedEnvironment.joined(separator: " ")
@@ -571,21 +571,21 @@ final class SyncSetupService {
                     echo "$(date '+%Y-%m-%d %H:%M:%S') - Refusing to sync: batch filter not readable: $DIRTY_FILTER" >> "$LOG_FILE"
                     exit 64
                 fi
+                batch_refused=""
                 for flag_token in ${ADDITIONAL_FLAGS_ARRAY[@]+"${ADDITIONAL_FLAGS_ARRAY[@]}"}; do
-                    flag_name="${flag_token%%=*}"
-                    flag_name="${flag_name//_/-}"
-                    case "$flag_name" in
-                        --delete-excluded)
-                            [[ "$flag_token" == *=false ]] || batch_refused="$flag_token" ;;
-                        \(batchRefusedCasePattern))
-                            batch_refused="$flag_token" ;;
-                    esac
-                    # A single-dash token is judged raw (`_drafts/**` is a value).
-                    case "${flag_token%%=*}" in
-                        --*) ;;
-                        -*f*)
-                            batch_refused="$flag_token" ;;
-                    esac
+                    flag_raw="${flag_token%%=*}"
+                    if [[ "$flag_raw" == -* && "$flag_raw" != --* ]]; then
+                        # A single-dash token, judged raw: its letters hold the short -f.
+                        [[ "$flag_raw" == *f* ]] && batch_refused="$flag_token"
+                    else
+                        # A long flag (or a value), named with `_` read as `-` as rclone does.
+                        case "${flag_raw//_/-}" in
+                            --delete-excluded)
+                                [[ "$flag_token" == *=false ]] || batch_refused="$flag_token" ;;
+                            \(batchRefusedCasePattern))
+                                batch_refused="$flag_token" ;;
+                        esac
+                    fi
                     if [[ -n "${batch_refused:-}" ]]; then
                         echo "$(date '+%Y-%m-%d %H:%M:%S') - Refusing to sync: additionalRcloneFlags $batch_refused changes what a batch would sync" >> "$LOG_FILE"
                         exit 64
@@ -594,12 +594,12 @@ final class SyncSetupService {
                 # rclone also reads any flag from an RCLONE_<FLAG> environment variable:
                 # a batch refuses those like the flags, and drops the ones it overrides.
                 for env_name in \(batchRefusedEnvironment); do
-                    if [[ -n "${!env_name:-}" ]]; then
+                    if [[ -n "${!env_name+x}" && "${!env_name}" != "false" ]]; then
                         echo "$(date '+%Y-%m-%d %H:%M:%S') - Refusing to sync: environment variable $env_name changes what a batch would sync" >> "$LOG_FILE"
                         exit 64
                     fi
                 done
-                unset RCLONE_FAST_LIST RCLONE_TPSLIMIT RCLONE_TPSLIMIT_BURST
+                unset RCLONE_FAST_LIST  # (--tpslimit/--tpslimit-burst on the command line beat their env defaults)
             fi
 
             # Find rclone binary. Cover the common package-manager locations,
