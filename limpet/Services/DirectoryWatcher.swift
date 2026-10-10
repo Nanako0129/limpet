@@ -4,10 +4,14 @@ import Foundation
 /// Calls the onChange handler with debouncing to avoid triggering too many syncs
 final class DirectoryWatcher {
     typealias ChangeHandler = () -> Void
+    /// Raw events for incremental sync (limpet-plan.md L9.2 S2b): path, flags, id.
+    typealias EventsHandler = ([(path: String, flags: UInt32, id: UInt64)]) -> Void
 
     private var stream: FSEventStreamRef?
     private let paths: [String]
     private let onChange: ChangeHandler
+    private let onEvents: EventsHandler?
+    private let sinceWhen: FSEventStreamEventId
     private let debounceInterval: TimeInterval
     private let debugLabel: String
 
@@ -20,10 +24,18 @@ final class DirectoryWatcher {
     ///   - debounceInterval: Time to wait after last change before triggering (default 15 seconds)
     ///   - debugLabel: Label for debug logging to identify this watcher
     ///   - onChange: Called when changes are detected (after debounce)
-    init(paths: [String], debounceInterval: TimeInterval = 15.0, debugLabel: String = "", onChange: @escaping ChangeHandler) {
+    ///   - onEvents: when set, every in-scope event (no metadata filter, no
+    ///     debounce) is delivered with its flags and id on the main queue
+    ///     instead of `onChange`.
+    ///   - sinceWhen: the stream's start (replay from a saved id, L9.2 S3).
+    init(paths: [String], debounceInterval: TimeInterval = 15.0, debugLabel: String = "",
+         sinceWhen: FSEventStreamEventId = FSEventStreamEventId(kFSEventStreamEventIdSinceNow),
+         onEvents: EventsHandler? = nil, onChange: @escaping ChangeHandler) {
         self.paths = paths
         self.debounceInterval = debounceInterval
         self.debugLabel = debugLabel
+        self.sinceWhen = sinceWhen
+        self.onEvents = onEvents
         self.onChange = onChange
     }
 
@@ -60,7 +72,7 @@ final class DirectoryWatcher {
             directoryWatcherCallback,
             &context,
             pathsToWatch,
-            FSEventStreamEventId(kFSEventStreamEventIdSinceNow),
+            sinceWhen,
             1.0,  // Latency - FSEvents batches events within this window
             flags
         ) else {
@@ -89,7 +101,16 @@ final class DirectoryWatcher {
     }
 
     /// Called when file system events are received
-    fileprivate func handleEvents(_ eventPaths: [String]) {
+    fileprivate func handleEvents(_ eventPaths: [String], flags: [UInt32], ids: [UInt64]) {
+        if let onEvents {
+            let events = zip(eventPaths, zip(flags, ids)).compactMap { path, rest -> (path: String, flags: UInt32, id: UInt64)? in
+                let inScope = paths.contains { path == $0 || path.hasPrefix($0 + "/") }
+                return inScope ? (path, rest.0, rest.1) : nil
+            }
+            guard !events.isEmpty else { return }
+            DispatchQueue.main.async { onEvents(events) }
+            return
+        }
         let label = debugLabel.isEmpty ? "unknown" : debugLabel
         LimpetSettings.debugLog("[\(label)] FSEvents callback - watching: \(self.paths.joined(separator: ", "))")
         LimpetSettings.debugLog("[\(label)] FSEvents received \(eventPaths.count) raw paths:")
@@ -196,6 +217,8 @@ private func directoryWatcherCallback(
 
     // Convert paths to Swift array
     guard let paths = unsafeBitCast(eventPaths, to: NSArray.self) as? [String] else { return }
+    let flags = (0..<numEvents).map { eventFlags[$0] }
+    let ids = (0..<numEvents).map { eventIds[$0] }
 
-    watcher.handleEvents(paths)
+    watcher.handleEvents(paths, flags: flags, ids: ids)
 }

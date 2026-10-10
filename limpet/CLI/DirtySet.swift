@@ -1,3 +1,4 @@
+import CoreServices
 import Foundation
 
 /// The profile's exclude rules as rclone itself compiled them, so excluded churn
@@ -60,6 +61,21 @@ final class ExcludeOracle {
         guard sawEnd else { return nil }
         fileRules = file
         dirRules = dir
+    }
+
+    /// Whether rclone's dump holds an include (`+`) file or directory rule. A
+    /// profile whose exclude file includes something cannot run batches: that
+    /// rule matches before the batch's own rules (limpet-plan.md L9.2).
+    static func dumpHasIncludeRule(_ dump: String) -> Bool {
+        var inRules = false
+        for line in dump.split(separator: "\n", omittingEmptySubsequences: false) {
+            if line.hasPrefix("--- ") && line.hasSuffix(" ---") {
+                inRules = line == "--- File filter rules ---" || line == "--- Directory filter rules ---"
+            } else if inRules && line.hasPrefix("+ ") {
+                return true
+            }
+        }
+        return false
     }
 
     /// Anything outside what rclone's glob translation emits, read alike by
@@ -624,14 +640,14 @@ extension RunOutcome {
     /// profile log (rclone 1.75.1 `--use-json-log` lines).
     /// - Exit 0 is success only if the script logged `Sync completed
     ///   successfully` (an unmounted drive exits 0 without running rclone).
-    /// - Exit 1, 5 or 6 whose error/critical lines are all per-object failures
+    /// - Exit 1, 5, 6 or 77 whose error/critical lines are all per-object failures
     ///   (`objectType` ending `.Object`) or rclone's own follow-ups is
     ///   `.objectErrors`, with the failures of the LAST attempt only (a path
     ///   that failed in attempt 1 and succeeded in attempt 2 is fine).
     ///   Follow-ups: `Attempt …` and `Can't retry any of the errors …` with no
     ///   object; `not deleting files|directories as there were IO errors`
     ///   (an `.Fs` objectType), which sets `deletesSkipped`.
-    /// - Everything else — any other code (75/76/77/78/79 …), any other error
+    /// - Everything else — any other code (75/76/78/79 …), any other error
     ///   line, a `{` line that is not JSON, or no named object — is `.runFailed`.
     static func classify(exitCode: Int32, runLog: String) -> RunOutcome {
         if exitCode == 0 {
@@ -642,7 +658,9 @@ extension RunOutcome {
         // must be countable and given up. Accepted (not measured): an outage
         // that starts mid-transfer also names the in-flight objects, so they
         // can be given up to the owed full run, which retries them.
-        guard exitCode == 1 || exitCode == 5 || exitCode == 6 else { return .runFailed }
+        // 77 is the script's "only files changing during upload" (L9.1): its
+        // lines name those files, so they are charged like any object error.
+        guard exitCode == 1 || exitCode == 5 || exitCode == 6 || exitCode == 77 else { return .runFailed }
         var attempt: Set<String> = [], lastFailedAttempt: Set<String> = []
         var attemptSkipped = false, lastSkipped = false
         for line in runLog.split(separator: "\n") where line.hasPrefix("{") {
@@ -674,5 +692,301 @@ extension RunOutcome {
         let failed = attempt.isEmpty ? lastFailedAttempt : attempt
         let skipped = attempt.isEmpty ? lastSkipped : attemptSkipped
         return failed.isEmpty ? .runFailed : .objectErrors(failedPaths: failed, deletesSkipped: skipped)
+    }
+}
+
+// MARK: - Incremental planner (limpet-plan.md L9.2 S2b)
+
+/// Decides what the watcher runs next in incremental mode: a full run (asked
+/// for, required by the set, or owed and its backoff elapsed) before a batch
+/// of ready paths, with retry delays after failures and gate refusals. Pure:
+/// the caller passes `now` (monotonic seconds) and FSEvents ids.
+struct IncrementalPlanner {
+    enum Run: Equatable {
+        case full
+        case batch([DirtySet.BatchItem])
+    }
+
+    var dirty = DirtySet()
+    /// A full run was asked for: watcher start (catch-up), the periodic timer,
+    /// "Sync now", the source coming back, or a rules change.
+    private(set) var fullRequested = true
+    let batchLimit: Int
+    private(set) var inFlight: Run?
+    private var batchFailures = 0
+    private var fullFailures = 0
+    private var refusals = 0
+    /// A gate refusal only spaces out the wake timer (no polling while a gate
+    /// keeps refusing); a trigger whose gates pass may still run.
+    private var wakeNotBefore: TimeInterval = 0
+    private(set) var batchNotBefore: TimeInterval = 0
+    private(set) var fullNotBefore: TimeInterval = 0
+    /// When the current owe began or its last failed full run ended.
+    private(set) var owedSince: TimeInterval?
+
+    init(batchLimit: Int) {
+        self.batchLimit = max(1, batchLimit)
+    }
+
+    /// Retry delay after `n` failures in a row: 30 s doubling, at most 30 min.
+    static func retryDelay(_ n: Int) -> TimeInterval {
+        n <= 0 ? 0 : min(30 * pow(2, Double(min(n, 16) - 1)), 1800)
+    }
+
+    /// The owed full run's wait after `n` full runs in a row ended with object
+    /// errors (limpet-plan.md contract): `min(30 s × 2^max(n−1, 0), 30 min)`
+    /// while n ≤ 7; past that only the periodic full run serves it (nil).
+    static func owedDelay(_ n: Int) -> TimeInterval? {
+        n > 7 ? nil : min(30 * pow(2, Double(max(n - 1, 0))), 1800)
+    }
+
+    /// An explicit request ("Sync now", source back, periodic, a refused batch)
+    /// runs at once; if it fails, the failure delay doubles from where it was.
+    mutating func requestFull() {
+        fullRequested = true
+        fullNotBefore = 0
+    }
+
+    private var fullWanted: Bool { fullRequested || dirty.fullRequired }
+
+    private func owedDue(_ now: TimeInterval) -> Bool {
+        guard dirty.fullRunOwed, let since = owedSince, let wait = Self.owedDelay(dirty.owedFullRunFailures) else { return false }
+        return now >= max(since + wait, fullNotBefore)
+    }
+
+    /// The run to start now, or nil. `currentEventId` is FSEvents' current id,
+    /// read only when a full run starts.
+    mutating func next(now: TimeInterval, currentEventId: () -> UInt64) -> Run? {
+        guard inFlight == nil else { return nil }
+        if dirty.fullRunOwed && owedSince == nil { owedSince = now }
+        if (fullWanted && now >= fullNotBefore) || owedDue(now) {
+            dirty.fullRunStarted(startEventId: currentEventId())
+            inFlight = .full
+            refusals = 0
+            wakeNotBefore = 0
+            return .full
+        }
+        guard now >= batchNotBefore else { return nil }
+        let items = dirty.takeBatch(now: now, limit: batchLimit)
+        guard !items.isEmpty else { return nil }
+        inFlight = .batch(items)
+        refusals = 0
+        wakeNotBefore = 0
+        return .batch(items)
+    }
+
+    /// When `next` could return something, for the wake timer; nil = nothing
+    /// pending (a new event or request will wake the watcher).
+    func nextWake(now: TimeInterval) -> TimeInterval? {
+        guard inFlight == nil else { return nil }
+        var times: [TimeInterval] = []
+        if fullWanted { times.append(fullNotBefore) }
+        if dirty.fullRunOwed, let wait = Self.owedDelay(dirty.owedFullRunFailures) {
+            times.append(max((owedSince ?? now) + wait, fullNotBefore))
+        }
+        if let ready = dirty.nextWakeup(now: now) { times.append(max(ready, batchNotBefore)) }
+        return times.min().map { max($0, now, wakeNotBefore) }
+    }
+
+    /// The started run ended. `exists`: lstat relative to the root.
+    mutating func finished(_ outcome: RunOutcome, now: TimeInterval, exists: (String) -> Bool) {
+        guard let run = inFlight else { return }
+        inFlight = nil
+        switch run {
+        case .full:
+            dirty.fullRunFinished(outcome: outcome, exists: exists)
+            if outcome == .runFailed {
+                fullFailures += 1
+                fullNotBefore = now + Self.retryDelay(fullFailures)
+            } else {
+                fullFailures = 0
+                fullNotBefore = 0
+                fullRequested = false
+            }
+            owedSince = dirty.fullRunOwed ? now : nil
+        case .batch(let items):
+            dirty.finish(items, outcome: outcome, exists: exists)
+            // Object errors are charged to their paths (given up after a few);
+            // only a run that failed as a whole delays every batch.
+            if outcome == .runFailed {
+                batchFailures += 1
+                batchNotBefore = now + Self.retryDelay(batchFailures)
+            } else {
+                batchFailures = 0
+                batchNotBefore = 0
+            }
+            if dirty.fullRunOwed && owedSince == nil { owedSince = now }
+        }
+    }
+
+    /// A gate refused to start anything (source missing, delete limit,
+    /// overlap, lingering group): the wake timer waits 30 s doubling to 30 min.
+    mutating func refused(now: TimeInterval) {
+        refusals += 1
+        wakeNotBefore = now + Self.retryDelay(refusals)
+    }
+}
+
+// MARK: - FSEvents to DirtySet, and the watcher glue (limpet-plan.md L9.2 S2b)
+
+/// One FSEvents event as `DirtySet.note` needs it.
+struct FSEventNote: Equatable {
+    let path: String
+    let isDir: Bool
+    let gap: Bool
+    let maybeSymlink: Bool
+
+    /// nil: outside `root` (FSEvents can report other paths on the volume),
+    /// HistoryDone, or an ordinary event for the root itself. `root` is the canonical (realpath) sync root, the form
+    /// FSEvents reports. MustScanSubDirs for a path is a directory event for
+    /// it; for the root, or UserDropped/KernelDropped/EventIdsWrapped/
+    /// RootChanged, a gap.
+    static func convert(path: String, flags: UInt32, root: String) -> FSEventNote? {
+        func has(_ flag: Int) -> Bool { flags & UInt32(flag) != 0 }
+        if has(kFSEventStreamEventFlagHistoryDone) { return nil }
+        let rel: String
+        if path == root || path == root + "/" { rel = "" }
+        else if path.hasPrefix(root + "/") { rel = String(path.dropFirst(root.count + 1)) }
+        else { return nil }
+        let mustScan = has(kFSEventStreamEventFlagMustScanSubDirs)
+        let gap = has(kFSEventStreamEventFlagUserDropped) || has(kFSEventStreamEventFlagKernelDropped)
+            || has(kFSEventStreamEventFlagEventIdsWrapped) || has(kFSEventStreamEventFlagRootChanged)
+            || (mustScan && rel.isEmpty)
+        // An ordinary event for the root itself (its own attributes, xattrs, a
+        // Finder tag) changes nothing to sync; only a gap there means rescan.
+        // Seen live: creating the root reports it with Created/IsDir/Xattr.
+        if rel.isEmpty && !gap { return nil }
+        let isFile = has(kFSEventStreamEventFlagItemIsFile)
+        let isDir = has(kFSEventStreamEventFlagItemIsDir) || mustScan
+        let isLink = has(kFSEventStreamEventFlagItemIsSymlink)
+        return FSEventNote(path: rel, isDir: isDir, gap: gap, maybeSymlink: isLink || !(isFile || isDir))
+    }
+}
+
+/// Connects the watcher's scheduler hooks, FSEvents and the sync script to
+/// `IncrementalPlanner` (limpet-plan.md L9.2 S2b). All I/O is injected so the
+/// self-test drives it; the daemon passes the real primitives. Main queue only.
+final class IncrementalDriver {
+    struct IO {
+        /// Monotonic seconds.
+        var now: () -> TimeInterval
+        var currentEventId: () -> UInt64
+        /// lstat of a root-relative path.
+        var exists: (String) -> Bool
+        /// Writes the batch filter text; returns its path, or nil on failure.
+        var writeFilter: (String) -> String?
+        var removeFilter: (String) -> Void
+        var logSize: () -> UInt64
+        /// The profile log from `offset` (the whole file if it shrank: rotation).
+        var readLog: (_ offset: UInt64) -> String
+        /// Arm the wake timer for this monotonic time, or cancel it (nil).
+        var scheduleWake: (TimeInterval?) -> Void
+        /// Whether the profile's exclude file changed since the watcher started.
+        var excludeFileChanged: () -> Bool
+        var log: (String) -> Void
+    }
+
+    private(set) var planner: IncrementalPlanner
+    private let oracle: ExcludeOracle?
+    /// The canonical (realpath) sync root, the form FSEvents reports.
+    let root: String
+    private let io: IO
+    private var pending: IncrementalPlanner.Run?
+    private var running: (run: IncrementalPlanner.Run, logOffset: UInt64, filterPath: String?)?
+    /// The exclude rules changed: the watcher restarts (when idle) so a fresh
+    /// start rebuilds the oracle and runs its catch-up full run.
+    private(set) var restartRequested = false
+
+    init(planner: IncrementalPlanner, oracle: ExcludeOracle?, root: String, io: IO) {
+        self.planner = planner
+        self.oracle = oracle
+        self.root = root
+        self.io = io
+        self.planner.dirty.advance(toEventId: io.currentEventId())
+    }
+
+    /// Scheduler hook, after its gates passed: whether there is a run to start.
+    func prepareRun() -> Bool {
+        guard !restartRequested else { return false }
+        pending = planner.next(now: io.now(), currentEventId: io.currentEventId)
+        if pending == nil { rearm() }
+        return pending != nil
+    }
+
+    /// For the run `prepareRun` chose: the script's extra arguments and
+    /// environment. nil if the batch filter could not be written (the run is
+    /// then recorded as failed and nothing is spawned).
+    func startRun() -> (arguments: [String], environment: [String: String])? {
+        guard let run = pending else { return ([], [:]) }
+        pending = nil
+        let offset = io.logSize()
+        guard case .batch(let items) = run else {
+            running = (run, offset, nil)
+            return ([], [:])
+        }
+        guard let path = io.writeFilter(DirtySet.filterRules(for: items, exists: io.exists)) else {
+            io.log("Batch not started: could not write its filter file")
+            running = (run, offset, nil)
+            runEnded(exitCode: 1)
+            return nil
+        }
+        running = (run, offset, path)
+        return ([path], ["LIMPET_BATCH_ITEMS": String(items.count)])
+    }
+
+    func runEnded(exitCode: Int32) {
+        guard let r = running else { return }
+        running = nil
+        if let path = r.filterPath { io.removeFilter(path) }
+        // Always classified: an exit 0 counts only with the script's completion
+        // line (an unmounted drive exits 0 without running rclone).
+        let outcome = RunOutcome.classify(exitCode: exitCode, runLog: io.readLog(r.logOffset))
+        planner.finished(outcome, now: io.now(), exists: io.exists)
+        // The script refused the batch (exit 64: a flag, variable or rclone.conf
+        // setting that changes what a batch would sync). Retrying the batch cannot
+        // help; a full run carries its paths.
+        if exitCode == 64, case .batch = r.run { planner.requestFull() }
+        if !planner.dirty.gaveUp.isEmpty {
+            io.log("Gave up on \(planner.dirty.gaveUp.count) path(s) after repeated failed batches; the next full run retries them")
+            planner.dirty.clearGaveUp()
+        }
+        rearm()
+    }
+
+    /// Scheduler hook: a gate refused to start anything.
+    func refused() {
+        planner.refused(now: io.now())
+        rearm()
+    }
+
+    func requestFull() {
+        planner.requestFull()
+        rearm()
+    }
+
+    /// One FSEvents callback's events (path, flags, id), in delivery order.
+    func events(_ events: [(path: String, flags: UInt32, id: UInt64)]) {
+        if io.excludeFileChanged() {
+            if !restartRequested { io.log("Exclude rules changed: restarting the watcher") }
+            restartRequested = true
+            return
+        }
+        let now = io.now()
+        var highest: UInt64 = 0
+        for event in events {
+            highest = max(highest, event.id)
+            guard let n = FSEventNote.convert(path: event.path, flags: event.flags, root: root) else { continue }
+            if !n.gap && !n.path.isEmpty, oracle?.isExcluded(n.path, isDir: n.isDir, maybeSymlink: n.maybeSymlink) == true { continue }
+            // A path whose first component rclone re-encodes has no clean
+            // ancestor to batch (`DirtySet.scope` is the root): a full run.
+            let rootOnly = !n.path.isEmpty && DirtySet.scope(of: n.path, subtree: n.isDir).path.isEmpty
+            planner.dirty.note(n.path, isDirEvent: n.isDir, gap: n.gap || rootOnly, eventId: event.id, now: now)
+        }
+        planner.dirty.advance(toEventId: highest)
+        rearm()
+    }
+
+    private func rearm() {
+        io.scheduleWake(planner.nextWake(now: io.now()))
     }
 }

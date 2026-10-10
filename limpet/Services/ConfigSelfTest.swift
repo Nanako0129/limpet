@@ -196,6 +196,12 @@ enum ConfigSelfTest {
             testBatchScriptMode,
             testBatchFilterFile,
             testRunClassifier,
+            testIncrementalPlanner,
+            testIncrementalPoisonPath,
+            testFSEventNoteAndIncludeRule,
+            testIncrementalDriver,
+            testSchedulerIncrementalHooks,
+            testIncrementalLiveFSEvents,
             testLogWatcherSplitMultibyteLine,
             testStalledLineIsAFailureMarker,
             testStalledSyncWatchdogEndToEnd,
@@ -7253,8 +7259,15 @@ enum ConfigSelfTest {
         let localSection = "if [ \"$1\" = config ]; then printf '[local]\\n%s\\n' \"$LOCAL_KEY\"; fi\nexit 0\n"
         guard let conf = runScriptFixture(name: "ac-l92-s2a2-conf", overrides: [:], stubTail: localSection,
                                           extraEnvironment: ["LOCAL_KEY": "encoding = Slash,Dot"], extraArgs: [dirty]),
-              conf.status == 64, conf.argv.first == "config", conf.log.contains("rclone.conf [local]") else {
+              conf.status == 64, conf.argv == ["config", "show", "local"], conf.log.contains("rclone.conf [local]") else {
             return report(id, slug, false, "(a [local] encoding did not refuse the batch)")
+        }
+        // A config rclone cannot show (exit 1, e.g. encrypted) refuses the batch too.
+        guard let unreadable = runScriptFixture(name: "ac-l92-s2a2-conf-fail", overrides: [:],
+                                                stubTail: "if [ \"$1\" = config ]; then echo '[local]'; exit 1; fi\nexit 0\n",
+                                                extraArgs: [dirty]),
+              unreadable.status == 64, unreadable.argv == ["config", "show", "local"] else {
+            return report(id, slug, false, "(an unreadable config did not refuse the batch)")
         }
         for (name, key, args) in [("norm", "unicode_normalization = true", [dirty]), ("full", "encoding = Slash", []),
                                   ("other", "copy_links = true", [dirty])] {
@@ -7346,10 +7359,344 @@ enum ConfigSelfTest {
             (1, [objectError, notDeleting, attempt, succeeded].joined(separator: "\n"), .runFailed),
             (5, [objectError, attempt].joined(separator: "\n"), .objectErrors(failedPaths: ["shanjie-s5p/r.jsonl"], deletesSkipped: false)),
             (5, [objectError, other].joined(separator: "\n"), .runFailed),
-            (7, log, .runFailed), (77, log, .runFailed), (75, "", .runFailed),
+            (7, log, .runFailed), (77, log, .objectErrors(failedPaths: ["shanjie-s5p/r.jsonl"], deletesSkipped: true)), (75, "", .runFailed),
         ]
         for (code, text, expected) in cases where RunOutcome.classify(exitCode: code, runLog: text) != expected {
             return report(id, slug, false, "(exit \(code): \(RunOutcome.classify(exitCode: code, runLog: text)), expected \(expected))")
+        }
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-L92-S2b — incremental planner (limpet-plan.md L9.2 S2b)
+
+    private static func testIncrementalPlanner() -> Bool {
+        let id = "AC-L92-S2b1", slug = "incremental-planner"
+        let yes: (String) -> Bool = { _ in true }
+        var eventId: UInt64 = 100
+        let current = { eventId }
+        var p = IncrementalPlanner(batchLimit: 500)
+        // Watcher start: the catch-up full run first; nothing else while it runs.
+        guard p.next(now: 0, currentEventId: current) == .full, p.next(now: 1, currentEventId: current) == nil else {
+            return report(id, slug, false, "(no catch-up full run first)")
+        }
+        p.finished(.success, now: 30, exists: yes)
+        guard !p.fullRequested else { return report(id, slug, false, "(a clean full run left the request)") }
+        // A quiet path becomes a batch; the wake time is its quiet deadline.
+        p.dirty.note("a.txt", isDirEvent: false, gap: false, eventId: 101, now: 40)
+        guard p.next(now: 45, currentEventId: current) == nil, p.nextWake(now: 45) == 50,
+              case .batch(let b1)? = p.next(now: 50, currentEventId: current), b1.map(\.path) == ["a.txt"] else {
+            return report(id, slug, false, "(quiet path not batched at its wake time)")
+        }
+        // A failed batch waits 30 s, then 60 s.
+        p.finished(.runFailed, now: 55, exists: yes)
+        guard p.next(now: 84, currentEventId: current) == nil, case .batch? = p.next(now: 85, currentEventId: current) else {
+            return report(id, slug, false, "(first batch retry not after 30 s)")
+        }
+        p.finished(.runFailed, now: 90, exists: yes)
+        guard p.next(now: 149, currentEventId: current) == nil, case .batch? = p.next(now: 150, currentEventId: current) else {
+            return report(id, slug, false, "(second batch retry not after 60 s)")
+        }
+        p.finished(.success, now: 155, exists: yes)
+        guard p.dirty.entries.isEmpty, p.batchNotBefore == 0 else { return report(id, slug, false, "(success did not reset the batch delay)") }
+        // A failed full run retries on its delay without blocking batches.
+        p.requestFull()
+        guard p.next(now: 200, currentEventId: current) == .full else { return report(id, slug, false, "(requested full run not started)") }
+        p.finished(.runFailed, now: 230, exists: yes)
+        eventId = 300
+        p.dirty.note("b.txt", isDirEvent: false, gap: false, eventId: 300, now: 231)
+        guard case .batch? = p.next(now: 241, currentEventId: current) else { return report(id, slug, false, "(a full run in its retry delay blocked a batch)") }
+        p.finished(.success, now: 242, exists: yes)
+        guard p.next(now: 259, currentEventId: current) == nil, p.next(now: 260, currentEventId: current) == .full else {
+            return report(id, slug, false, "(failed full run not retried after 30 s)")
+        }
+        // An explicit request ("Sync now") runs at once, even inside a failure delay.
+        p.finished(.runFailed, now: 265, exists: yes)
+        p.requestFull()
+        guard p.next(now: 266, currentEventId: current) == .full else { return report(id, slug, false, "(Sync now waited out the failure delay)") }
+        // The owed backoff formula itself (limpet-plan.md contract).
+        guard IncrementalPlanner.owedDelay(0) == 30, IncrementalPlanner.owedDelay(1) == 30, IncrementalPlanner.owedDelay(2) == 60,
+              IncrementalPlanner.owedDelay(3) == 120, IncrementalPlanner.owedDelay(6) == 960, IncrementalPlanner.owedDelay(7) == 1800,
+              IncrementalPlanner.owedDelay(8) == nil, IncrementalPlanner.retryDelay(1) == 30, IncrementalPlanner.retryDelay(7) == 1800 else {
+            return report(id, slug, false, "(backoff formula changed)")
+        }
+        // Object errors in a full run: owed, retried on the owed backoff (30 s, 60 s, …),
+        // and after more than 7 in a row only a requested (periodic) full run serves it.
+        var t: TimeInterval = 300
+        for n in 1...8 {
+            p.finished(.objectErrors(failedPaths: ["bad.bin"], deletesSkipped: false), now: t, exists: yes)
+            guard p.dirty.fullRunOwed else { return report(id, slug, false, "(object errors did not owe a full run)") }
+            guard let wait = IncrementalPlanner.owedDelay(n) else { break }
+            guard p.next(now: t + wait - 1, currentEventId: current) == nil, p.next(now: t + wait, currentEventId: current) == .full else {
+                return report(id, slug, false, "(owed run \(n) not after \(wait) s)")
+            }
+            t += wait + 10
+        }
+        p.finished(.objectErrors(failedPaths: ["bad.bin"], deletesSkipped: false), now: t, exists: yes)
+        guard p.next(now: t + 100_000, currentEventId: current) == nil else { return report(id, slug, false, "(owed run kept retrying past 7 failures)") }
+        p.requestFull()
+        guard p.next(now: t + 100_001, currentEventId: current) == .full else { return report(id, slug, false, "(periodic full run did not serve the owe)") }
+        p.finished(.success, now: t + 100_010, exists: yes)
+        guard !p.dirty.fullRunOwed, p.dirty.checkpoint != nil else { return report(id, slug, false, "(clean full run did not settle the owe)") }
+        // A gate refusal spaces out the wake timer (30 s, then 60 s) but blocks no
+        // run once the gates pass.
+        var r = IncrementalPlanner(batchLimit: 500)
+        r.refused(now: 0)
+        guard r.nextWake(now: 1) == 30 else { return report(id, slug, false, "(refusal did not space the wake 30 s)") }
+        r.refused(now: 30)
+        guard r.nextWake(now: 31) == 90, r.next(now: 31, currentEventId: current) == .full else {
+            return report(id, slug, false, "(second refusal: wake not 60 s, or the run was blocked)")
+        }
+        // Once a run started, the refusal spacing is gone: the next edit wakes at its quiet deadline.
+        r.finished(.success, now: 35, exists: yes)
+        r.dirty.note("c.txt", isDirEvent: false, gap: false, eventId: 2000, now: 36)
+        guard r.nextWake(now: 37) == 46 else { return report(id, slug, false, "(the wake stayed spaced after a run started: \(String(describing: r.nextWake(now: 37))))") }
+        // An owed full run that fails as a whole (offline) backs off like any failed full run.
+        var q = IncrementalPlanner(batchLimit: 500)
+        _ = q.next(now: 0, currentEventId: current)
+        q.finished(.objectErrors(failedPaths: ["bad.bin"], deletesSkipped: false), now: 10, exists: yes)
+        guard q.next(now: 40, currentEventId: current) == .full else { return report(id, slug, false, "(owed run not started)") }
+        q.finished(.runFailed, now: 45, exists: yes)
+        guard q.next(now: 75, currentEventId: current) == .full else { return report(id, slug, false, "(owed run not retried after 30 s)") }
+        q.finished(.runFailed, now: 80, exists: yes)
+        guard q.next(now: 139, currentEventId: current) == nil, q.next(now: 140, currentEventId: current) == .full else {
+            return report(id, slug, false, "(failing owed run ignored the 60 s failure delay)")
+        }
+        // Object errors in a batch (exit 77: a file changing during upload) charge
+        // that file only: the other paths' next batch is not delayed.
+        let changing = #"{"level":"error","msg":"Failed to copy: can't copy - source file is being updated","object":"x.log","objectType":"*local.Object"}"#
+        guard RunOutcome.classify(exitCode: 77, runLog: changing + "\n") == .objectErrors(failedPaths: ["x.log"], deletesSkipped: false) else {
+            return report(id, slug, false, "(exit 77 not read per object)")
+        }
+        var w = IncrementalPlanner(batchLimit: 500)
+        _ = w.next(now: 0, currentEventId: current)
+        w.finished(.success, now: 1, exists: yes)
+        w.dirty.note("x.log", isDirEvent: false, gap: false, eventId: 1001, now: 10)
+        guard case .batch? = w.next(now: 20, currentEventId: current) else { return report(id, slug, false, "(x.log not batched)") }
+        w.finished(.objectErrors(failedPaths: ["x.log"], deletesSkipped: false), now: 25, exists: yes)
+        w.dirty.note("y.txt", isDirEvent: false, gap: false, eventId: 1002, now: 26)
+        guard w.batchNotBefore == 0, case .batch(let next)? = w.next(now: 36, currentEventId: current), next.map(\.path).contains("y.txt") else {
+            return report(id, slug, false, "(an object error delayed the other paths' batch)")
+        }
+        return report(id, slug, true)
+    }
+
+    /// The plan's poison-path acceptance (L9.2 S2): a path X that fails whenever it
+    /// is in a run; other paths noted later still reach a successful batch within
+    /// 3 failure delays, a pending owed full run does not starve batches, and the
+    /// run count over one hour is bounded.
+    private static func testIncrementalPoisonPath() -> Bool {
+        let id = "AC-L92-S2b2", slug = "incremental-poison-path"
+        let yes: (String) -> Bool = { _ in true }
+        var p = IncrementalPlanner(batchLimit: 500)
+        var now: TimeInterval = 0, eventId: UInt64 = 1, runs = 0
+        var uploaded: [String: TimeInterval] = [:], notedAt: [String: TimeInterval] = [:]
+        func step() {
+            if let run = p.next(now: now, currentEventId: { eventId }) {
+                runs += 1
+                switch run {
+                case .full:
+                    // A full run uploads everything noted before it started, except X.
+                    for (name, at) in notedAt where at <= now && name != "X" && uploaded[name] == nil { uploaded[name] = now + 30 }
+                    p.finished(.objectErrors(failedPaths: ["X"], deletesSkipped: true), now: now + 30, exists: yes)
+                case .batch(let items):
+                    if items.contains(where: { $0.path == "X" }) {
+                        p.finished(.objectErrors(failedPaths: ["X"], deletesSkipped: true), now: now + 5, exists: yes)
+                    } else {
+                        for i in items { uploaded[i.path] = now }
+                        p.finished(.success, now: now + 5, exists: yes)
+                    }
+                }
+            }
+        }
+        while now < 3600 {
+            if now == 40 { eventId += 1; p.dirty.note("X", isDirEvent: false, gap: false, eventId: eventId, now: now) }
+            if Int(now) % 120 == 0 {
+                eventId += 1
+                notedAt["f\(Int(now)).txt"] = now
+                p.dirty.note("f\(Int(now)).txt", isDirEvent: false, gap: false, eventId: eventId, now: now)
+            }
+            step()
+            now += 1
+        }
+        let late = (0..<30).map { "f\($0 * 120).txt" }.filter { name in
+            guard let at = uploaded[name], let noted = TimeInterval(name.dropFirst().dropLast(4)) else { return true }
+            return at - noted > 10 + 30 + 60 + 120 + 60
+        }
+        guard late.isEmpty, runs < 200, p.dirty.entries["X"] == nil else {
+            return report(id, slug, false, "(late \(late.prefix(5)), runs \(runs), X still queued \(p.dirty.entries["X"] != nil))")
+        }
+        return report(id, slug, true)
+    }
+
+    private static func testFSEventNoteAndIncludeRule() -> Bool {
+        let id = "AC-L92-S2b3", slug = "fsevent-note-include-rule"
+        let root = "/r/src"
+        let file = UInt32(kFSEventStreamEventFlagItemIsFile | kFSEventStreamEventFlagItemModified)
+        let dir = UInt32(kFSEventStreamEventFlagItemIsDir | kFSEventStreamEventFlagItemRenamed)
+        let link = UInt32(kFSEventStreamEventFlagItemIsSymlink | kFSEventStreamEventFlagItemCreated)
+        let must = UInt32(kFSEventStreamEventFlagMustScanSubDirs)
+        let dropped = UInt32(kFSEventStreamEventFlagKernelDropped)
+        let cases: [(String, UInt32, FSEventNote?)] = [
+            ("/r/src/a/b.txt", file, FSEventNote(path: "a/b.txt", isDir: false, gap: false, maybeSymlink: false)),
+            ("/r/src/d", dir, FSEventNote(path: "d", isDir: true, gap: false, maybeSymlink: false)),
+            ("/r/src/l", link, FSEventNote(path: "l", isDir: false, gap: false, maybeSymlink: true)),
+            ("/r/src/x", 0, FSEventNote(path: "x", isDir: false, gap: false, maybeSymlink: true)),
+            ("/r/src/sub", must, FSEventNote(path: "sub", isDir: true, gap: false, maybeSymlink: false)),
+            ("/r/src", must, FSEventNote(path: "", isDir: true, gap: true, maybeSymlink: false)),
+            ("/r/src", UInt32(kFSEventStreamEventFlagItemIsDir | kFSEventStreamEventFlagItemCreated | kFSEventStreamEventFlagItemXattrMod), nil),
+            ("/r/src/y", dropped, FSEventNote(path: "y", isDir: false, gap: true, maybeSymlink: true)),
+            ("/r/srcother/z", file, nil),
+            ("/r/src", UInt32(kFSEventStreamEventFlagHistoryDone), nil),
+        ]
+        for (path, flags, expected) in cases where FSEventNote.convert(path: path, flags: flags, root: root) != expected {
+            return report(id, slug, false, "(\(path) flags \(flags): \(String(describing: FSEventNote.convert(path: path, flags: flags, root: root))))")
+        }
+        guard !ExcludeOracle.dumpHasIncludeRule(l92FilterDump),
+              ExcludeOracle.dumpHasIncludeRule(l92FilterDump.replacingOccurrences(of: "--- File filter rules ---", with: "--- File filter rules ---\n+ ^keep/.*$")),
+              !ExcludeOracle.dumpHasIncludeRule(l92FilterDump.replacingOccurrences(of: "--- end filters ---", with: "--- Metadata filter rules ---\n+ (^|/)tier=x$\n--- end filters ---")) else {
+            return report(id, slug, false, "(include-rule detection wrong)")
+        }
+        return report(id, slug, true)
+    }
+
+    private static func testIncrementalDriver() -> Bool {
+        let id = "AC-L92-S2b4", slug = "incremental-driver"
+        var now: TimeInterval = 0, eventId: UInt64 = 1000, logText = "", wake: TimeInterval?? = nil
+        var written: String?, removed: [String] = [], rulesChanged = false, logged: [String] = []
+        let io = IncrementalDriver.IO(
+            now: { now }, currentEventId: { eventId }, exists: { $0 != "gone.txt" },
+            writeFilter: { written = $0; return "/tmp/batch.filter" }, removeFilter: { removed.append($0) },
+            logSize: { UInt64(logText.utf8.count) },
+            readLog: { offset in String(logText.utf8.dropFirst(Int(offset))) ?? "" },
+            scheduleWake: { wake = $0 }, excludeFileChanged: { rulesChanged }, log: { logged.append($0) })
+        guard let oracle = ExcludeOracle(dump: l92FilterDump) else { return report(id, slug, false, "(fixture dump)") }
+        let d = IncrementalDriver(planner: IncrementalPlanner(batchLimit: 500), oracle: oracle, root: "/r/src", io: io)
+        // Start: the catch-up full run, no filter argument.
+        guard d.prepareRun(), let full = d.startRun(), full.arguments.isEmpty else { return report(id, slug, false, "(no catch-up full run)") }
+        logText += "x - Starting sync (local → remote)\nx - Sync completed successfully\n"
+        d.runEnded(exitCode: 0)
+        // An exit 0 without the script's completion line (an unmounted drive) is no success.
+        d.requestFull()
+        guard d.prepareRun(), d.startRun() != nil else { return report(id, slug, false, "(requested full run not started)") }
+        logText += "x - Drive not mounted, skipping sync\n"
+        d.runEnded(exitCode: 0)
+        guard d.planner.fullRequested, !d.prepareRun() else { return report(id, slug, false, "(exit 0 without the completion line counted as a full run)") }
+        now = 30
+        guard d.prepareRun(), d.startRun() != nil else { return report(id, slug, false, "(full run not retried after 30 s)") }
+        logText += "x - Sync completed successfully\n"
+        d.runEnded(exitCode: 0)
+        // Events: an excluded build output never becomes work; a source file does.
+        let file = UInt32(kFSEventStreamEventFlagItemIsFile | kFSEventStreamEventFlagItemModified)
+        eventId = 1001
+        d.events([("/r/src/photophore/build/o.o", file, 1001), ("/r/src/a.txt", file, 1002), ("/r/elsewhere/q", file, 1003)])
+        guard d.planner.dirty.entries.keys.sorted() == ["a.txt"], wake == .some(40) else {
+            return report(id, slug, false, "(events: entries \(d.planner.dirty.entries.keys.sorted()), wake \(String(describing: wake)))")
+        }
+        now = 40
+        guard d.prepareRun(), let batch = d.startRun(), batch.arguments == ["/tmp/batch.filter"],
+              batch.environment["LIMPET_BATCH_ITEMS"] == "1", written == "+ /a.txt\n+ /a.txt.rclonelink\n- **\n" else {
+            return report(id, slug, false, "(batch not started as expected: \(String(describing: written)))")
+        }
+        // The run's own log decides the outcome: an object error for a.txt is charged to it.
+        logText += #"{"level":"error","msg":"Failed to copy: denied","object":"a.txt","objectType":"*s3.Object"}"# + "\n"
+        d.runEnded(exitCode: 1)
+        guard removed == ["/tmp/batch.filter"], d.planner.dirty.entries["a.txt"]?.failures == 1 else {
+            return report(id, slug, false, "(batch outcome not applied: \(d.planner.dirty.entries.mapValues(\.failures)))")
+        }
+        // A batch the script refuses (exit 64) is carried by a full run, not retried.
+        now = 70
+        eventId = 1004
+        guard d.prepareRun(), let retried = d.startRun(), !retried.arguments.isEmpty else {
+            return report(id, slug, false, "(a.txt not retried as a batch)")
+        }
+        logText += "x - Refusing to sync: rclone.conf [local] sets encoding or unicode_normalization\n"
+        d.runEnded(exitCode: 64)
+        guard d.prepareRun(), let fallback = d.startRun(), fallback.arguments.isEmpty else {
+            return report(id, slug, false, "(a refused batch did not lead to a full run)")
+        }
+        logText += "x - Sync completed successfully\n"
+        d.runEnded(exitCode: 0)
+        guard d.planner.dirty.entries.isEmpty else { return report(id, slug, false, "(the full run did not carry a.txt)") }
+        // A top-level name rclone re-encodes (a tab) cannot be batched: a full run.
+        d.events([("/r/src/tab\tdir/f.txt", file, 1005)])
+        guard d.planner.dirty.fullRequired else { return report(id, slug, false, "(a top-level re-encoded name did not require a full run)") }
+        // Changed exclude rules: a restart is requested and nothing more runs.
+        rulesChanged = true
+        d.events([("/r/src/b.txt", file, 1010)])
+        now = 1000
+        guard d.restartRequested, !d.prepareRun(), logged.contains(where: { $0.contains("Exclude rules changed") }) else {
+            return report(id, slug, false, "(exclude change did not request a restart)")
+        }
+        return report(id, slug, true)
+    }
+
+    private static func testSchedulerIncrementalHooks() -> Bool {
+        let id = "AC-L92-S2b5", slug = "scheduler-incremental-hooks"
+        let clock = VirtualClock()
+        var runs = 0, refusals = 0, ready = false, sourceThere = true
+        var runner = SchedulerRunner(
+            sourceExists: { sourceThere }, runChild: { _, done in runs += 1; done(0) },
+            now: { clock.now }, scheduleAfter: { s, a in clock.scheduleAfter(s, a) },
+            logSourceMissing: {}, refusalReason: { nil }, logRefusal: { _ in },
+            deleteLimitReached: { false }, recordDeleteLimit: { true })
+        runner.prepareRun = { ready }
+        runner.refused = { refusals += 1 }
+        let scheduler = SyncWatchScheduler(runner: runner)
+        scheduler.trigger()
+        guard runs == 0, scheduler.state == .idle else { return report(id, slug, false, "(ran with nothing prepared)") }
+        ready = true
+        scheduler.trigger()
+        guard runs == 1 else { return report(id, slug, false, "(prepared run not started)") }
+        sourceThere = false
+        scheduler.trigger()
+        guard runs == 1, refusals == 1 else { return report(id, slug, false, "(missing source not reported as a refusal)") }
+        // readLog: from the offset, or from the start after a rotation.
+        let path = "\(selfTestRoot)/ac-l92-s2b5.log"
+        try? "abcdef".write(toFile: path, atomically: true, encoding: .utf8)
+        guard SyncWatchDaemon.readLog(path, from: 2) == "cdef", SyncWatchDaemon.readLog(path, from: 99) == "abcdef" else {
+            return report(id, slug, false, "(readLog offset/rotation)")
+        }
+        return report(id, slug, true)
+    }
+
+    /// Real FSEvents through the real DirectoryWatcher into the driver: the
+    /// flags macOS actually sends become the expected entries, and an excluded
+    /// build output never does (limpet-plan.md L9.2 S2b).
+    private static func testIncrementalLiveFSEvents() -> Bool {
+        let id = "AC-L92-S2b6", slug = "incremental-live-fsevents"
+        guard Thread.isMainThread else { return report(id, slug, false, "(self-test not on main)") }
+        let base = "\(selfTestRoot)/ac-l92-s2b6"
+        try? FileManager.default.removeItem(atPath: base)
+        try? FileManager.default.createDirectory(atPath: "\(base)/build", withIntermediateDirectories: true)
+        guard let resolved = realpath(base, nil), let oracle = ExcludeOracle(dump: l92FilterDump) else {
+            return report(id, slug, false, "(setup)")
+        }
+        let root = String(cString: resolved)
+        free(resolved)
+        let io = IncrementalDriver.IO(
+            now: { SyncWatchDaemon.monotonicNow() }, currentEventId: { FSEventsGetCurrentEventId() },
+            exists: { rel in var st = stat(); return lstat(root + "/" + rel, &st) == 0 },
+            writeFilter: { _ in nil }, removeFilter: { _ in }, logSize: { 0 },
+            readLog: { _ in "x - Sync completed successfully\n" }, scheduleWake: { _ in },
+            excludeFileChanged: { false }, log: { _ in })
+        let driver = IncrementalDriver(planner: IncrementalPlanner(batchLimit: 500), oracle: oracle, root: root, io: io)
+        guard driver.prepareRun(), driver.startRun() != nil else { return report(id, slug, false, "(no catch-up full run)") }
+        driver.runEnded(exitCode: 0)
+        var callbacks: [[(path: String, flags: UInt32, id: UInt64)]] = []
+        let watcher = DirectoryWatcher(paths: [root], debugLabel: "ac-l92-s2b6", onEvents: { callbacks.append($0); driver.events($0) }) {}
+        watcher.start()
+        defer { watcher.stop() }
+        _ = pumpMain(timeout: 1.0) { false }  // let the stream start
+        try? "1".write(toFile: "\(root)/a.txt", atomically: false, encoding: .utf8)
+        try? "1".write(toFile: "\(root)/build/x.o", atomically: false, encoding: .utf8)
+        try? FileManager.default.createDirectory(atPath: "\(root)/d", withIntermediateDirectories: true)
+        let seen = pumpMain(timeout: 8.0) {
+            driver.planner.dirty.entries["a.txt"] != nil && driver.planner.dirty.entries["d"] != nil
+        }
+        _ = pumpMain(timeout: 1.5) { false }  // any late build/ event
+        let keys = driver.planner.dirty.entries.keys.sorted()
+        guard seen, driver.planner.dirty.entries["d"]?.subtree == true, !keys.contains(where: { $0.hasPrefix("build") }) else {
+            return report(id, slug, false, "(entries \(keys), subtree d \(String(describing: driver.planner.dirty.entries["d"]?.subtree)), root \(root), callbacks \(callbacks.map { $0.map { "\($0.path) \($0.flags)" } }))")
         }
         return report(id, slug, true)
     }

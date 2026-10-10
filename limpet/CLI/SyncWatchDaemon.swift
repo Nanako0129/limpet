@@ -173,7 +173,24 @@ enum SyncWatchDaemon {
         // read at start never disables self-restart for the life of the process.
         let startVersion = bundleVersionOnDisk(executablePath: executablePath)
             ?? Bundle.main.infoDictionary?["CFBundleVersion"] as? String
-        let scheduler = SyncWatchScheduler(runner: productionRunner(for: profile, executablePath: executablePath, startVersion: startVersion))
+        // limpet-plan.md L9.2 S2b: incremental mode when the profile asks for it
+        // and is eligible; otherwise (or when it cannot be set up) today's full
+        // syncs on every change.
+        var wake: DispatchSourceTimer?
+        var schedulerRef: SyncWatchScheduler?
+        let driver = makeIncrementalDriver(profile: profile) { at in
+            wake?.cancel()
+            wake = nil
+            guard let at else { return }
+            let timer = DispatchSource.makeTimerSource(queue: .main)
+            timer.schedule(deadline: .now() + max(at - monotonicNow(), 0.5))
+            timer.setEventHandler { schedulerRef?.trigger() }
+            timer.resume()
+            wake = timer
+        }
+        let scheduler = SyncWatchScheduler(runner: productionRunner(
+            for: profile, executablePath: executablePath, startVersion: startVersion, driver: driver))
+        schedulerRef = scheduler
 
         // SIGUSR1 = "sync now". The default action for SIGUSR1 terminates the
         // process outright — under launchd's KeepAlive=true that would just
@@ -184,7 +201,10 @@ enum SyncWatchDaemon {
         // `handleAction` runs instead of the process dying.
         signal(SIGUSR1, SIG_IGN)
         let signalSource = DispatchSource.makeSignalSource(signal: SIGUSR1, queue: .main)
-        signalSource.setEventHandler { scheduler.trigger() }
+        signalSource.setEventHandler {
+            driver?.requestFull()
+            scheduler.trigger()
+        }
         signalSource.resume()
 
         // limpet-plan.md L6.1 change B, root cause 2: `launchctl unload` sends
@@ -217,11 +237,16 @@ enum SyncWatchDaemon {
             terminationSources.append(terminationSource)  // kept alive: `run` never returns
         }
 
-        // Periodic safety sync every profile interval.
-        let intervalSeconds = TimeInterval(max(profile.syncIntervalMinutes, 1) * 60)
+        // Periodic safety sync every profile interval; in incremental mode a full
+        // run every max(interval, 6 h) (limpet-plan.md L9.2 cost check).
+        let intervalMinutes = driver == nil ? max(profile.syncIntervalMinutes, 1) : max(profile.syncIntervalMinutes, 360)
+        let intervalSeconds = TimeInterval(intervalMinutes * 60)
         let periodicTimer = DispatchSource.makeTimerSource(queue: .main)
         periodicTimer.schedule(deadline: .now() + intervalSeconds, repeating: intervalSeconds)
-        periodicTimer.setEventHandler { scheduler.trigger() }
+        periodicTimer.setEventHandler {
+            driver?.requestFull()
+            scheduler.trigger()
+        }
         periodicTimer.resume()
 
         // FSEvents on the local path, reusing `DirectoryWatcher` at the 5s
@@ -234,11 +259,25 @@ enum SyncWatchDaemon {
         func startWatcherIfNeeded() {
             guard directoryWatcher == nil,
                   FileManager.default.fileExists(atPath: profile.localSyncPath) else { return }
-            let watcher = DirectoryWatcher(
-                paths: [profile.localSyncPath],
-                debounceInterval: 5.0,
-                debugLabel: "watch-\(profile.shortId)"
-            ) { scheduler.trigger() }
+            let watcher: DirectoryWatcher
+            if let driver {
+                // FSEvents reports canonical paths; watch the realpath root so
+                // they compare (limpet-plan.md L9.2 S2b).
+                watcher = DirectoryWatcher(
+                    paths: [driver.root],
+                    debugLabel: "watch-\(profile.shortId)",
+                    onEvents: { events in
+                        driver.events(events)
+                        scheduler.trigger()
+                    }
+                ) {}
+            } else {
+                watcher = DirectoryWatcher(
+                    paths: [profile.localSyncPath],
+                    debounceInterval: 5.0,
+                    debugLabel: "watch-\(profile.shortId)"
+                ) { scheduler.trigger() }
+            }
             watcher.start()
             directoryWatcher = watcher
         }
@@ -255,7 +294,10 @@ enum SyncWatchDaemon {
         recheckTimer.setEventHandler {
             let exists = FileManager.default.fileExists(atPath: profile.localSyncPath)
             startWatcherIfNeeded()
-            if exists && sourceWasMissing { scheduler.trigger() }
+            if exists && sourceWasMissing {
+                driver?.requestFull()
+                scheduler.trigger()
+            }
             sourceWasMissing = !exists
         }
         recheckTimer.resume()
@@ -266,12 +308,120 @@ enum SyncWatchDaemon {
         dispatchMain()
     }
 
+    /// limpet-plan.md L9.2 S2b: the incremental driver for a profile that asks
+    /// for it and is eligible, or nil (today's full syncs). Logs why incremental
+    /// mode is off when the profile asked for it.
+    private static func makeIncrementalDriver(
+        profile: SyncProfile, scheduleWake: @escaping (TimeInterval?) -> Void
+    ) -> IncrementalDriver? {
+        guard profile.incrementalSync else { return nil }
+        func off(_ why: String) -> IncrementalDriver? {
+            appendProfileLogLine("Incremental sync off: \(why); using full syncs", profile: profile)
+            return nil
+        }
+        if let reason = profile.incrementalIneligibility { return off(reason) }
+        // The script refuses a batch while one of these is set (rclone reads
+        // flags from the environment); do not start batches it would refuse.
+        if let name = SyncProfile.refusedEnvironmentVariable(in: ProcessInfo.processInfo.environment) {
+            return off("environment variable \(name) is set")
+        }
+        guard let resolved = realpath(profile.localSyncPath, nil) else { return off("cannot resolve \(profile.localSyncPath)") }
+        let root = String(cString: resolved)
+        free(resolved)
+        guard let dump = filterDump(for: profile) else { return off("could not read the exclude rules from rclone") }
+        if ExcludeOracle.dumpHasIncludeRule(dump) { return off("the exclude rules hold a + (include) rule") }
+        let oracle = ExcludeOracle(dump: dump)
+        if oracle == nil {
+            appendProfileLogLine("Incremental sync: exclude prefilter off (rules rclone and limpet read differently)", profile: profile)
+        }
+        let rulesStamp = modificationDate(profile.filterFilePath)
+        let filterPath = "\(LimpetPaths.home)/.local/state/limpet/\(profile.shortId)-batch.filter"
+        let io = IncrementalDriver.IO(
+            now: monotonicNow,
+            currentEventId: { FSEventsGetCurrentEventId() },
+            exists: { rel in
+                var st = stat()
+                return lstat(root + "/" + rel, &st) == 0
+            },
+            writeFilter: { text in
+                try? FileManager.default.createDirectory(
+                    atPath: (filterPath as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
+                return (try? text.write(toFile: filterPath, atomically: true, encoding: .utf8)) != nil ? filterPath : nil
+            },
+            removeFilter: { try? FileManager.default.removeItem(atPath: $0) },
+            logSize: {
+                ((try? FileManager.default.attributesOfItem(atPath: profile.logPath))?[.size] as? NSNumber)?.uint64Value ?? 0
+            },
+            readLog: { readLog(profile.logPath, from: $0) },
+            scheduleWake: scheduleWake,
+            excludeFileChanged: { modificationDate(profile.filterFilePath) != rulesStamp },
+            log: { appendProfileLogLine($0, profile: profile) })
+        appendProfileLogLine("Incremental sync on", profile: profile)
+        let limit = profile.maxDelete > 0 ? min(500, profile.maxDelete) : 500
+        return IncrementalDriver(planner: IncrementalPlanner(batchLimit: limit), oracle: oracle, root: root, io: io)
+    }
+
+    private static func modificationDate(_ path: String) -> Date? {
+        (try? FileManager.default.attributesOfItem(atPath: path))?[.modificationDate] as? Date
+    }
+
+    /// The profile log from `offset`, or from the start when the file is now
+    /// shorter (the script rotated it during the run).
+    static func readLog(_ path: String, from offset: UInt64) -> String {
+        guard let handle = FileHandle(forReadingAtPath: path) else { return "" }
+        defer { try? handle.close() }
+        let size = (try? handle.seekToEnd()) ?? 0
+        try? handle.seek(toOffset: size >= offset ? offset : 0)
+        return String(decoding: (try? handle.readToEnd()) ?? Data(), as: UTF8.self)
+    }
+
+    /// rclone's compiled filter rules for the profile's rule sources, exactly
+    /// as the script passes them (`--filter-from <exclude file>` plus
+    /// additionalFlags), from `rclone lsf --dump filters` of an empty
+    /// directory; nil when rclone is missing, fails or takes over 30 s.
+    static func filterDump(for profile: SyncProfile) -> String? {
+        guard let rclone = RcloneLocator.resolve() else { return nil }
+        let empty = "\(LimpetPaths.home)/.local/state/limpet/empty-dir"
+        try? FileManager.default.createDirectory(atPath: empty, withIntermediateDirectories: true)
+        let flags = profile.additionalRcloneFlags.split(whereSeparator: \.isWhitespace).map(String.init)
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: rclone)
+        process.arguments = ["lsf", "--dump", "filters", "--filter-from", profile.filterFilePath] + flags + [empty]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = pipe
+        guard (try? process.run()) != nil else { return nil }
+        DispatchQueue.global().asyncAfter(deadline: .now() + 30) { if process.isRunning { process.terminate() } }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else { return nil }
+        let text = String(decoding: data, as: UTF8.self)
+        return text.contains("--- end filters ---") ? text : nil
+    }
+
     /// Wires `SchedulerRunner`'s closures to real process/filesystem/clock
     /// primitives for `profile`.
-    private static func productionRunner(for profile: SyncProfile, executablePath: String, startVersion: String?) -> SchedulerRunner {
-        SchedulerRunner(
+    private static func productionRunner(
+        for profile: SyncProfile, executablePath: String, startVersion: String?, driver: IncrementalDriver?
+    ) -> SchedulerRunner {
+        var runner = SchedulerRunner(
             sourceExists: { FileManager.default.fileExists(atPath: profile.localSyncPath) },
             runChild: { mayLog, completion in
+                // Incremental mode: the run `prepareRun` chose (a full run, or a
+                // batch with its filter file); a filter that cannot be written
+                // was already recorded as a failed batch.
+                var extraArguments: [String] = []
+                var extraEnvironment: [String: String] = [:]
+                if let driver {
+                    guard let start = driver.startRun() else { return completion(1) }
+                    (extraArguments, extraEnvironment) = start
+                }
+                let finish: (Int32) -> Void = { code in
+                    DispatchQueue.main.async {
+                        driver?.runEnded(exitCode: code)
+                        completion(code)
+                    }
+                }
                 DispatchQueue.global(qos: .utility).async {
                     let code = runSyncChild(
                         profile: profile,
@@ -283,11 +433,12 @@ enum SyncWatchDaemon {
                             runChildProcess(
                                 scriptPath: SyncProfile.sharedScriptPath,
                                 configPath: profile.configPath,
-                                environment: environment,
+                                environment: environment.merging(extraEnvironment) { _, new in new },
                                 logPath: profile.logPath,
-                                log: { appendProfileLogLine($0, profile: profile) })
+                                log: { appendProfileLogLine($0, profile: profile) },
+                                extraArguments: extraArguments)
                         })
-                    DispatchQueue.main.async { completion(code) }
+                    finish(code)
                 }
             },
             now: { Date().timeIntervalSinceReferenceDate },
@@ -311,6 +462,16 @@ enum SyncWatchDaemon {
                 exit(0)
             }
         )
+        if let driver {
+            runner.prepareRun = {
+                // The exclude rules changed: restart (idle here), so the new
+                // watcher rebuilds its rules and runs a catch-up full run.
+                if driver.restartRequested { exit(0) }
+                return driver.prepareRun()
+            }
+            runner.refused = { driver.refused() }
+        }
+        return runner
     }
 
     /// F4/F6 gate the watcher asks before every run (limpet-plan.md L4). Re-reads
@@ -459,7 +620,8 @@ enum SyncWatchDaemon {
     /// Not private so the self-test / A5 harness drives this exact code path.
     static func runChildProcess(
         scriptPath: String, configPath: String, environment: [String: String],
-        logPath: String, log: (String) -> Void, timings: WatchdogTimings = .standard
+        logPath: String, log: (String) -> Void, timings: WatchdogTimings = .standard,
+        extraArguments: [String] = []
     ) -> Int32 {
         // A group `.giveUp` left behind (a member in uninterruptible sleep that
         // survived SIGKILL) still counts as a running sync: starting another
@@ -486,7 +648,7 @@ enum SyncWatchDaemon {
         let exited = DispatchSemaphore(value: 0)
         process.terminationHandler = { _ in exited.signal() }
         process.executableURL = URL(fileURLWithPath: "/bin/bash")
-        process.arguments = [scriptPath, configPath]
+        process.arguments = [scriptPath, configPath] + extraArguments
         process.environment = environment
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice

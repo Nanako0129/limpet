@@ -49,6 +49,13 @@ struct SchedulerRunner {
     /// FIRST in every run attempt: with no child running, restarting is always
     /// safe, whatever the other gates would say. Default: never.
     var restartForUpdate: () -> Bool = { false }
+    /// limpet-plan.md L9.2 S2b: asked after every gate passed, right before
+    /// `runChild`; false = nothing to run now (incremental mode with nothing
+    /// due), so the scheduler stays idle. Default: always run.
+    var prepareRun: () -> Bool = { true }
+    /// Told whenever a gate refused a run attempt (delete limit, refusal,
+    /// missing source), so incremental mode delays its next attempt.
+    var refused: () -> Void = {}
 }
 
 /// Pure idle/running/(running+pending) scheduler for one profile's realtime
@@ -140,16 +147,23 @@ final class SyncWatchScheduler {
                     + "'limpet profile clear-delete-limit' or the menu, after checking the remote")
             }
             state = .idle
+            runner.refused()
             return
         }
         if let reason = runner.refusalReason() {
             if throttle(&lastRefusalLogAt) { runner.logRefusal(reason) }
             state = .idle
+            runner.refused()
             return
         }
         guard runner.sourceExists() else {
             if throttle(&lastMissingSourceLogAt) { runner.logSourceMissing() }
             state = .idle  // no run, per limpet-plan.md L3(a).
+            runner.refused()
+            return
+        }
+        guard runner.prepareRun() else {
+            state = .idle
             return
         }
         state = .running(pending: pending)
