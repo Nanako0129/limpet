@@ -280,11 +280,13 @@ struct SyncProfile: Identifiable, Codable, Equatable {
     ]
 
     /// The RCLONE_<FLAG> environment variables for `batchRefusedFlags` (rclone
-    /// reads any flag from one). The script and `refusedEnvironmentVariable`
-    /// apply the same rule to them.
+    /// reads any flag from one), plus RCLONE_CONFIG_LOCAL_<OPT> for the two
+    /// local-backend options (measured, rclone 1.75.1: they rename files too).
+    /// The script and `refusedEnvironmentVariable` apply the same rule to them.
     static var batchRefusedEnvironment: [String] {
         batchRefusedFlags.subtracting(["--"]).sorted()
             .map { "RCLONE_" + $0.dropFirst(2).uppercased().replacingOccurrences(of: "-", with: "_") }
+            + ["RCLONE_CONFIG_LOCAL_ENCODING", "RCLONE_CONFIG_LOCAL_UNICODE_NORMALIZATION"]
     }
 
     /// The first of `batchRefusedEnvironment` set in `environment` (empty

@@ -490,10 +490,13 @@ The generated script runs a batch when given a second argument, a filter file.
 Before the lock it refuses (exit 64) a batch for remoteToLocal, an unreadable
 file, or any of those flags (a newer config can reach an older watcher's
 batch) or the matching `RCLONE_*` environment variable is set, even empty
-(rclone reads every flag from one; `SyncProfile.batchRefusedEnvironment`), except
+(rclone reads every flag from one; `SyncProfile.batchRefusedEnvironment`, which
+also lists `RCLONE_CONFIG_LOCAL_ENCODING` / `_UNICODE_NORMALIZATION`), except
 `RCLONE_DELETE_EXCLUDED=false`, the one value the flag check passes too
 (`SyncProfile.refusedEnvironmentVariable` is the same rule in Swift; AC-L92-S2a2
-compares them), and unsets `RCLONE_FAST_LIST`. The case
+compares them), and unsets `RCLONE_FAST_LIST`. Once rclone is found it also
+refuses a batch whose `rclone config show local` sets `encoding` or
+`unicode_normalization` (rclone reads a `[local]` section, typed or not). The case
 pattern and the variable list are generated from `batchRefusedFlags`; a
 single-dash token is judged raw (a value like `_drafts/**` is no flag), exactly
 as `SyncProfile.refusesBatch` does (AC-L92-S2a1 runs every listed token through

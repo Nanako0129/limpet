@@ -7161,7 +7161,8 @@ enum ConfigSelfTest {
                           "--delete_excluded", "--include_from=f", "--min-age=2m", "--max-age=1d",
                           "--exclude-if-present=.nosync", "--files-from0=f", "--error-on-no-transfer",
                           "--local-encoding=Slash", "--local-unicode-normalization", "--hash-filter=@/4", "--", "-vf!",
-                          "--log-file=/tmp/x", "--log-level=CRITICAL", "--use-json-log=false", "--syslog", "__include=x"]
+                          "--log-file=/tmp/x", "--log-level=CRITICAL", "--use-json-log=false", "--syslog", "--log-systemd",
+                          "__include=x"]
         for f in eligible where reason(f) != nil { return report(id, slug, false, "(\(f) refused: \(reason(f)!))") }
         for f in ineligible where reason(f) == nil { return report(id, slug, false, "(\(f) accepted)") }
         guard reason("", enabled: false) != nil, reason("", direction: .remoteToLocal) != nil else {
@@ -7229,19 +7230,42 @@ enum ConfigSelfTest {
         let envCases: [[String: String]] = [
             ["RCLONE_INCLUDE": ""], ["RCLONE_INCLUDE": "false"], ["RCLONE_DELETE_EXCLUDED": "false"],
             ["RCLONE_DELETE_EXCLUDED": "true"], ["RCLONE_LOG_FILE": "false"], ["RCLONE_TRANSFERS": "8"],
+            ["RCLONE_CONFIG_LOCAL_ENCODING": "Slash"], ["RCLONE_CONFIG_LOCAL_UNICODE_NORMALIZATION": "true"],
         ]
         for (i, env) in envCases.enumerated() {
             guard let run = runScriptFixture(name: "ac-l92-s2a2-env\(i)", overrides: [:], extraEnvironment: env, extraArgs: [dirty]) else {
                 return report(id, slug, false, "(fixture setup failed)")
             }
             let scriptRefused = run.status == 64 && run.log.contains("environment variable")
-            if scriptRefused != (SyncProfile.refusedEnvironmentVariable(in: env) != nil) {
-                return report(id, slug, false, "(Swift and the script disagree on \(env): script refused \(scriptRefused))")
+            let scriptRan = run.status == 0 && run.stubRan
+            if scriptRefused != (SyncProfile.refusedEnvironmentVariable(in: env) != nil) || scriptRefused == scriptRan {
+                return report(id, slug, false, "(Swift and the script disagree on \(env): script refused \(scriptRefused), ran \(scriptRan))")
             }
         }
         guard SyncProfile.refusedEnvironmentVariable(in: ["RCLONE_INCLUDE": "false"]) == "RCLONE_INCLUDE",
-              SyncProfile.refusedEnvironmentVariable(in: ["RCLONE_DELETE_EXCLUDED": "false"]) == nil else {
+              SyncProfile.refusedEnvironmentVariable(in: ["RCLONE_DELETE_EXCLUDED": "false"]) == nil,
+              SyncProfile.refusedEnvironmentVariable(in: ["RCLONE_CONFIG_LOCAL_ENCODING": ""]) == "RCLONE_CONFIG_LOCAL_ENCODING",
+              SyncProfile.refusedEnvironmentVariable(in: ["RCLONE_CONFIG_LOCAL_UNICODE_NORMALIZATION": "x"]) != nil else {
             return report(id, slug, false, "(environment rule wrong)")
+        }
+        // A [local] section that renames files refuses a batch (not a full run);
+        // one without those keys does not.
+        let localSection = "if [ \"$1\" = config ]; then printf '[local]\\n%s\\n' \"$LOCAL_KEY\"; fi\nexit 0\n"
+        guard let conf = runScriptFixture(name: "ac-l92-s2a2-conf", overrides: [:], stubTail: localSection,
+                                          extraEnvironment: ["LOCAL_KEY": "encoding = Slash,Dot"], extraArgs: [dirty]),
+              conf.status == 64, conf.argv.first == "config", conf.log.contains("rclone.conf [local]") else {
+            return report(id, slug, false, "(a [local] encoding did not refuse the batch)")
+        }
+        for (name, key, args) in [("norm", "unicode_normalization = true", [dirty]), ("full", "encoding = Slash", []),
+                                  ("other", "copy_links = true", [dirty])] {
+            guard let run = runScriptFixture(name: "ac-l92-s2a2-conf-\(name)", overrides: [:], stubTail: localSection,
+                                             extraEnvironment: ["LOCAL_KEY": key], extraArgs: args) else {
+                return report(id, slug, false, "(fixture setup failed)")
+            }
+            let refused = run.status == 64 && run.log.contains("rclone.conf [local]")
+            guard refused == (name == "norm"), refused || (run.status == 0 && run.argv.first == "sync") else {
+                return report(id, slug, false, "([local] \(key) with \(args.count) args: status \(run.status), argv \(run.argv.prefix(2)))")
+            }
         }
         // An RCLONE_* variable for a refused flag refuses the batch like the flag.
         guard let envRefused = runScriptFixture(name: "ac-l92-s2a2-env", overrides: [:],

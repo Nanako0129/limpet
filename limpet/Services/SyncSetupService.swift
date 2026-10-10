@@ -636,6 +636,17 @@ final class SyncSetupService {
                 exit 1
             fi
 
+            # rclone also reads the local backend's options from a [local] section
+            # of its config, typed or not (measured, rclone 1.75.1): a batch
+            # refuses the two that rename files, like their flags.
+            if [[ -n "$DIRTY_FILTER" ]]; then
+                local_section="$("$RCLONE_BIN" config show local 2>/dev/null || true)"
+                if grep -Eq '^(encoding|unicode_normalization)[[:space:]]*=' <<< "$local_section"; then
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') - Refusing to sync: rclone.conf [local] sets encoding or unicode_normalization, which changes what a batch would sync" >> "$LOG_FILE"
+                    exit 64
+                fi
+            fi
+
             # Helper: check if a remote has no_check_certificate set in rclone config
             check_no_cert() {
                 local remote_name="$1"
