@@ -276,16 +276,26 @@ struct SyncProfile: Identifiable, Codable, Equatable {
         "--files-from-raw", "--files-from0", "--delete-excluded", "--min-age", "--max-age",
         "--hash-filter", "--exclude-if-present", "--local-encoding",
         "--local-unicode-normalization", "--error-on-no-transfer", "--",
-        "--log-file", "--log-level", "--use-json-log", "--syslog",
+        "--log-file", "--log-level", "--use-json-log", "--syslog", "--log-systemd",
     ]
 
     /// The RCLONE_<FLAG> environment variables for `batchRefusedFlags` (rclone
-    /// reads any flag from one, even an empty one). A batch refuses to run while
-    /// one is set to anything but `false` (as `--flag=false` passes): the script
-    /// checks this list, and the watcher (L9.2 S2b) checks it before batching.
+    /// reads any flag from one). The script and `refusedEnvironmentVariable`
+    /// apply the same rule to them.
     static var batchRefusedEnvironment: [String] {
         batchRefusedFlags.subtracting(["--"]).sorted()
             .map { "RCLONE_" + $0.dropFirst(2).uppercased().replacingOccurrences(of: "-", with: "_") }
+    }
+
+    /// The first of `batchRefusedEnvironment` set in `environment` (empty
+    /// included: the variable is there), except RCLONE_DELETE_EXCLUDED=false —
+    /// the one value the flag check passes too (`--delete-excluded=false`).
+    /// nil = batches may run. The generated script applies the same rule.
+    static func refusedEnvironmentVariable(in environment: [String: String]) -> String? {
+        batchRefusedEnvironment.first { name in
+            guard let value = environment[name] else { return false }
+            return !(name == "RCLONE_DELETE_EXCLUDED" && value == "false")
+        }
     }
 
     /// Whether one additionalRcloneFlags token makes a batch unsafe. A single

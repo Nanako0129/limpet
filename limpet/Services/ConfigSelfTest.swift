@@ -2136,7 +2136,9 @@ enum ConfigSelfTest {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/bash")
         process.arguments = [scriptPath, configPath] + extraArgs
-        var env = ProcessInfo.processInfo.environment
+        // The developer's own RCLONE_* variables must not change a fixture's
+        // verdict (the batch refuses several of them).
+        var env = ProcessInfo.processInfo.environment.filter { !$0.key.hasPrefix("RCLONE_") }
         env["RCLONE_BIN"] = stubPath
         env.merge(extraEnvironment) { _, new in new }
         process.environment = env
@@ -7222,12 +7224,24 @@ enum ConfigSelfTest {
               value.status == 0, value.stubRan else {
             return report(id, slug, false, "(--exclude _drafts/** was refused by the script)")
         }
-        // Set-but-empty counts (rclone applies it); `false` passes like --flag=false.
-        guard let emptyEnv = runScriptFixture(name: "ac-l92-s2a2-env0", overrides: [:], extraEnvironment: ["RCLONE_INCLUDE": ""], extraArgs: [dirty]),
-              emptyEnv.status == 64,
-              let falseEnv = runScriptFixture(name: "ac-l92-s2a2-envf", overrides: [:], extraEnvironment: ["RCLONE_DELETE_EXCLUDED": "false"], extraArgs: [dirty]),
-              falseEnv.status == 0, falseEnv.stubRan else {
-            return report(id, slug, false, "(empty or false RCLONE_* variable handled wrong)")
+        // Environment parity: the script refuses exactly when Swift does
+        // (set-but-empty counts; only RCLONE_DELETE_EXCLUDED=false passes).
+        let envCases: [[String: String]] = [
+            ["RCLONE_INCLUDE": ""], ["RCLONE_INCLUDE": "false"], ["RCLONE_DELETE_EXCLUDED": "false"],
+            ["RCLONE_DELETE_EXCLUDED": "true"], ["RCLONE_LOG_FILE": "false"], ["RCLONE_TRANSFERS": "8"],
+        ]
+        for (i, env) in envCases.enumerated() {
+            guard let run = runScriptFixture(name: "ac-l92-s2a2-env\(i)", overrides: [:], extraEnvironment: env, extraArgs: [dirty]) else {
+                return report(id, slug, false, "(fixture setup failed)")
+            }
+            let scriptRefused = run.status == 64 && run.log.contains("environment variable")
+            if scriptRefused != (SyncProfile.refusedEnvironmentVariable(in: env) != nil) {
+                return report(id, slug, false, "(Swift and the script disagree on \(env): script refused \(scriptRefused))")
+            }
+        }
+        guard SyncProfile.refusedEnvironmentVariable(in: ["RCLONE_INCLUDE": "false"]) == "RCLONE_INCLUDE",
+              SyncProfile.refusedEnvironmentVariable(in: ["RCLONE_DELETE_EXCLUDED": "false"]) == nil else {
+            return report(id, slug, false, "(environment rule wrong)")
         }
         // An RCLONE_* variable for a refused flag refuses the batch like the flag.
         guard let envRefused = runScriptFixture(name: "ac-l92-s2a2-env", overrides: [:],

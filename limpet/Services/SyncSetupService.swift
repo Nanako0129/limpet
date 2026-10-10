@@ -594,7 +594,7 @@ final class SyncSetupService {
                 # rclone also reads any flag from an RCLONE_<FLAG> environment variable:
                 # a batch refuses those like the flags, and drops the ones it overrides.
                 for env_name in \(batchRefusedEnvironment); do
-                    if [[ -n "${!env_name+x}" && "${!env_name}" != "false" ]]; then
+                    if [[ -n "${!env_name+x}" ]] && ! [[ "$env_name" == RCLONE_DELETE_EXCLUDED && "${!env_name}" == false ]]; then
                         echo "$(date '+%Y-%m-%d %H:%M:%S') - Refusing to sync: environment variable $env_name changes what a batch would sync" >> "$LOG_FILE"
                         exit 64
                     fi

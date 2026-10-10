@@ -637,9 +637,11 @@ extension RunOutcome {
         if exitCode == 0 {
             return runLog.contains(" - Sync completed successfully") ? .success : .runFailed
         }
-        // 5 is rclone's exit when the last error was retryable: an outage logs
-        // object-less or `.Fs` lines (-> .runFailed below), while one object
-        // that keeps failing names itself and must be countable and given up.
+        // 5 is rclone's exit when the last error was retryable. Read by line
+        // shape like 1 and 6: one object that keeps failing names itself and
+        // must be countable and given up. Accepted (not measured): an outage
+        // that starts mid-transfer also names the in-flight objects, so they
+        // can be given up to the owed full run, which retries them.
         guard exitCode == 1 || exitCode == 5 || exitCode == 6 else { return .runFailed }
         var attempt: Set<String> = [], lastFailedAttempt: Set<String> = []
         var attemptSkipped = false, lastSkipped = false

@@ -483,15 +483,17 @@ flag in `SyncProfile.batchRefusedFlags` (include/filter/files-from rules incl.
 `--files-from0`, `--delete-excluded` unless `=false`, `--min-age`, `--max-age`,
 `--hash-filter`, `--exclude-if-present`, `--local-encoding`,
 `--local-unicode-normalization`, `--error-on-no-transfer`, `--log-file`,
-`--log-level`, `--use-json-log`, `--syslog` (they take rclone's JSON error lines
+`--log-level`, `--use-json-log`, `--syslog`, `--log-systemd` (they can take rclone's JSON error lines
 out of the profile log the watcher classifies), a bare `--`, and any single-dash
 token whose letters include `f`; long flags read `_` as `-`).
 The generated script runs a batch when given a second argument, a filter file.
 Before the lock it refuses (exit 64) a batch for remoteToLocal, an unreadable
 file, or any of those flags (a newer config can reach an older watcher's
-batch) or the matching `RCLONE_*` environment variable is set, even empty, to
-anything but `false` (rclone reads every flag from one;
-`SyncProfile.batchRefusedEnvironment`), and unsets `RCLONE_FAST_LIST`. The case
+batch) or the matching `RCLONE_*` environment variable is set, even empty
+(rclone reads every flag from one; `SyncProfile.batchRefusedEnvironment`), except
+`RCLONE_DELETE_EXCLUDED=false`, the one value the flag check passes too
+(`SyncProfile.refusedEnvironmentVariable` is the same rule in Swift; AC-L92-S2a2
+compares them), and unsets `RCLONE_FAST_LIST`. The case
 pattern and the variable list are generated from `batchRefusedFlags`; a
 single-dash token is judged raw (a value like `_drafts/**` is no flag), exactly
 as `SyncProfile.refusesBatch` does (AC-L92-S2a1 runs every listed token through
