@@ -448,6 +448,11 @@ final class SyncSetupService {
         // environment exists only for the self-test's stub rclone. A shipped
         // script must never run whatever binary an environment variable names,
         // so outside Debug builds the variable is cleared before the search.
+        // limpet-plan.md L9.2: the batch flag check and the refused RCLONE_*
+        // variables come from SyncProfile.batchRefusedFlags (the watcher's list).
+        let batchRefusedCasePattern = SyncProfile.batchRefusedFlags
+            .subtracting(["--delete-excluded"]).sorted().joined(separator: "|")
+        let batchRefusedEnvironment = SyncProfile.batchRefusedEnvironment.joined(separator: " ")
         let rcloneBinSelection = honorRcloneBinOverride
             ? #"if [[ -z "${RCLONE_BIN:-}" || ! -x "$RCLONE_BIN" ]]; then"#
             : #"RCLONE_BIN=""; if true; then"#
@@ -460,6 +465,10 @@ final class SyncSetupService {
             export PATH="/usr/sbin:/usr/bin:/bin:$PATH"
 
             CONFIG_FILE="$1"
+            # limpet-plan.md L9.2 S2: a second argument makes this run a batch: a
+            # filter file of the changed paths (written by the watcher, ending in
+            # `- **`), applied after the profile's own rules.
+            DIRTY_FILTER="${2:-}"
 
             if [[ -z "$CONFIG_FILE" || ! -f "$CONFIG_FILE" ]]; then
                 echo "Error: Config file not specified or not found: $CONFIG_FILE"
@@ -550,6 +559,49 @@ final class SyncSetupService {
                 fi
             done
 
+            # limpet-plan.md L9.2: a batch is checked here as well as by the watcher
+            # (SyncProfile.batchRefusedFlags, same list), before the lock: a config
+            # written by a newer install can reach a batch an older watcher starts.
+            if [[ -n "$DIRTY_FILTER" ]]; then
+                if [[ "$SYNC_DIRECTION" != "localToRemote" ]]; then
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') - Refusing to sync: a batch needs localToRemote" >> "$LOG_FILE"
+                    exit 64
+                fi
+                if [[ ! -r "$DIRTY_FILTER" ]]; then
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') - Refusing to sync: batch filter not readable: $DIRTY_FILTER" >> "$LOG_FILE"
+                    exit 64
+                fi
+                batch_refused=""
+                for flag_token in ${ADDITIONAL_FLAGS_ARRAY[@]+"${ADDITIONAL_FLAGS_ARRAY[@]}"}; do
+                    flag_raw="${flag_token%%=*}"
+                    if [[ "$flag_raw" == -* && "$flag_raw" != --* ]]; then
+                        # A single-dash token, judged raw: its letters hold the short -f.
+                        [[ "$flag_raw" == *f* ]] && batch_refused="$flag_token"
+                    else
+                        # A long flag (or a value), named with `_` read as `-` as rclone does.
+                        case "${flag_raw//_/-}" in
+                            --delete-excluded)
+                                [[ "$flag_token" == *=false ]] || batch_refused="$flag_token" ;;
+                            \(batchRefusedCasePattern))
+                                batch_refused="$flag_token" ;;
+                        esac
+                    fi
+                    if [[ -n "${batch_refused:-}" ]]; then
+                        echo "$(date '+%Y-%m-%d %H:%M:%S') - Refusing to sync: additionalRcloneFlags $batch_refused changes what a batch would sync" >> "$LOG_FILE"
+                        exit 64
+                    fi
+                done
+                # rclone also reads any flag from an RCLONE_<FLAG> environment variable:
+                # a batch refuses those like the flags, and drops the ones it overrides.
+                for env_name in \(batchRefusedEnvironment); do
+                    if [[ -n "${!env_name+x}" ]] && ! [[ "$env_name" == RCLONE_DELETE_EXCLUDED && "${!env_name}" == false ]]; then
+                        echo "$(date '+%Y-%m-%d %H:%M:%S') - Refusing to sync: environment variable $env_name changes what a batch would sync" >> "$LOG_FILE"
+                        exit 64
+                    fi
+                done
+                unset RCLONE_FAST_LIST  # (--tpslimit/--tpslimit-burst on the command line beat their env defaults)
+            fi
+
             # Find rclone binary. Cover the common package-manager locations,
             # including nix-darwin's system and per-user profiles which live outside
             # Homebrew's dirs (issue #53). $USER can be unset under launchd, so derive
@@ -582,6 +634,17 @@ final class SyncSetupService {
             if [[ -z "$RCLONE_BIN" ]]; then
                 echo "$(date '+%Y-%m-%d %H:%M:%S') - Error: rclone not found" >> "$LOG_FILE"
                 exit 1
+            fi
+
+            # rclone also reads the local backend's options from a [local] section
+            # of its config, typed or not (measured, rclone 1.75.1): a batch
+            # refuses the two that rename files, like their flags.
+            if [[ -n "$DIRTY_FILTER" ]]; then
+                local_section="$("$RCLONE_BIN" config show local 2>/dev/null || true)"
+                if grep -Eq '^(encoding|unicode_normalization)[[:space:]]*=' <<< "$local_section"; then
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') - Refusing to sync: rclone.conf [local] sets encoding or unicode_normalization, which changes what a batch would sync" >> "$LOG_FILE"
+                    exit 64
+                fi
             fi
 
             # Helper: check if a remote has no_check_certificate set in rclone config
@@ -742,7 +805,28 @@ final class SyncSetupService {
             # string re-interpreted by the shell (a value like `~/Data$old` in
             # LOCAL_PATH/REMOTE/FILTER_FILE must never be re-expanded, or `$old`
             # collapses to empty and the wrong directory gets synced/deleted).
-            if [[ "$SYNC_DIRECTION" == "localToRemote" ]]; then
+            if [[ -n "$DIRTY_FILTER" ]]; then
+                # A batch (limpet-plan.md L9.2): the dirty rules come after the
+                # profile's (first match wins, so a profile exclude beats a dirty
+                # include; rclone puts every --exclude flag before both files).
+                # No --fast-list: with it rclone walks the whole remote prefix
+                # and ignores directory filters (march.go/walk.go, 1.75.1).
+                # --tpslimit 4 --tpslimit-burst 1 (appended after additionalFlags below,
+                # so a profile's own values cannot raise them) keep two busy profiles
+                # far below the S4 IP block.
+                BATCH_ITEMS="${LIMPET_BATCH_ITEMS:-}"
+                [[ "$BATCH_ITEMS" =~ ^[0-9]+$ ]] || BATCH_ITEMS="?"
+                echo "$(date '+%Y-%m-%d %H:%M:%S') - Starting sync (local → remote, $BATCH_ITEMS changed paths)" >> "$LOG_FILE"
+                cmd=("$RCLONE_BIN" sync "$LOCAL_PATH" "$REMOTE" --verbose --use-json-log --stats 2s --filter-from "$FILTER_FILE" --filter-from "$DIRTY_FILTER" --links --transfers "$TRANSFERS" --checkers "$CHECKERS")
+                BATCH_FLAGS=()
+                for flag_token in ${ADDITIONAL_FLAGS_ARRAY[@]+"${ADDITIONAL_FLAGS_ARRAY[@]}"}; do
+                    case "$flag_token" in
+                        --fast-list|--fast-list=*|--fast_list|--fast_list=*) ;;
+                        *) BATCH_FLAGS+=("$flag_token") ;;
+                    esac
+                done
+                ADDITIONAL_FLAGS_ARRAY=(${BATCH_FLAGS[@]+"${BATCH_FLAGS[@]}"})
+            elif [[ "$SYNC_DIRECTION" == "localToRemote" ]]; then
                 # Local is source, remote is destination (backup/upload)
                 echo "$(date '+%Y-%m-%d %H:%M:%S') - Starting sync (local → remote)" >> "$LOG_FILE"
                 cmd=("$RCLONE_BIN" sync "$LOCAL_PATH" "$REMOTE" --verbose --use-json-log --stats 2s --filter-from "$FILTER_FILE" --links --fast-list --transfers "$TRANSFERS" --checkers "$CHECKERS")
@@ -772,6 +856,9 @@ final class SyncSetupService {
             # ADDITIONAL_FLAGS_ARRAY above; append its tokens as-is.
             if [[ ${#ADDITIONAL_FLAGS_ARRAY[@]} -gt 0 ]]; then
                 cmd+=("${ADDITIONAL_FLAGS_ARRAY[@]}")
+            fi
+            if [[ -n "$DIRTY_FILTER" ]]; then
+                cmd+=(--tpslimit 4 --tpslimit-burst 1)
             fi
 
             # The max-delete lines of THIS run only (never an older run's lines in

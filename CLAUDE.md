@@ -475,6 +475,53 @@ The GUI treats 77 as idle on both completion paths (`processLogEvent`'s
 `.syncFailed` clears `profileErrors`; `readLastErrorFromLog` returns nil), with
 no notification. Self-tests AC-L91-A/B/C/C2.
 
+**Incremental sync, batch mode (limpet-plan.md L9.2 S2a; not wired to the watcher
+yet).** Profile field `incrementalSync` (default false; `profile set`, schema,
+reinstall trigger). `SyncProfile.incrementalIneligibility` keeps a profile on full
+syncs when it is off, not localToRemote, or `additionalRcloneFlags` holds a
+flag in `SyncProfile.batchRefusedFlags` (include/filter/files-from rules incl.
+`--files-from0`, `--delete-excluded` unless `=false`, `--min-age`, `--max-age`,
+`--hash-filter`, `--exclude-if-present`, `--local-encoding`,
+`--local-unicode-normalization`, `--error-on-no-transfer`, `--log-file`,
+`--log-level`, `--use-json-log`, `--syslog`, `--log-systemd` (they can take rclone's JSON error lines
+out of the profile log the watcher classifies), a bare `--`, and any single-dash
+token whose letters include `f`; long flags read `_` as `-`).
+The generated script runs a batch when given a second argument, a filter file.
+Before the lock it refuses (exit 64) a batch for remoteToLocal, an unreadable
+file, or any of those flags (a newer config can reach an older watcher's
+batch) or the matching `RCLONE_*` environment variable is set, even empty
+(rclone reads every flag from one; `SyncProfile.batchRefusedEnvironment`, which
+also lists `RCLONE_CONFIG_LOCAL_ENCODING` / `_UNICODE_NORMALIZATION`), except
+`RCLONE_DELETE_EXCLUDED=false`, the one value the flag check passes too
+(`SyncProfile.refusedEnvironmentVariable` is the same rule in Swift; AC-L92-S2a2
+compares them), and unsets `RCLONE_FAST_LIST`. Once rclone is found it also
+refuses a batch whose `rclone config show local` sets `encoding` or
+`unicode_normalization` (rclone reads a `[local]` section, typed or not). The case
+pattern and the variable list are generated from `batchRefusedFlags`; a
+single-dash token is judged raw (a value like `_drafts/**` is no flag), exactly
+as `SyncProfile.refusesBatch` does (AC-L92-S2a1 runs every listed token through
+both). It logs `Starting sync (local → remote, N changed
+paths)` (N from `LIMPET_BATCH_ITEMS`) and runs `rclone sync` with
+`--filter-from <profile exclude file> --filter-from <batch file>`, no
+`--fast-list` (also removed from additionalFlags: with it rclone walks the
+whole remote prefix and ignores directory filters), and `--tpslimit 4
+--tpslimit-burst 1` appended last so a profile's own values cannot raise them. Exit-code mapping (76,
+77) is unchanged. `DirtySet.filterRules(for:exists:)` writes the batch file
+(`+ /p`, `+ /p.rclonelink`, `+ /p/**` for a subtree or gone path, then `- **`):
+`\ * ? [ ]` escaped, `{` `}` written as `?` (rclone's directory-filter
+derivation gives up on `{{`, `}}`, `{…{` and `{…/…}` even when escaped,
+measured), trailing whitespace bracketed (rclone TrimSpaces filter lines), and a
+path holding a scalar rclone filters in a different form (control characters,
+DEL, U+2401–U+241F, U+2421, U+201B; measured: raw rules for U+2400, U+2420,
+U+FF0E, U+FF0F do match) synced through its nearest clean ancestor as a subtree
+(`DirtySet.scope`, also used to attribute failures).
+`RunOutcome.classify(exitCode:runLog:)` turns a run into `.success` (exit 0 AND
+the script's `Sync completed successfully` line — an unmounted drive exits 0
+without it), `.objectErrors` (exit 1/5/6 with only per-object failures, taken from
+the last attempt, and known rclone follow-up lines) or `.runFailed`. Verified end
+to end with real rclone 1.75.1 local→local (excluded, unlisted, deleted, new,
+symlink, tab-named and `{{…}}` paths). Self-tests AC-L92-S2a1–4.
+
 **GUI responsiveness, log rotation and the stalled-sync watchdog
 (limpet-plan.md L6.3, plan v1-v3).** Three defects found by reading the code
 (none is claimed to be THE cause of the multi-day menu freeze; the decisive

@@ -424,7 +424,8 @@ struct DirtySet {
             for item in batch {
                 guard let e = entries[item.path] else { continue }
                 if !e.subtree && !exists(item.path) { gone.insert(item.path) }
-                let mine = Self.carried(by: item.path, coversBelow: e.subtree || gone.contains(item.path), of: failed)
+                let covered = Self.scope(of: item.path, subtree: e.subtree || gone.contains(item.path))
+                let mine = Self.carried(by: covered.path, coversBelow: covered.subtree, of: failed)
                 if !mine.isEmpty { carriers.insert(item.path); carriedFailures.formUnion(mine) }
             }
             if failed.isEmpty || !failed.isSubset(of: carriedFailures) {
@@ -530,4 +531,148 @@ struct DirtySet {
     }
 
     mutating func clearGaveUp() { gaveUp.removeAll() }
+}
+
+// MARK: - Batch filter file and run classification (limpet-plan.md L9.2 S2)
+
+extension DirtySet {
+    /// Scalars whose name rclone filters in a different form than the bytes on
+    /// disk (its Standard encoding on macOS, lib/encoder): control characters
+    /// and DEL become U+2401–U+241F / U+2421, and those symbols or the quote
+    /// rune U+201B in a name get quoted. Measured with rclone 1.75.1: raw rules
+    /// for a tab or U+201B match nothing; raw rules for U+2400, U+2420, U+FF0E
+    /// and U+FF0F do match, so those are fine. Such a path is synced through
+    /// its nearest clean ancestor (`scope`).
+    static func rcloneReencodes(_ path: String) -> Bool {
+        path.unicodeScalars.contains { s in
+            (0x01...0x1F).contains(s.value) || s.value == 0x7F || (0x2401...0x241F).contains(s.value)
+                || s.value == 0x2421 || s.value == 0x201B
+        }
+    }
+
+    /// What a batch item actually covers: the item, or — for a path rclone
+    /// re-encodes — its nearest clean ancestor as a subtree. Used both to write
+    /// the filter and to attribute failures (each with its own lstat of a gone
+    /// path, so a path recreated mid-run can make a failure unattributed,
+    /// which only costs a full run). An empty path means the root; the watcher
+    /// is to turn such a path into a full run instead (limpet-plan.md L9.2 S2b).
+    static func scope(of path: String, subtree: Bool) -> (path: String, subtree: Bool) {
+        var p = path
+        var sub = subtree
+        while rcloneReencodes(p) {
+            p = parent(of: p)
+            sub = true
+        }
+        return (p, sub)
+    }
+
+    /// One rclone glob that matches `path`: `\` before `\ * ? [ ]`
+    /// (fs/filter/glob.go); `{` and `}` as `?` (any one character), because
+    /// rclone's directory-glob derivation gives up on `{{`, `}}`, `{…{` and
+    /// `{…/…}` even when escaped (`tooHardRe`, measured) and would then walk
+    /// every directory — matching a few extra same-named siblings is harmless; trailing whitespace bracketed,
+    /// because rclone trims each filter-file line with Go's strings.TrimSpace
+    /// (which also takes U+0085, U+00A0 and the Unicode space separators).
+    /// Works on scalars, so a combining mark cannot hide a metacharacter.
+    static func globEscaped(_ path: String) -> String {
+        var scalars = Array(path.unicodeScalars)
+        var trailing: [Unicode.Scalar] = []
+        while let last = scalars.last, last.properties.isWhitespace {
+            trailing.insert(scalars.removeLast(), at: 0)
+        }
+        var out = ""
+        for scalar in scalars {
+            if scalar == "{" || scalar == "}" { out += "?"; continue }
+            if "\\*?[]".unicodeScalars.contains(scalar) { out.unicodeScalars.append("\\") }
+            out.unicodeScalars.append(scalar)
+        }
+        for scalar in trailing {
+            out += "["
+            out.unicodeScalars.append(scalar)
+            out += "]"
+        }
+        return out
+    }
+
+    /// The batch's filter file, read by rclone after the profile's rules:
+    /// `+ /p` and `+ /p.rclonelink` (a symlink under `--links`) for every item,
+    /// `+ /p/**` too for a subtree entry or a path that is gone (lstat), and a
+    /// final `- **`. A path rclone re-encodes is replaced by its nearest
+    /// ancestor without such a scalar, as a subtree (`scope`); `+ /**` only as
+    /// a fallback for a root scope, which the watcher is to replace with a full
+    /// run (L9.2 S2b).
+    static func filterRules(for batch: [BatchItem], exists: (String) -> Bool) -> String {
+        var lines: [String] = []
+        for item in batch {
+            let (path, subtree) = scope(of: item.path, subtree: item.subtree || !exists(item.path))
+            if path.isEmpty {
+                lines.append("+ /**")
+                continue
+            }
+            let glob = "/" + globEscaped(path)
+            lines.append("+ " + glob)
+            lines.append("+ /" + globEscaped(path + ".rclonelink"))
+            if subtree { lines.append("+ " + glob + "/**") }
+        }
+        lines.append("- **")
+        return lines.joined(separator: "\n") + "\n"
+    }
+}
+
+extension RunOutcome {
+    /// What a finished run did, from its exit code and its own part of the
+    /// profile log (rclone 1.75.1 `--use-json-log` lines).
+    /// - Exit 0 is success only if the script logged `Sync completed
+    ///   successfully` (an unmounted drive exits 0 without running rclone).
+    /// - Exit 1, 5 or 6 whose error/critical lines are all per-object failures
+    ///   (`objectType` ending `.Object`) or rclone's own follow-ups is
+    ///   `.objectErrors`, with the failures of the LAST attempt only (a path
+    ///   that failed in attempt 1 and succeeded in attempt 2 is fine).
+    ///   Follow-ups: `Attempt …` and `Can't retry any of the errors …` with no
+    ///   object; `not deleting files|directories as there were IO errors`
+    ///   (an `.Fs` objectType), which sets `deletesSkipped`.
+    /// - Everything else — any other code (75/76/77/78/79 …), any other error
+    ///   line, a `{` line that is not JSON, or no named object — is `.runFailed`.
+    static func classify(exitCode: Int32, runLog: String) -> RunOutcome {
+        if exitCode == 0 {
+            return runLog.contains(" - Sync completed successfully") ? .success : .runFailed
+        }
+        // 5 is rclone's exit when the last error was retryable. Read by line
+        // shape like 1 and 6: one object that keeps failing names itself and
+        // must be countable and given up. Accepted (not measured): an outage
+        // that starts mid-transfer also names the in-flight objects, so they
+        // can be given up to the owed full run, which retries them.
+        guard exitCode == 1 || exitCode == 5 || exitCode == 6 else { return .runFailed }
+        var attempt: Set<String> = [], lastFailedAttempt: Set<String> = []
+        var attemptSkipped = false, lastSkipped = false
+        for line in runLog.split(separator: "\n") where line.hasPrefix("{") {
+            guard let json = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any] else { return .runFailed }
+            guard let level = json["level"] as? String, level == "error" || level == "critical" else { continue }
+            let message = json["msg"] as? String ?? ""
+            let type = json["objectType"] as? String ?? ""
+            let object = json["object"] as? String
+            if type.hasSuffix(".Object"), let object, !object.isEmpty {
+                attempt.insert(object)
+            } else if type.hasSuffix(".Fs"),
+                      message.hasPrefix("not deleting files as there were IO errors")
+                        || message.hasPrefix("not deleting directories as there were IO errors") {
+                attemptSkipped = true
+            } else if object == nil, message.hasPrefix("Attempt ") {
+                // The end of one attempt: its failures are what counts so far
+                // (none after `Attempt N/M succeeded`).
+                let failedAttempt = message.contains(" failed with ")
+                lastFailedAttempt = failedAttempt ? attempt : []
+                lastSkipped = failedAttempt && attemptSkipped
+                attempt = []
+                attemptSkipped = false
+            } else if object == nil, message.hasPrefix("Can't retry any of the errors") {
+                continue
+            } else {
+                return .runFailed
+            }
+        }
+        let failed = attempt.isEmpty ? lastFailedAttempt : attempt
+        let skipped = attempt.isEmpty ? lastSkipped : attemptSkipped
+        return failed.isEmpty ? .runFailed : .objectErrors(failedPaths: failed, deletesSkipped: skipped)
+    }
 }

@@ -76,6 +76,10 @@
       "minimum": 0,
       "maximum": 365,
       "description": "Days a deleted or overwritten file is kept under <remote parent>/.limpet-trash/<leaf>/<date>/ before being purged, for a localToRemote profile on a remote that keeps no deleted versions and whose remotePath has a parent folder (a bucket-root remotePath cannot have a trash sibling). 0 disables trash. Default 14."
+    },
+    "incrementalSync": {
+      "type": "boolean",
+      "description": "Sync only the paths macOS reported as changed (in batches), with a periodic full sync as the safety net, instead of a full comparison per change. localToRemote only; ignored (full syncs) when additionalRcloneFlags (or its RCLONE_* environment variable) has a flag that changes what a batch would sync (SyncProfile.batchRefusedFlags: include/filter/files-from rules, --delete-excluded, --min-age/--max-age, --hash-filter, --exclude-if-present, --local-encoding, --local-unicode-normalization, --error-on-no-transfer, log flags), or the exclude file has a + rule. Default false."
     }
   },
   "required": [

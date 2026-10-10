@@ -54,6 +54,10 @@ struct SyncProfile: Identifiable, Codable, Equatable {
     /// keeps no deleted versions, and `remotePath` has a parent — resolved
     /// once, in `SyncSetupService.generateProfileConfig`/`trashRoot(for:remoteSection:)`.
     var trashDays: Int
+    /// limpet-plan.md L9.2: sync only the paths FSEvents reported (batches),
+    /// with a full run as the safety net, instead of a full diff per change.
+    /// Default false; see `incrementalIneligibility`.
+    var incrementalSync: Bool
 
     /// Short ID for file naming (first 8 chars of UUID)
     var shortId: String {
@@ -236,7 +240,8 @@ struct SyncProfile: Identifiable, Codable, Equatable {
         transfers: Int = 16,
         maxDelete: Int = 100,
         remoteVersioning: Bool = false,
-        trashDays: Int = 14
+        trashDays: Int = 14,
+        incrementalSync: Bool = false
     ) {
         self.id = id
         self.name = name
@@ -253,6 +258,72 @@ struct SyncProfile: Identifiable, Codable, Equatable {
         self.maxDelete = maxDelete
         self.remoteVersioning = remoteVersioning
         self.trashDays = trashDays
+        self.incrementalSync = incrementalSync
+    }
+
+    /// Flags a batch must not run with: include rules or a file list widen or
+    /// replace the batch's own `- **`; --delete-excluded would delete everything
+    /// outside it; age filters, --hash-filter and --exclude-if-present change a
+    /// path's verdict without any FSEvent; --local-encoding and
+    /// --local-unicode-normalization change the names rclone filters on;
+    /// --error-on-no-transfer fails every no-op batch; a bare `--` would turn the
+    /// batch's own trailing flags into arguments; the log flags would take
+    /// rclone's JSON error lines out of the profile log the watcher classifies. A single-dash token whose
+    /// letters include `f` (`-f`, `-vf…`) is the short --filter. The generated
+    /// script refuses a batch carrying any of them as well (same list).
+    static let batchRefusedFlags: Set<String> = [
+        "--include", "--include-from", "--filter", "--filter-from", "--files-from",
+        "--files-from-raw", "--files-from0", "--delete-excluded", "--min-age", "--max-age",
+        "--hash-filter", "--exclude-if-present", "--local-encoding",
+        "--local-unicode-normalization", "--error-on-no-transfer", "--",
+        "--log-file", "--log-level", "--use-json-log", "--syslog", "--log-systemd",
+    ]
+
+    /// The RCLONE_<FLAG> environment variables for `batchRefusedFlags` (rclone
+    /// reads any flag from one), plus RCLONE_CONFIG_LOCAL_<OPT> for the two
+    /// local-backend options (measured, rclone 1.75.1: they rename files too).
+    /// The script and `refusedEnvironmentVariable` apply the same rule to them.
+    static var batchRefusedEnvironment: [String] {
+        batchRefusedFlags.subtracting(["--"]).sorted()
+            .map { "RCLONE_" + $0.dropFirst(2).uppercased().replacingOccurrences(of: "-", with: "_") }
+            + ["RCLONE_CONFIG_LOCAL_ENCODING", "RCLONE_CONFIG_LOCAL_UNICODE_NORMALIZATION"]
+    }
+
+    /// The first of `batchRefusedEnvironment` set in `environment` (empty
+    /// included: the variable is there), except RCLONE_DELETE_EXCLUDED=false —
+    /// the one value the flag check passes too (`--delete-excluded=false`).
+    /// nil = batches may run. The generated script applies the same rule.
+    static func refusedEnvironmentVariable(in environment: [String: String]) -> String? {
+        batchRefusedEnvironment.first { name in
+            guard let value = environment[name] else { return false }
+            return !(name == "RCLONE_DELETE_EXCLUDED" && value == "false")
+        }
+    }
+
+    /// Whether one additionalRcloneFlags token makes a batch unsafe. A single
+    /// dash is judged on the raw token (a value such as `_drafts/**` is no
+    /// flag); a long flag on its name with `_` read as `-`, as rclone does.
+    static func refusesBatch(_ token: String) -> Bool {
+        let raw = String(token.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false).first ?? "")
+        if raw.hasPrefix("-") && !raw.hasPrefix("--") { return raw.dropFirst().contains("f") }
+        let name = raw.replacingOccurrences(of: "_", with: "-")
+        if name == "--delete-excluded" { return !token.hasSuffix("=false") }
+        return batchRefusedFlags.contains(name)
+    }
+
+    /// Why this profile must use full syncs although `incrementalSync` is on,
+    /// or nil when batches may run (limpet-plan.md L9.2 S2). A batch adds its
+    /// own `--filter-from` after the profile's rules and ends in `- **`, so a
+    /// flag in `batchRefusedFlags` would widen, break or silently skip it. The profile's
+    /// exclude file is checked separately (its rclone dump must hold no `+`
+    /// rule), because that needs rclone.
+    var incrementalIneligibility: String? {
+        guard incrementalSync else { return "incrementalSync is off" }
+        guard syncDirection == .localToRemote else { return "incremental sync needs localToRemote" }
+        for token in additionalRcloneFlags.split(whereSeparator: \.isWhitespace).map(String.init) where Self.refusesBatch(token) {
+            return "additionalRcloneFlags \(token) changes what a batch would sync"
+        }
+        return nil
     }
 
     /// Create a new profile with default values
@@ -268,7 +339,7 @@ extension SyncProfile {
         case id, name, rcloneRemote, remotePath, localSyncPath
         case drivePathToMonitor, syncIntervalMinutes, additionalRcloneFlags
         case isEnabled, isMuted, syncDirection, transfers
-        case maxDelete, remoteVersioning, trashDays
+        case maxDelete, remoteVersioning, trashDays, incrementalSync
     }
 
     init(from decoder: Decoder) throws {
@@ -297,6 +368,7 @@ extension SyncProfile {
         // Backwards compatibility: default 14 (limpet-plan.md L6.2), matching
         // the memberwise-init default so an app-written file round-trips.
         trashDays = try container.decodeIfPresent(Int.self, forKey: .trashDays) ?? 14
+        incrementalSync = try container.decodeIfPresent(Bool.self, forKey: .incrementalSync) ?? false
 
         // F4: a refused value never becomes a SyncProfile, so it can never be
         // written back out, installed, or run by a watcher.

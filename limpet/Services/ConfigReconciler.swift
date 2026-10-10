@@ -280,7 +280,8 @@ extension SyncManager {
             current.transfers != updated.transfers ||
             current.maxDelete != updated.maxDelete ||
             current.remoteVersioning != updated.remoteVersioning ||
-            current.trashDays != updated.trashDays
+            current.trashDays != updated.trashDays ||
+            current.incrementalSync != updated.incrementalSync
 
         return needsReinstall ? .reinstall : .none
     }
