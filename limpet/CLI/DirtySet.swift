@@ -763,6 +763,7 @@ struct IncrementalPlanner {
             dirty.fullRunStarted(startEventId: currentEventId())
             inFlight = .full
             refusals = 0
+            wakeNotBefore = 0
             return .full
         }
         guard now >= batchNotBefore else { return nil }
@@ -770,6 +771,7 @@ struct IncrementalPlanner {
         guard !items.isEmpty else { return nil }
         inFlight = .batch(items)
         refusals = 0
+        wakeNotBefore = 0
         return .batch(items)
     }
 

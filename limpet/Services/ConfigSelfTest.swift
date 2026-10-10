@@ -7446,6 +7446,10 @@ enum ConfigSelfTest {
         guard r.nextWake(now: 31) == 90, r.next(now: 31, currentEventId: current) == .full else {
             return report(id, slug, false, "(second refusal: wake not 60 s, or the run was blocked)")
         }
+        // Once a run started, the refusal spacing is gone: the next edit wakes at its quiet deadline.
+        r.finished(.success, now: 35, exists: yes)
+        r.dirty.note("c.txt", isDirEvent: false, gap: false, eventId: 2000, now: 36)
+        guard r.nextWake(now: 37) == 46 else { return report(id, slug, false, "(the wake stayed spaced after a run started: \(String(describing: r.nextWake(now: 37))))") }
         // An owed full run that fails as a whole (offline) backs off like any failed full run.
         var q = IncrementalPlanner(batchLimit: 500)
         _ = q.next(now: 0, currentEventId: current)
