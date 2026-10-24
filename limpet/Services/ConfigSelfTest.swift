@@ -49,10 +49,13 @@ enum ConfigSelfTest {
         for name in (try? fm.contentsOfDirectory(atPath: bin)) ?? [] where name.hasPrefix("limpet") {
             add("\(bin)/\(name)")
         }
+        // A live incremental watcher writes (and removes) `<shortId>-batch.filter`
+        // under the real state dir during the run, which also bumps the dir's mtime:
+        // both are left out (a self-test writing a batch filter there goes unseen).
         for dir in ["\(home)/.config/limpet", "\(home)/.local/state/limpet"] {
-            add(dir)
+            if !dir.hasSuffix("state/limpet") { add(dir) }
             if let e = fm.enumerator(atPath: dir) {
-                for case let rel as String in e { add("\(dir)/\(rel)") }
+                for case let rel as String in e where !rel.hasSuffix("-batch.filter") { add("\(dir)/\(rel)") }
             }
         }
         add("\(home)/.config/rclone/rclone.conf")
@@ -7204,12 +7207,20 @@ enum ConfigSelfTest {
         let filterFroms = a.indices.filter { a[$0] == "--filter-from" && $0 + 1 < a.count }.map { a[$0 + 1] }
         guard batch.status == 0, filterFroms.count == 2, filterFroms[0].hasSuffix("exclude.txt"), filterFroms[1] == dirty,
               !a.contains(where: { $0.hasPrefix("--fast-list") }), a.contains("--s3-no-head"),
-              let t = a.lastIndex(of: "--tpslimit"), a.indices.contains(t + 1), a[t + 1] == "4",
-              !a[(t + 1)...].contains(where: { $0.hasPrefix("--tpslimit=") }),
-              let tb = a.lastIndex(of: "--tpslimit-burst"), tb > t, a.indices.contains(tb + 1), a[tb + 1] == "1",
+              // Default 16/burst 1 first, so the profile's own --tpslimit=20 comes later and wins.
+              let t = a.firstIndex(of: "--tpslimit"), a.indices.contains(t + 1), a[t + 1] == "16",
+              let tb = a.firstIndex(of: "--tpslimit-burst"), tb > t, a.indices.contains(tb + 1), a[tb + 1] == "1",
+              a.lastIndex(of: "--tpslimit=20").map({ $0 > tb }) == true,
               a.contains("ENV=unset"),
               batch.log.contains("Starting sync (local → remote, 3 changed paths)") else {
             return report(id, slug, false, "(batch argv/log wrong: \(a))")
+        }
+        // The profile setting sets the batch limit; a non-number in the config falls back to 16.
+        for (value, expected) in [(5 as Any, "5"), ("abc" as Any, "16")] {
+            guard let r = runScriptFixture(name: "ac-l92-s2a2-tps", overrides: ["batchRequestsPerSecond": value], extraArgs: [dirty]),
+                  let i = r.argv.firstIndex(of: "--tpslimit"), r.argv.indices.contains(i + 1), r.argv[i + 1] == expected else {
+                return report(id, slug, false, "(batchRequestsPerSecond \(value) did not give --tpslimit \(expected))")
+            }
         }
         guard full.argv.contains("--fast-list"), !full.argv.contains("--tpslimit"),
               full.argv.filter({ $0 == "--filter-from" }).count == 1 else {

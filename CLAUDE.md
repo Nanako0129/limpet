@@ -505,8 +505,9 @@ both). It logs `Starting sync (local → remote, N changed
 paths)` (N from `LIMPET_BATCH_ITEMS`) and runs `rclone sync` with
 `--filter-from <profile exclude file> --filter-from <batch file>`, no
 `--fast-list` (also removed from additionalFlags: with it rclone walks the
-whole remote prefix and ignores directory filters), and `--tpslimit 4
---tpslimit-burst 1` appended last so a profile's own values cannot raise them. Exit-code mapping (76,
+whole remote prefix and ignores directory filters), and `--tpslimit <batchRequestsPerSecond> --tpslimit-burst 1` (profile setting,
+1-64, default 16; CLI `profile set` and the profile's Advanced section) placed
+before additionalFlags, so a profile's own `--tpslimit` still wins. Exit-code mapping (76,
 77) is unchanged. `DirtySet.filterRules(for:exists:)` writes the batch file
 (`+ /p`, `+ /p.rclonelink`, `+ /p/**` for a subtree or gone path, then `- **`):
 `\ * ? [ ]` escaped, `{` `}` written as `?` (rclone's directory-filter
@@ -768,7 +769,7 @@ is the separate, fail-closed schema-drift gate.
 ### Versioning, Sparkle updates and the watcher self-restart (limpet-plan.md L7.1)
 
 **Version wiring.** `Info.plist` carries `CFBundleShortVersionString = $(MARKETING_VERSION)` and
-`CFBundleVersion = $(CURRENT_PROJECT_VERSION)`. `project.pbxproj` sets `MARKETING_VERSION = 1.0.2`
+`CFBundleVersion = $(CURRENT_PROJECT_VERSION)`. `project.pbxproj` sets `MARKETING_VERSION = 1.0.3`
 (Debug and Release) and leaves `CURRENT_PROJECT_VERSION = 1` locally; CI overrides it in L7.2 (commit count).
 
 **Sparkle (SwiftPM, `upToNextMajor` from 2.9.0, pinned in the committed

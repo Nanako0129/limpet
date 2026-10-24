@@ -190,7 +190,8 @@ enum LimpetCLI {
     profile set keys: name, rcloneRemote, remotePath, localSyncPath,
       drivePathToMonitor, additionalRcloneFlags,
       syncDirection (localToRemote|remoteToLocal), syncIntervalMinutes,
-      transfers, isMuted, maxDelete, remoteVersioning, trashDays, incrementalSync.
+      transfers, isMuted, maxDelete, remoteVersioning, trashDays, incrementalSync,
+      batchRequestsPerSecond (1-64, incremental batches' S4 request limit).
       Use enable/disable for isEnabled.
 
     trash list/restore work on any profile whose remotePath has a parent
@@ -1106,6 +1107,12 @@ enum LimpetCLI {
                 return "transfers must be a whole number from 1 to 64 without a leading zero"
             }
             profile.transfers = n
+        case "batchRequestsPerSecond":
+            guard let first = value.first, first != "0", value.allSatisfy(\.isASCII),
+                  value.allSatisfy(\.isNumber), let n = int(value), (1...64).contains(n) else {
+                return "batchRequestsPerSecond must be a whole number from 1 to 64 without a leading zero"
+            }
+            profile.batchRequestsPerSecond = n
         case "maxDelete":
             guard let n = int(value), n >= 1 else { return "maxDelete must be an integer ≥ 1" }
             profile.maxDelete = n
