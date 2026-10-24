@@ -62,6 +62,12 @@
       "maximum": 64,
       "description": "rclone --transfers for this profile's sync (--checkers is 2x this value). Default 16."
     },
+    "batchRequestsPerSecond": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 64,
+      "description": "rclone --tpslimit for incremental batches (requests per second to the remote, burst 1). Higher syncs many small files faster but nears the request volume at which MEGA S4 has blocked the IP for 6-30 min. A --tpslimit in additionalRcloneFlags overrides it. Default 16."
+    },
     "maxDelete": {
       "type": "integer",
       "minimum": 1,

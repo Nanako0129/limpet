@@ -278,6 +278,7 @@ extension SyncManager {
             current.additionalRcloneFlags != updated.additionalRcloneFlags ||
             current.syncDirection != updated.syncDirection ||
             current.transfers != updated.transfers ||
+            current.batchRequestsPerSecond != updated.batchRequestsPerSecond ||
             current.maxDelete != updated.maxDelete ||
             current.remoteVersioning != updated.remoteVersioning ||
             current.trashDays != updated.trashDays ||

@@ -16,6 +16,7 @@ struct ProfileDetailView: View {
     @State private var isExternalDrive: Bool = false
     @State private var syncIntervalMinutes: Int = 5
     @State private var additionalRcloneFlags: String = ""
+    @State private var batchRequestsPerSecond: Int = 16
     @State private var syncDirection: SyncDirection = .localToRemote
 
     // UI State
@@ -101,6 +102,7 @@ struct ProfileDetailView: View {
         computedDrivePath != profile.drivePathToMonitor ||
         syncIntervalMinutes != profile.syncIntervalMinutes ||
         additionalRcloneFlags != profile.additionalRcloneFlags ||
+        batchRequestsPerSecond != profile.batchRequestsPerSecond ||
         syncDirection != profile.syncDirection
     }
 
@@ -874,6 +876,21 @@ struct ProfileDetailView: View {
 
             Divider()
 
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Batch Requests per Second")
+                    .font(.subheadline.weight(.medium))
+                Text("Incremental sync only: the most requests a batch sends to the remote each second. Higher uploads many small files faster; around 16 and above, a long burst can get MEGA S4 to block uploads for a while.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Stepper(value: $batchRequestsPerSecond, in: 1...64) {
+                    Text("\(batchRequestsPerSecond) per second")
+                        .monospacedDigit()
+                }
+                .frame(width: 200, alignment: .leading)
+            }
+
+            Divider()
+
             // Additional rclone flags
             VStack(alignment: .leading, spacing: 4) {
                 Text("Additional rclone Flags")
@@ -942,6 +959,7 @@ struct ProfileDetailView: View {
         isExternalDrive = !profile.drivePathToMonitor.isEmpty
         syncIntervalMinutes = profile.syncIntervalMinutes
         additionalRcloneFlags = profile.additionalRcloneFlags
+        batchRequestsPerSecond = profile.batchRequestsPerSecond
         syncDirection = profile.syncDirection
 
         // Show text input if the path contains "/" (nested path) or is a custom path
@@ -959,6 +977,7 @@ struct ProfileDetailView: View {
         updatedProfile.drivePathToMonitor = computedDrivePath
         updatedProfile.syncIntervalMinutes = syncIntervalMinutes
         updatedProfile.additionalRcloneFlags = additionalRcloneFlags
+        updatedProfile.batchRequestsPerSecond = batchRequestsPerSecond
         updatedProfile.syncDirection = syncDirection
         return updatedProfile
     }

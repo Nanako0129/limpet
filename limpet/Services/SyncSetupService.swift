@@ -490,6 +490,7 @@ final class SyncSetupService {
             SYNC_DIRECTION=$(parse_json "syncDirection" "localToRemote")
             REMOTE_PATH=$(parse_json "remotePath" "")
             TRANSFERS=$(parse_json "transfers" "16")
+            BATCH_TPS=$(parse_json "batchRequestsPerSecond" "16")
             TRASH_ROOT=$(parse_json "trashRoot" "")
             TRASH_DAYS=$(parse_json "trashDays" "14")
 
@@ -515,6 +516,7 @@ final class SyncSetupService {
                 exit 64
             fi
             CHECKERS=$((TRANSFERS * 2))
+            [[ "$BATCH_TPS" =~ ^[1-9][0-9]?$ ]] || BATCH_TPS=16
 
             # maxDelete (0 = no limit) is written by limpet from an Int; anything
             # else in the derived config is refused rather than passed on.
@@ -814,13 +816,16 @@ final class SyncSetupService {
                 # include; rclone puts every --exclude flag before both files).
                 # No --fast-list: with it rclone walks the whole remote prefix
                 # and ignores directory filters (march.go/walk.go, 1.75.1).
-                # --tpslimit 4 --tpslimit-burst 1 (appended after additionalFlags below,
-                # so a profile's own values cannot raise them) keep two busy profiles
-                # far below the S4 IP block.
+                # --tpslimit <batchRequestsPerSecond> --tpslimit-burst 1 (profile
+                # setting, default 16), placed BEFORE additionalFlags so a profile's
+                # own --tpslimit still wins (rclone takes the last value; measured
+                # 1.75.1). 16/s is up to 9,600 requests per 10 min, inside the
+                # ~6k-10k PUTs in 3-10 min that got the IP blocked for 6-30 min
+                # (limpet-plan.md L6.3); a block stalls sync, it loses nothing.
                 BATCH_ITEMS="${LIMPET_BATCH_ITEMS:-}"
                 [[ "$BATCH_ITEMS" =~ ^[0-9]+$ ]] || BATCH_ITEMS="?"
                 echo "$(date '+%Y-%m-%d %H:%M:%S') - Starting sync (local → remote, $BATCH_ITEMS changed paths)" >> "$LOG_FILE"
-                cmd=("$RCLONE_BIN" sync "$LOCAL_PATH" "$REMOTE" --verbose --use-json-log --stats 2s --filter-from "$FILTER_FILE" --filter-from "$DIRTY_FILTER" --links --transfers "$TRANSFERS" --checkers "$CHECKERS")
+                cmd=("$RCLONE_BIN" sync "$LOCAL_PATH" "$REMOTE" --verbose --use-json-log --stats 2s --filter-from "$FILTER_FILE" --filter-from "$DIRTY_FILTER" --links --transfers "$TRANSFERS" --checkers "$CHECKERS" --tpslimit "$BATCH_TPS" --tpslimit-burst 1)
                 BATCH_FLAGS=()
                 for flag_token in ${ADDITIONAL_FLAGS_ARRAY[@]+"${ADDITIONAL_FLAGS_ARRAY[@]}"}; do
                     case "$flag_token" in
@@ -859,9 +864,6 @@ final class SyncSetupService {
             # ADDITIONAL_FLAGS_ARRAY above; append its tokens as-is.
             if [[ ${#ADDITIONAL_FLAGS_ARRAY[@]} -gt 0 ]]; then
                 cmd+=("${ADDITIONAL_FLAGS_ARRAY[@]}")
-            fi
-            if [[ -n "$DIRTY_FILTER" ]]; then
-                cmd+=(--tpslimit 4 --tpslimit-burst 1)
             fi
 
             # The max-delete lines of THIS run only (never an older run's lines in
@@ -1051,6 +1053,7 @@ final class SyncSetupService {
             "syncDirection": profile.syncDirection.rawValue,
             "remotePath": profile.remotePath,
             "transfers": profile.transfers,
+            "batchRequestsPerSecond": profile.batchRequestsPerSecond,
             "maxDelete": Self.maxDeleteArgument(for: profile, remoteSection: remoteSection),
             "trashRoot": Self.trashRoot(for: profile, remoteSection: remoteSection) ?? "",
             "trashDays": profile.trashDays,

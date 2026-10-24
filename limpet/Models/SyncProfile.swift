@@ -41,6 +41,9 @@ struct SyncProfile: Identifiable, Codable, Equatable {
     var isMuted: Bool                   // whether notifications are muted for this profile
     var syncDirection: SyncDirection    // direction for one-way sync
     var transfers: Int                  // rclone --transfers (checkers = 2x this); default: 16
+    /// rclone `--tpslimit` for incremental batches (limpet-plan.md L9.2); default 16.
+    /// Higher is faster for many small files but nears the S4 IP block (L6.3).
+    var batchRequestsPerSecond: Int
     /// rclone `--max-delete` for this profile when its remote does not keep
     /// deleted versions (limpet-plan.md L4 F6); default 100.
     var maxDelete: Int
@@ -160,6 +163,7 @@ struct SyncProfile: Identifiable, Codable, Equatable {
         // (measured: JSONDecoder rejects `08` and `010`), and `profile set`
         // refuses one itself, because bash reads `08` as octal.
         if !(1...64).contains(transfers) { return "transfers must be between 1 and 64" }
+        if !(1...64).contains(batchRequestsPerSecond) { return "batchRequestsPerSecond must be between 1 and 64" }
         return nil
     }
 
@@ -238,6 +242,7 @@ struct SyncProfile: Identifiable, Codable, Equatable {
         isMuted: Bool = false,
         syncDirection: SyncDirection = .localToRemote,
         transfers: Int = 16,
+        batchRequestsPerSecond: Int = 16,
         maxDelete: Int = 100,
         remoteVersioning: Bool = false,
         trashDays: Int = 14,
@@ -255,6 +260,7 @@ struct SyncProfile: Identifiable, Codable, Equatable {
         self.isMuted = isMuted
         self.syncDirection = syncDirection
         self.transfers = transfers
+        self.batchRequestsPerSecond = batchRequestsPerSecond
         self.maxDelete = maxDelete
         self.remoteVersioning = remoteVersioning
         self.trashDays = trashDays
@@ -339,7 +345,7 @@ extension SyncProfile {
         case id, name, rcloneRemote, remotePath, localSyncPath
         case drivePathToMonitor, syncIntervalMinutes, additionalRcloneFlags
         case isEnabled, isMuted, syncDirection, transfers
-        case maxDelete, remoteVersioning, trashDays, incrementalSync
+        case maxDelete, remoteVersioning, trashDays, incrementalSync, batchRequestsPerSecond
     }
 
     init(from decoder: Decoder) throws {
@@ -369,6 +375,7 @@ extension SyncProfile {
         // the memberwise-init default so an app-written file round-trips.
         trashDays = try container.decodeIfPresent(Int.self, forKey: .trashDays) ?? 14
         incrementalSync = try container.decodeIfPresent(Bool.self, forKey: .incrementalSync) ?? false
+        batchRequestsPerSecond = try container.decodeIfPresent(Int.self, forKey: .batchRequestsPerSecond) ?? 16
 
         // F4: a refused value never becomes a SyncProfile, so it can never be
         // written back out, installed, or run by a watcher.
